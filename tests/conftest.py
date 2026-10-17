@@ -114,6 +114,7 @@ class FakeIssuer:
     hits: Counter[str] = field(default_factory=Counter)
     oidc_issuer_value: str = ISSUER
     jwks_uri_value: str = JWKS_URI
+    jwks_headers: dict[str, str] = field(default_factory=dict)
     serve_oidc: bool = True
     serve_rfc8414: bool = True
     down: bool = False
@@ -145,7 +146,7 @@ class FakeIssuer:
         if url == RFC8414_DISCOVERY and self.serve_rfc8414:
             return httpx.Response(200, json={"issuer": ISSUER, "jwks_uri": self.jwks_uri_value})
         if url == JWKS_URI:
-            return httpx.Response(200, json=self.jwks())
+            return httpx.Response(200, json=self.jwks(), headers=self.jwks_headers)
         return httpx.Response(404)
 
     @property

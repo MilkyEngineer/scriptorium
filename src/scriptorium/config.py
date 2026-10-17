@@ -147,6 +147,16 @@ class Settings(BaseSettings):
     allow_all_issuer_users: bool = False
     # Optional: scopes every token must carry (from `scope` or `scp`). Empty = aud only.
     oidc_required_scopes: Annotated[tuple[str, ...], NoDecode] = ()
+    oidc_jwks_max_age_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=24 * 3600,
+        description=(
+            "Longest a fetched JWKS is trusted before it is refetched, so a key the issuer "
+            "withdraws stops being accepted within this time. A shorter Cache-Control max-age "
+            "on the JWKS response wins (never below 60 s)."
+        ),
+    )
     log_level: LogLevel = "info"
     max_inline_kb: int = Field(default=256, ge=1, le=16 * 1024)
     spike_tools: bool = False

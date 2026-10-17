@@ -244,6 +244,97 @@ async def test_unknown_kid_storm_fetches_once(
     assert issuer.jwks_hits == 1
 
 
+async def test_removed_key_accepted_until_max_age_then_rejected(
+    validator: OIDCValidator, issuer: FakeIssuer, clock: FakeClock
+) -> None:
+    """A key the issuer withdraws stops working within OIDC_JWKS_MAX_AGE_SECONDS."""
+    assert await validator.validate(issuer.token("rsa-1"))
+    issuer.published.discard("rsa-1")
+
+    clock.advance(3600)  # exactly max-age: still fresh, no refetch
+    assert await validator.validate(issuer.token("rsa-1"))
+    assert issuer.jwks_hits == 1
+
+    clock.advance(1)  # older than max-age: the next request refetches
+    with pytest.raises(TokenInvalid, match="unknown_kid"):
+        await validator.validate(issuer.token("rsa-1"))
+    assert issuer.jwks_hits == 2
+
+    # The fresh set serves the remaining key without further fetches.
+    assert await validator.validate(issuer.token("ec-1"))
+    with pytest.raises(TokenInvalid, match="unknown_kid"):
+        await validator.validate(issuer.token("rsa-1"))
+    assert issuer.jwks_hits == 2
+
+
+async def test_max_age_setting(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, clock: FakeClock
+) -> None:
+    validator = make_validator(make_settings(oidc_jwks_max_age_seconds=600))
+    await validator.validate(issuer.token())
+    clock.advance(600)
+    await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 1
+    clock.advance(1)
+    await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 2
+
+
+@pytest.mark.parametrize(
+    ("cache_control", "max_age"),
+    [
+        ("public, max-age=300", 300),  # shorter than the setting: honoured
+        ("max-age=86400", 3600),  # longer than the setting: ignored
+        ("no-cache, max-age=0", 60),  # floored, so the issuer cannot make us poll it
+        ('max-age="120"', 120),
+        ("max-age=soon", 3600),  # malformed: the setting applies
+        ("no-store", 3600),
+    ],
+)
+async def test_jwks_cache_control_max_age(
+    validator: OIDCValidator,
+    issuer: FakeIssuer,
+    clock: FakeClock,
+    cache_control: str,
+    max_age: int,
+) -> None:
+    issuer.jwks_headers = {"Cache-Control": cache_control}
+    await validator.validate(issuer.token())
+    clock.advance(max_age)
+    await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 1
+    clock.advance(1)
+    await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 2
+
+
+async def test_stale_jwks_used_while_issuer_down_for_up_to_a_day(
+    validator: OIDCValidator, issuer: FakeIssuer, clock: FakeClock
+) -> None:
+    await validator.validate(issuer.token())
+    issuer.down = True
+
+    clock.advance(3601)  # stale; the refresh fails, so the cached set is used
+    assert await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 2
+    clock.advance(5)  # within the failure cooldown: no new attempt, still served
+    assert await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 2
+    # An unknown kid cannot be checked against the stale set: an outage, not a bad token.
+    with pytest.raises(DiscoveryError):
+        await validator.validate(unsigned_token({"alg": "RS256", "kid": "new"}, issuer.claims()))
+
+    clock.advance(24 * 3600 - 3606)  # exactly a day old: still usable
+    assert await validator.validate(issuer.token())
+    clock.advance(11)  # older than a day: fail closed
+    with pytest.raises(DiscoveryError):
+        await validator.validate(issuer.token())
+
+    issuer.down = False
+    clock.advance(11)
+    assert await validator.validate(issuer.token())
+
+
 async def test_jwks_skips_unusable_keys(
     validator: OIDCValidator, issuer: FakeIssuer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -4,7 +4,10 @@ Validation is deliberately narrow: algorithms pinned to RS256/ES256 (and to the
 key's own type), ``iss`` byte-exact, ``aud`` membership, ``exp`` required,
 ``exp``/``nbf`` with 60 s leeway. Unknown ``kid`` values cause at most one JWKS
 refetch per cooldown window shared by all requests, so a stream of junk tokens
-cannot turn the server into a request amplifier against the issuer.
+cannot turn the server into a request amplifier against the issuer. The cached
+set is also refetched once it is older than ``OIDC_JWKS_MAX_AGE_SECONDS`` (or a
+shorter ``Cache-Control: max-age``), so a withdrawn key stops working; if that
+refresh fails, a set up to 24 h old is still used, and nothing older.
 
 Metadata and the JWKS are read with a size cap enforced while streaming, and the
 ``jwks_uri`` must share the issuer's scheme, host and port.
@@ -47,6 +50,10 @@ logger = logging.getLogger(__name__)
 ALLOWED_ALGORITHMS: Final = ("RS256", "ES256")
 LEEWAY_SECONDS: Final = 60
 JWKS_REFETCH_COOLDOWN_SECONDS: Final = 60.0
+JWKS_MIN_AGE_SECONDS: Final = 60.0
+"""Floor for a JWKS ``Cache-Control: max-age``, so the issuer cannot make us poll it."""
+JWKS_STALE_GRACE_SECONDS: Final = 24 * 3600.0
+"""Oldest cached JWKS still used when a refresh fails; beyond it, fail closed."""
 DISCOVERY_RETRY_SECONDS: Final = 10.0
 HTTP_TIMEOUT_SECONDS: Final = 10.0
 MAX_TOKEN_BYTES: Final = 16 * 1024
@@ -184,6 +191,16 @@ class ProviderMetadata:
     jwks_uri: str
 
 
+def _cache_max_age(headers: httpx.Headers) -> float | None:
+    """``max-age`` from a ``Cache-Control`` header, or None if absent or malformed."""
+    for directive in headers.get("cache-control", "").split(","):
+        name, _, value = directive.partition("=")
+        if name.strip().lower() == "max-age":
+            value = value.strip().strip('"')
+            return float(value) if value.isascii() and value.isdigit() else None
+    return None
+
+
 def discovery_urls(issuer: str) -> list[str]:
     """OIDC discovery first, then RFC 8414 (path-inserted) metadata."""
     base = issuer.rstrip("/")
@@ -270,6 +287,7 @@ class OIDCValidator:
         self._unnamed_keys: list[jwt.PyJWK] = []
         self._jwks_fetched_at: float | None = None
         self._jwks_failed_at: float | None = None
+        self._jwks_max_age = float(settings.oidc_jwks_max_age_seconds)
         self._lock = anyio.Lock()
         self.jwks_fetch_count = 0  # observability and tests
 
@@ -279,8 +297,9 @@ class OIDCValidator:
 
     # -- fetching ---------------------------------------------------------------
 
-    async def _get_json(self, url: str) -> dict[str, Any]:
-        """GET a JSON object, reading no more than :data:`MAX_METADATA_BYTES` of body."""
+    async def _get_json(self, url: str) -> tuple[dict[str, Any], httpx.Headers]:
+        """GET a JSON object and the response headers, reading at most
+        :data:`MAX_METADATA_BYTES` of body."""
         # identity: the cap then bounds what the issuer sends, not only what it inflates to.
         headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
         async with self._http.stream("GET", url, headers=headers) as response:
@@ -300,7 +319,7 @@ class OIDCValidator:
             raise DiscoveryError("not_json") from None
         if not isinstance(body, dict):
             raise DiscoveryError("not_object")
-        return body
+        return body, response.headers
 
     async def discover(self) -> ProviderMetadata:
         """Fetch and validate the issuer's metadata (cached after success)."""
@@ -321,7 +340,7 @@ class OIDCValidator:
         reasons: list[str] = []
         for url in discovery_urls(self._issuer):
             try:
-                doc = await self._get_json(url)
+                doc, _ = await self._get_json(url)
             except DiscoveryError as exc:
                 reasons.append(exc.reason)
                 continue
@@ -356,7 +375,7 @@ class OIDCValidator:
         metadata = await self._discover_locked()
         self.jwks_fetch_count += 1
         try:
-            doc = await self._get_json(metadata.jwks_uri)
+            doc, headers = await self._get_json(metadata.jwks_uri)
         except httpx.HTTPError as exc:
             raise DiscoveryError(type(exc).__name__) from None
         raw_keys = doc.get("keys")
@@ -382,6 +401,13 @@ class OIDCValidator:
         self._unnamed_keys = unnamed
         self._jwks_fetched_at = self._clock()
         self._jwks_failed_at = None
+        # The issuer may ask for a shorter cache life, never a longer one, and never one
+        # so short that every request would refetch.
+        max_age = float(self._settings.oidc_jwks_max_age_seconds)
+        advertised = _cache_max_age(headers)
+        if advertised is not None:
+            max_age = max(JWKS_MIN_AGE_SECONDS, min(max_age, advertised))
+        self._jwks_max_age = max_age
         log_event(
             logger,
             "oidc_jwks_fetched",
@@ -389,28 +415,53 @@ class OIDCValidator:
             count=len(keys) + len(unnamed),
         )
 
+    async def _refresh_jwks_locked(self, now: float) -> None:
+        failed_at = self._jwks_failed_at
+        if failed_at is not None and now - failed_at < DISCOVERY_RETRY_SECONDS:
+            raise DiscoveryError("cooldown")
+        try:
+            await self._fetch_jwks_locked()
+        except DiscoveryError as exc:
+            self._jwks_failed_at = now
+            log_event(
+                logger,
+                "oidc_jwks_fetch_failed",
+                level=logging.WARNING,
+                host=urlsplit(self._issuer).hostname,
+                reason=exc.reason,
+            )
+            raise
+
+    def _jwks_age(self, now: float) -> float | None:
+        return None if self._jwks_fetched_at is None else now - self._jwks_fetched_at
+
     async def _key_for(self, kid: str | None) -> jwt.PyJWK:
-        known = self._lookup(kid)
-        if known is not None:
-            return known
-        async with self._lock:
-            # Another request may have refreshed while we waited for the lock.
+        age = self._jwks_age(self._clock())
+        if age is not None and age <= self._jwks_max_age:
             known = self._lookup(kid)
             if known is not None:
                 return known
+        async with self._lock:
             now = self._clock()
-            if self._jwks_fetched_at is not None and now - self._jwks_fetched_at < self._cooldown:
-                raise TokenInvalid("unknown_kid")
-            if (
-                self._jwks_failed_at is not None
-                and now - self._jwks_failed_at < DISCOVERY_RETRY_SECONDS
-            ):
-                raise DiscoveryError("cooldown")
+            age = self._jwks_age(now)
+            if age is not None and age <= self._jwks_max_age:
+                # Another request may have refreshed while we waited for the lock.
+                known = self._lookup(kid)
+                if known is not None:
+                    return known
+                if age < self._cooldown:
+                    raise TokenInvalid("unknown_kid")
+            # The set is missing, too old, or lacks this kid: refetch.
             try:
-                await self._fetch_jwks_locked()
+                await self._refresh_jwks_locked(now)
             except DiscoveryError:
-                self._jwks_failed_at = now
-                raise
+                # The issuer is unreachable: keep trusting a set that is stale but not
+                # ancient, so an outage does not lock everyone out; past that, fail closed.
+                stale_ok = age is not None and age <= JWKS_STALE_GRACE_SECONDS
+                known = self._lookup(kid) if stale_ok else None
+                if known is None:
+                    raise
+                return known
         known = self._lookup(kid)
         if known is None:
             raise TokenInvalid("unknown_kid")

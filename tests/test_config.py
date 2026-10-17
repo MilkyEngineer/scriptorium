@@ -207,6 +207,16 @@ def test_sub_needs_no_opt_in(env: pytest.MonkeyPatch) -> None:
     assert (settings.oidc_user_claim, settings.oidc_unsafe_user_claim) == ("sub", False)
 
 
+def test_jwks_max_age(env: pytest.MonkeyPatch) -> None:
+    assert load_settings().oidc_jwks_max_age_seconds == 3600
+    env.setenv("SCRIPTORIUM_OIDC_JWKS_MAX_AGE_SECONDS", "60")
+    assert load_settings().oidc_jwks_max_age_seconds == 60
+    for bad in ("59", "86401", "soon"):
+        env.setenv("SCRIPTORIUM_OIDC_JWKS_MAX_AGE_SECONDS", bad)
+        with pytest.raises(ConfigError, match="OIDC_JWKS_MAX_AGE_SECONDS"):
+            load_settings()
+
+
 def test_admin_claim_and_value_together(env: pytest.MonkeyPatch) -> None:
     env.setenv("SCRIPTORIUM_OIDC_ADMIN_CLAIM", "realm_access.roles")
     with pytest.raises(ConfigError, match="OIDC_ADMIN_VALUE"):
