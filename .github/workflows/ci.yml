@@ -125,10 +125,16 @@ jobs:
             -e SCRIPTORIUM_OIDC_ALLOWED_USERS=ci-user \
             -e SCRIPTORIUM_MASTER_KEYS="$key" \
             scriptorium:ci
+          # `serve` under a read-only root with an unreachable issuer: /healthz must
+          # answer 200 regardless, because it never depends on OIDC discovery.
+          healthy=no
           for _ in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:8000/healthz && break
+            if curl -fsS http://127.0.0.1:8000/healthz; then healthy=yes; break; fi
             sleep 1
           done
+          test "$healthy" = yes
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/healthz)"
+          test "$code" = "200"
           curl -fsS http://127.0.0.1:8000/.well-known/oauth-protected-resource
           code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp)"
           test "$code" = "401"

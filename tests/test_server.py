@@ -133,11 +133,42 @@ async def test_healthz_without_token(http: httpx.AsyncClient) -> None:
     assert response.json() == {"status": "ok", "version": __version__}
 
 
+async def test_healthz_does_not_depend_on_the_issuer(
+    http: httpx.AsyncClient, issuer: FakeIssuer
+) -> None:
+    """The container healthcheck (and CI's smoke test) run with no reachable issuer."""
+    issuer.down = True
+    assert (await http.get("/healthz")).status_code == 200
+    assert sum(issuer.hits.values()) == 0
+
+
 @pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
 async def test_mcp_without_token_is_401_with_challenge(http: httpx.AsyncClient, path: str) -> None:
     response = await http.post(path, json=_rpc("tools/list"), headers=MCP_HEADERS)
     assert response.status_code == 401
     assert response.headers.get_list("www-authenticate") == [CHALLENGE]
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+@pytest.mark.parametrize("method", ["GET", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"])
+async def test_mcp_non_post_is_405_once_authenticated(
+    http: httpx.AsyncClient, issuer: FakeIssuer, path: str, method: str
+) -> None:
+    """Stateless JSON mode has no server-initiated SSE stream and no session to delete."""
+    headers = {"Authorization": f"Bearer {issuer.token()}", "Accept": "text/event-stream"}
+    response = await http.request(method, path, headers=headers)
+    assert response.status_code == 405
+    assert response.headers["allow"] == "POST"
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+async def test_mcp_non_post_without_token_keeps_the_401_contract(
+    http: httpx.AsyncClient, path: str, method: str
+) -> None:
+    response = await http.request(method, path, headers={"Accept": "text/event-stream"})
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == CHALLENGE
 
 
 async def test_other_auth_scheme_counts_as_no_token(http: httpx.AsyncClient) -> None:
@@ -229,9 +260,42 @@ async def test_unknown_path_is_404_without_auth(http: httpx.AsyncClient) -> None
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/mcp//",
+        "/healthz/",
+        f"/dl/{'A' * 43}/",
+        "/.well-known/oauth-protected-resource/",
+        "/.well-known/oauth-protected-resource/mcp/",
+    ],
+)
+@pytest.mark.parametrize("host", ["mcp.example.com", "evil.example.com"])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_no_trailing_slash_redirects(
+    http: httpx.AsyncClient, path: str, host: str, method: str
+) -> None:
+    """A slash redirect would echo the Host header into Location (an open redirect)."""
+    response = await http.request(method, path, headers={"Host": host})
+    assert response.status_code == 404
+    assert "location" not in response.headers
+
+
 def test_spike_tools_only_when_enabled() -> None:
     assert len(build_registry(make_settings(spike_tools=False))) == 0
     assert len(build_registry(make_settings(spike_tools=True))) == 7
+
+
+def test_no_tool_schema_declares_mcp_param_headers() -> None:
+    """The SDK checks Mcp-Param-* headers against ``get_tool_input_schema``, which is not
+    user-aware: it answers for admin tools too, and its 400s could reveal their schemas
+    to anyone. With no ``x-mcp-header`` in any schema there is nothing to reveal; a tool
+    that needs one must make that lookup user-aware first."""
+    registry = build_registry(make_settings(spike_tools=True))
+    for spec in registry:
+        schema = registry.input_schema(spec.name)
+        assert schema is not None
+        assert "x-mcp-header" not in json.dumps(schema), spec.name
 
 
 # ---- MCP round trips -----------------------------------------------------------------------
@@ -442,6 +506,42 @@ def test_download_store_tokens_and_eviction(clock: FakeClock) -> None:
         store.mint(b"x" * 11, media_type="text/plain", owner="u", filename="c")
 
 
+def test_download_store_owner_at_volume_cannot_evict_another_owner(clock: FakeClock) -> None:
+    store = InMemoryDownloadStore(
+        clock=clock, max_bytes=1000, max_owner_bytes=100, max_owner_items=4
+    )
+    alice, bob = "a" * 64, "b" * 64
+    theirs = store.mint(b"x" * 10, media_type="text/plain", owner=bob, filename="b")
+
+    # Alice mints twice the global budget; without per-owner caps Bob's token would go.
+    mine = [
+        store.mint(b"y" * 10, media_type="text/plain", owner=alice, filename="a")
+        for _ in range(200)
+    ]
+    assert store.get(theirs) is not None
+    assert [store.get(t) is not None for t in mine] == [False] * 196 + [True] * 4
+
+    # The byte cap: Alice's own oldest links make room, never Bob's.
+    big = [
+        store.mint(b"z" * 40, media_type="text/plain", owner=alice, filename="a") for _ in range(3)
+    ]
+    assert [store.get(t) is not None for t in big] == [False, True, True]
+    assert all(store.get(t) is None for t in mine)
+    assert store.get(theirs) is not None
+    with pytest.raises(ValueError, match="budget"):
+        store.mint(b"x" * 101, media_type="text/plain", owner=alice, filename="a")
+
+
+def test_download_store_global_budget_still_evicts_oldest(clock: FakeClock) -> None:
+    store = InMemoryDownloadStore(clock=clock, max_bytes=100, max_owner_bytes=60)
+    first = store.mint(b"x" * 50, media_type="text/plain", owner="b" * 64, filename="b")
+    second = store.mint(b"y" * 50, media_type="text/plain", owner="a" * 64, filename="a")
+    third = store.mint(b"z" * 10, media_type="text/plain", owner="c" * 64, filename="c")
+    assert store.get(first) is None  # the oldest overall, once the global budget is hit
+    assert store.get(second) is not None
+    assert store.get(third) is not None
+
+
 def test_loggable_path_redacts_tokens() -> None:
     assert loggable_path("/dl/abcdef") == "/dl/<token>"
     assert loggable_path("/mcp") == "/mcp"
@@ -497,15 +597,26 @@ async def test_client_ip_on_request_state(issuer: FakeIssuer) -> None:
 
     async def probe(request: Request) -> PlainTextResponse:
         seen.update(request.state._state)
+        seen["url"] = str(request.url)
         return PlainTextResponse("ok")
 
     inner = Starlette(routes=[Route("/", probe)])
     wrapped = ForwardedHeadersMiddleware(inner, TRUSTED)
+    forwarded = {"X-Forwarded-For": "198.51.100.1", "X-Forwarded-Proto": "https"}
     transport = httpx.ASGITransport(app=wrapped, client=("172.18.0.2", 4000))
     async with httpx.AsyncClient(transport=transport, base_url="http://mcp.example.com") as c:
-        await c.get("/", headers={"X-Forwarded-For": "198.51.100.1", "X-Forwarded-Proto": "https"})
+        await c.get("/", headers=forwarded)
     assert seen["client_ip"] == "198.51.100.1"
     assert seen["scheme"] == "https"
+    assert seen["url"] == "https://mcp.example.com/"  # the scope's scheme follows the proxy
+
+    # From an untrusted peer the same headers change nothing.
+    transport = httpx.ASGITransport(app=wrapped, client=("203.0.113.9", 4000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://mcp.example.com") as c:
+        await c.get("/", headers=forwarded)
+    assert seen["client_ip"] == "203.0.113.9"
+    assert seen["scheme"] == "http"
+    assert seen["url"] == "http://mcp.example.com/"
 
 
 # ---- the command line (serve's entry point) -----------------------------------------------

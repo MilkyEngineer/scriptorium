@@ -7,9 +7,9 @@ Request flow, outermost first:
 2. ``AccessLogMiddleware``: one structured line per request, capability tokens redacted.
 3. Scriptorium's own routes, which need no token: protected-resource metadata,
    ``/healthz`` and ``/dl/<token>``.
-4. ``/mcp``: ``BearerAuthMiddleware`` (the 401/403 contract), which binds the
-   user to the request, then the MCP SDK's Streamable HTTP transport in
-   stateless mode.
+4. ``/mcp``: ``BearerAuthMiddleware`` (the 401/403 contract, then 405 for
+   anything but POST), which binds the user to the request, then the MCP SDK's
+   Streamable HTTP transport in stateless mode.
 
 Request bodies on ``/mcp`` are limited by the SDK's body-limit middleware to
 :data:`MCP_MAX_REQUEST_BODY_BYTES`; nothing else here reads a body.
@@ -83,6 +83,8 @@ MCP_MAX_REQUEST_BODY_BYTES: Final = 4 * 1024 * 1024
 
 DOWNLOAD_TTL_SECONDS: Final = 600
 DOWNLOAD_STORE_MAX_BYTES: Final = 256 * 1024 * 1024
+DOWNLOAD_OWNER_MAX_BYTES: Final = 64 * 1024 * 1024
+DOWNLOAD_OWNER_MAX_ITEMS: Final = 64
 _DOWNLOAD_TOKEN_RE: Final = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _SAFE_FILENAME_RE: Final = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -114,8 +116,11 @@ class DownloadStore(DownloadMinter, Protocol):
 class InMemoryDownloadStore:
     """Process-local download store: 256-bit tokens, 10-minute expiry, bounded memory.
 
-    Tokens are kept only as SHA-256 digests. When the byte budget is exceeded the
-    oldest entries are evicted first.
+    Tokens are kept only as SHA-256 digests. Each owner may hold at most
+    ``max_owner_items`` downloads and ``max_owner_bytes``; beyond that the owner's
+    own oldest entries go first, so one user minting at volume cannot push out
+    another user's links. Only when the global byte budget is exceeded (which takes
+    several owners at their caps) are the oldest entries overall evicted.
     """
 
     def __init__(
@@ -123,13 +128,19 @@ class InMemoryDownloadStore:
         *,
         ttl_seconds: float = DOWNLOAD_TTL_SECONDS,
         max_bytes: int = DOWNLOAD_STORE_MAX_BYTES,
+        max_owner_bytes: int = DOWNLOAD_OWNER_MAX_BYTES,
+        max_owner_items: int = DOWNLOAD_OWNER_MAX_ITEMS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._ttl = ttl_seconds
         self._max_bytes = max_bytes
+        self._max_owner_bytes = max_owner_bytes
+        self._max_owner_items = max_owner_items
         self._clock = clock
         self._items: OrderedDict[bytes, Download] = OrderedDict()
         self._bytes = 0
+        # owner -> {key: size}, oldest first; each holds at most max_owner_items entries.
+        self._owners: dict[str, OrderedDict[bytes, int]] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -137,18 +148,27 @@ class InMemoryDownloadStore:
         return hashlib.sha256(token.encode("ascii")).digest()
 
     def mint(self, data: bytes, *, media_type: str, owner: str, filename: str) -> str:
-        if len(data) > self._max_bytes:
+        size = len(data)
+        if size > min(self._max_bytes, self._max_owner_bytes):
             raise ValueError("download larger than the store's budget")
         token = secrets.token_urlsafe(32)
         safe_name = _SAFE_FILENAME_RE.sub("_", filename)[:100] or "download"
         item = Download(data, media_type, owner, safe_name, self._clock() + self._ttl)
         with self._lock:
             self._purge_locked()
-            while self._items and self._bytes + len(data) > self._max_bytes:
-                _, evicted = self._items.popitem(last=False)
-                self._bytes -= len(evicted.data)
-            self._items[self._key(token)] = item
-            self._bytes += len(data)
+            # The owner's quota first: an owner over it loses only their own oldest links.
+            while (mine := self._owners.get(owner)) and (
+                len(mine) >= self._max_owner_items
+                or sum(mine.values()) + size > self._max_owner_bytes
+            ):
+                self._remove_locked(next(iter(mine)))
+            # Then the global budget, oldest first across owners.
+            while self._items and self._bytes + size > self._max_bytes:
+                self._remove_locked(next(iter(self._items)))
+            key = self._key(token)
+            self._items[key] = item
+            self._bytes += size
+            self._owners.setdefault(owner, OrderedDict())[key] = size
         return token
 
     def get(self, token: str) -> Download | None:
@@ -158,10 +178,18 @@ class InMemoryDownloadStore:
             self._purge_locked()
             return self._items.get(self._key(token))
 
+    def _remove_locked(self, key: bytes) -> None:
+        item = self._items.pop(key)
+        self._bytes -= len(item.data)
+        mine = self._owners[item.owner]
+        del mine[key]
+        if not mine:
+            del self._owners[item.owner]
+
     def _purge_locked(self) -> None:
         now = self._clock()
         for key in [k for k, v in self._items.items() if v.expires_at <= now]:
-            self._bytes -= len(self._items.pop(key).data)
+            self._remove_locked(key)
 
 
 # ---- client address -----------------------------------------------------------------------
@@ -216,7 +244,11 @@ def resolve_client(
 
 
 class ForwardedHeadersMiddleware:
-    """Puts ``client_ip`` and ``scheme`` on the request state (for logs and rate limits)."""
+    """Puts ``client_ip`` and ``scheme`` on the request state (for logs and rate limits).
+
+    A trusted proxy's ``X-Forwarded-Proto`` also becomes the ASGI scope's scheme, so
+    any URL Starlette derives from the request says https behind a TLS proxy.
+    """
 
     def __init__(self, app: ASGIApp, trusted: Sequence[IPNetwork]) -> None:
         self.app = app
@@ -236,6 +268,9 @@ class ForwardedHeadersMiddleware:
             state = scope.setdefault("state", {})
             state["client_ip"] = ip
             state["scheme"] = proto
+            # resolve_client returns the scope's own scheme unless a trusted proxy said
+            # http or https, so this changes nothing for anyone else.
+            scope["scheme"] = proto
         await self.app(scope, receive, send)
 
 
@@ -338,8 +373,22 @@ class BearerAuthMiddleware:
             await (response or unavailable_response())(scope, receive, send)
             return
         scope.setdefault("state", {})["uid"] = user.log_uid
+        if scope.get("method") != "POST":
+            # Stateless JSON mode never opens a server-initiated SSE stream (GET) and has
+            # no session to delete (DELETE); a GET would otherwise hold a stream open.
+            await _method_not_allowed()(scope, receive, send)
+            return
         with user_context(user):
             await self.app(scope, receive, send)
+
+
+def _method_not_allowed() -> Response:
+    return Response(
+        "Method Not Allowed",
+        status_code=405,
+        media_type="text/plain",
+        headers={"Allow": "POST", "Cache-Control": "no-store"},
+    )
 
 
 # ---- MCP -------------------------------------------------------------------------------------
@@ -535,7 +584,7 @@ def create_app(
         Route(MCP_PATH, mcp_app),
         Route(MCP_PATH + "/", mcp_app),
     ]
-    return Starlette(
+    app = Starlette(
         routes=routes,
         middleware=[
             Middleware(ForwardedHeadersMiddleware, trusted=settings.trusted_proxies),
@@ -543,3 +592,8 @@ def create_app(
         ],
         lifespan=lifespan,
     )
+    # A slash redirect builds its Location from the client's Host header (an open
+    # redirect, and /dl tokens in URLs), and no client needs one: every path here is
+    # exact. Starlette 0.52's constructor does not take this flag.
+    app.router.redirect_slashes = False
+    return app

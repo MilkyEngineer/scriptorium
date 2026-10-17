@@ -5,28 +5,35 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from scriptorium.auth.oidc import (
+    MAX_METADATA_BYTES,
     DiscoveryError,
     InsufficientScope,
     OIDCValidator,
     TokenExpired,
     TokenInvalid,
     UserNotAllowed,
+    ascii_lower,
     claim_at_path,
     discovery_urls,
+    uid_hash_for,
 )
+from scriptorium.config import Settings
 from tests.conftest import (
     ADMIN_SUB,
     ALLOWED_EMAIL,
     ALLOWED_SUB,
     ISSUER,
+    JWKS_URI,
     OIDC_DISCOVERY,
     PUBLIC_URL,
     RFC8414_DISCOVERY,
@@ -43,7 +50,8 @@ async def test_valid_rs256(validator: OIDCValidator, issuer: FakeIssuer) -> None
     user = await validator.validate(issuer.token("rsa-1"))
     assert user.iss == ISSUER
     assert user.sub == ALLOWED_SUB
-    assert user.uid_hash == hashlib.sha256(f"{ISSUER}|{ALLOWED_SUB}".encode()).hexdigest()
+    # Architecture §6: sha256(iss + "\n" + user_claim); storage uses the first 16 hex chars.
+    assert user.uid_hash == hashlib.sha256(f"{ISSUER}\n{ALLOWED_SUB}".encode()).hexdigest()
     assert user.display_name == "reader"
     assert user.is_admin is False
     assert user.scopes == frozenset({"openid", "scriptorium", "email"})
@@ -236,6 +244,97 @@ async def test_unknown_kid_storm_fetches_once(
     assert issuer.jwks_hits == 1
 
 
+async def test_removed_key_accepted_until_max_age_then_rejected(
+    validator: OIDCValidator, issuer: FakeIssuer, clock: FakeClock
+) -> None:
+    """A key the issuer withdraws stops working within OIDC_JWKS_MAX_AGE_SECONDS."""
+    assert await validator.validate(issuer.token("rsa-1"))
+    issuer.published.discard("rsa-1")
+
+    clock.advance(3600)  # exactly max-age: still fresh, no refetch
+    assert await validator.validate(issuer.token("rsa-1"))
+    assert issuer.jwks_hits == 1
+
+    clock.advance(1)  # older than max-age: the next request refetches
+    with pytest.raises(TokenInvalid, match="unknown_kid"):
+        await validator.validate(issuer.token("rsa-1"))
+    assert issuer.jwks_hits == 2
+
+    # The fresh set serves the remaining key without further fetches.
+    assert await validator.validate(issuer.token("ec-1"))
+    with pytest.raises(TokenInvalid, match="unknown_kid"):
+        await validator.validate(issuer.token("rsa-1"))
+    assert issuer.jwks_hits == 2
+
+
+async def test_max_age_setting(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, clock: FakeClock
+) -> None:
+    validator = make_validator(make_settings(oidc_jwks_max_age_seconds=600))
+    await validator.validate(issuer.token())
+    clock.advance(600)
+    await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 1
+    clock.advance(1)
+    await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 2
+
+
+@pytest.mark.parametrize(
+    ("cache_control", "max_age"),
+    [
+        ("public, max-age=300", 300),  # shorter than the setting: honoured
+        ("max-age=86400", 3600),  # longer than the setting: ignored
+        ("no-cache, max-age=0", 60),  # floored, so the issuer cannot make us poll it
+        ('max-age="120"', 120),
+        ("max-age=soon", 3600),  # malformed: the setting applies
+        ("no-store", 3600),
+    ],
+)
+async def test_jwks_cache_control_max_age(
+    validator: OIDCValidator,
+    issuer: FakeIssuer,
+    clock: FakeClock,
+    cache_control: str,
+    max_age: int,
+) -> None:
+    issuer.jwks_headers = {"Cache-Control": cache_control}
+    await validator.validate(issuer.token())
+    clock.advance(max_age)
+    await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 1
+    clock.advance(1)
+    await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 2
+
+
+async def test_stale_jwks_used_while_issuer_down_for_up_to_a_day(
+    validator: OIDCValidator, issuer: FakeIssuer, clock: FakeClock
+) -> None:
+    await validator.validate(issuer.token())
+    issuer.down = True
+
+    clock.advance(3601)  # stale; the refresh fails, so the cached set is used
+    assert await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 2
+    clock.advance(5)  # within the failure cooldown: no new attempt, still served
+    assert await validator.validate(issuer.token())
+    assert issuer.jwks_hits == 2
+    # An unknown kid cannot be checked against the stale set: an outage, not a bad token.
+    with pytest.raises(DiscoveryError):
+        await validator.validate(unsigned_token({"alg": "RS256", "kid": "new"}, issuer.claims()))
+
+    clock.advance(24 * 3600 - 3606)  # exactly a day old: still usable
+    assert await validator.validate(issuer.token())
+    clock.advance(11)  # older than a day: fail closed
+    with pytest.raises(DiscoveryError):
+        await validator.validate(issuer.token())
+
+    issuer.down = False
+    clock.advance(11)
+    assert await validator.validate(issuer.token())
+
+
 async def test_jwks_skips_unusable_keys(
     validator: OIDCValidator, issuer: FakeIssuer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -310,6 +409,106 @@ async def test_discovery_mismatch_falls_back_to_rfc8414(
     assert issuer.hits[RFC8414_DISCOVERY] == 1
 
 
+@pytest.mark.parametrize(
+    "jwks_uri",
+    [
+        "https://evil.example.com/realms/scriptorium/protocol/openid-connect/certs",
+        "https://auth.example.com.evil.example.com/certs",
+        "http://auth.example.com/realms/scriptorium/protocol/openid-connect/certs",
+        "https://auth.example.com:8443/certs",
+        "https://reader@auth.example.com/certs",
+        "https://evil.example.com\\@auth.example.com/certs",
+        "//evil.example.com/certs",
+        "/realms/scriptorium/certs",
+    ],
+)
+async def test_jwks_uri_must_share_the_issuers_origin(
+    validator: OIDCValidator, issuer: FakeIssuer, jwks_uri: str
+) -> None:
+    issuer.jwks_uri_value = jwks_uri
+    with pytest.raises(DiscoveryError, match="bad_jwks_uri"):
+        await validator.discover()
+    assert issuer.jwks_hits == 0
+    assert not any("evil" in url for url in issuer.hits)
+
+
+@pytest.mark.parametrize(
+    "jwks_uri",
+    [JWKS_URI, "https://AUTH.example.com:443/realms/scriptorium/protocol/openid-connect/certs"],
+)
+async def test_jwks_uri_on_the_issuers_origin_accepted(
+    validator: OIDCValidator, issuer: FakeIssuer, jwks_uri: str
+) -> None:
+    issuer.jwks_uri_value = jwks_uri
+    assert (await validator.discover()).jwks_uri == jwks_uri
+
+
+class CountingBody:
+    """A streamed response body that counts the bytes it hands out (up to 64 MiB)."""
+
+    CHUNK = 64 * 1024
+
+    def __init__(self) -> None:
+        self.handed_out = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while self.handed_out < 64 * 1024 * 1024:
+            self.handed_out += self.CHUNK
+            yield b" " * self.CHUNK
+
+
+@asynccontextmanager
+async def validator_serving(
+    respond: Callable[[httpx.Request], httpx.Response],
+) -> AsyncIterator[OIDCValidator]:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        yield OIDCValidator(make_settings(), http=client, clock=FakeClock())
+
+
+async def test_oversized_metadata_is_aborted_while_streaming() -> None:
+    bodies: list[CountingBody] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        bodies.append(CountingBody())
+        return httpx.Response(200, content=bodies[-1])
+
+    async with validator_serving(respond) as validator:
+        with pytest.raises(DiscoveryError, match="too_large"):
+            await validator.discover()
+    assert len(bodies) == 2  # OIDC discovery, then the RFC 8414 fallback
+    for body in bodies:
+        assert MAX_METADATA_BYTES < body.handed_out <= MAX_METADATA_BYTES + CountingBody.CHUNK
+
+
+async def test_oversized_content_length_is_refused_before_reading() -> None:
+    bodies: list[CountingBody] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        bodies.append(CountingBody())
+        headers = {"Content-Length": str(MAX_METADATA_BYTES + 1)}
+        return httpx.Response(200, headers=headers, content=bodies[-1])
+
+    async with validator_serving(respond) as validator:
+        with pytest.raises(DiscoveryError, match="too_large"):
+            await validator.discover()
+    assert [body.handed_out for body in bodies] == [0, 0]
+
+
+async def test_oversized_jwks_is_aborted(issuer: FakeIssuer) -> None:
+    body = CountingBody()
+    real = issuer.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == JWKS_URI:
+            return httpx.Response(200, content=body)
+        return real(request)
+
+    async with validator_serving(handler) as streaming:
+        with pytest.raises(DiscoveryError, match="too_large"):
+            await streaming.validate(issuer.token())
+    assert body.handed_out <= MAX_METADATA_BYTES + CountingBody.CHUNK
+
+
 # ---- admin and allowlist ----------------------------------------------------------------
 
 
@@ -330,6 +529,30 @@ async def test_admin_role_as_string_claim(
     validator = make_validator(make_settings(oidc_admin_claim="role", oidc_admin_value="admin"))
     assert (await validator.validate(issuer.token(role="admin"))).is_admin is True
     assert (await validator.validate(issuer.token(role="administrator"))).is_admin is False
+
+
+@pytest.mark.parametrize(
+    ("admin_value", "claim", "is_admin"),
+    [
+        ("True", True, False),
+        ("True", [True], False),
+        ("1", [True], False),
+        ("1", True, False),
+        ("1", [1], True),
+        ("1", 1, True),
+        ("admin", ["x", "admin"], True),
+        ("admin", {"admin": True}, False),
+    ],
+)
+async def test_admin_claim_never_matches_booleans(
+    make_validator: Callable[..., OIDCValidator],
+    issuer: FakeIssuer,
+    admin_value: str,
+    claim: object,
+    is_admin: bool,
+) -> None:
+    validator = make_validator(make_settings(oidc_admin_claim="role", oidc_admin_value=admin_value))
+    assert (await validator.validate(issuer.token(role=claim))).is_admin is is_admin
 
 
 async def test_no_admin_claim_configured_means_no_admins(
@@ -395,7 +618,11 @@ async def test_email_entry_never_matches_the_user_claim(
 ) -> None:
     """An issuer whose subject is a self-chosen email must not bypass email_verified."""
     validator = make_validator(
-        make_settings(oidc_user_claim=claim, oidc_allowed_users=ALLOWED_EMAIL)
+        make_settings(
+            oidc_user_claim=claim,
+            oidc_unsafe_user_claim=claim != "sub",
+            oidc_allowed_users=ALLOWED_EMAIL,
+        )
     )
     unverified = issuer.token(
         sub=ALLOWED_EMAIL,
@@ -431,11 +658,112 @@ async def test_custom_user_claim(
     make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer
 ) -> None:
     validator = make_validator(
-        make_settings(oidc_user_claim="oid", oidc_allowed_users="object-id-1")
+        make_settings(
+            oidc_user_claim="oid", oidc_unsafe_user_claim=True, oidc_allowed_users="object-id-1"
+        )
     )
     user = await validator.validate(issuer.token(oid="object-id-1"))
     assert user.sub == "object-id-1"
-    assert user.uid_hash == hashlib.sha256(f"{ISSUER}|object-id-1".encode()).hexdigest()
+    assert user.uid_hash == hashlib.sha256(f"{ISSUER}\nobject-id-1".encode()).hexdigest()
+
+
+def _email_identity_settings() -> Settings:
+    return make_settings(
+        oidc_user_claim="email", oidc_unsafe_user_claim=True, oidc_allowed_users=ALLOWED_EMAIL
+    )
+
+
+@pytest.mark.parametrize("verified", [False, "true", 1, None])
+async def test_email_user_claim_requires_verified_email(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, verified: object
+) -> None:
+    """With OIDC_USER_CLAIM=email an unverified (or unstated) email is no identity at all."""
+    validator = make_validator(_email_identity_settings())
+    token = issuer.token(email=ALLOWED_EMAIL, email_verified=verified)
+    with pytest.raises(UserNotAllowed, match="email_not_verified"):
+        await validator.validate(token)
+
+
+async def test_email_user_claim_ignores_letter_case(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer
+) -> None:
+    """READER@… and reader@… are one mailbox, so one identity and one storage directory."""
+    validator = make_validator(_email_identity_settings())
+    upper = await validator.validate(issuer.token(email="READER@example.com", email_verified=True))
+    lower = await validator.validate(issuer.token(email="reader@example.com", email_verified=True))
+    assert upper.sub == lower.sub == "reader@example.com"
+    assert upper.uid_hash == lower.uid_hash == uid_hash_for(ISSUER, "reader@example.com")
+
+
+KELVIN = "\N{KELVIN SIGN}"  # U+212A: str.lower() maps it to ASCII "k"
+
+
+def test_ascii_lower_folds_ascii_letters_only() -> None:
+    assert ascii_lower("Ada@Example.com") == "ada@example.com"
+    assert ascii_lower(f"{KELVIN}elvin@example.com") == f"{KELVIN}elvin@example.com"
+    assert ascii_lower(f"{KELVIN}elvin@example.com") != "kelvin@example.com"
+    assert ascii_lower(f"reader@{KELVIN}iwi.example.com") != "reader@kiwi.example.com"
+    dotted_i = "\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}"
+    assert ascii_lower(dotted_i) == dotted_i  # str.lower() gives two code points
+
+
+@pytest.mark.parametrize(
+    ("issued", "ascii_form"),
+    [
+        (f"{KELVIN}elvin@example.com", "kelvin@example.com"),  # Kelvin sign in the local part
+        (f"reader@{KELVIN}iwi.example.com", "reader@kiwi.example.com"),  # and in the domain
+    ],
+)
+async def test_email_identity_does_not_merge_unicode_lookalikes(
+    make_validator: Callable[..., OIDCValidator],
+    issuer: FakeIssuer,
+    issued: str,
+    ascii_form: str,
+) -> None:
+    validator = make_validator(
+        make_settings(
+            oidc_user_claim="email",
+            oidc_unsafe_user_claim=True,
+            oidc_allowed_users="",
+            allow_all_issuer_users=True,
+        )
+    )
+    lookalike = await validator.validate(issuer.token(email=issued, email_verified=True))
+    genuine = await validator.validate(issuer.token(email=ascii_form, email_verified=True))
+    assert lookalike.sub == issued  # kept byte-for-byte
+    assert lookalike.uid_hash != genuine.uid_hash
+
+
+@pytest.mark.parametrize(
+    ("allowed", "issued"),
+    [
+        ("kelvin@example.com", f"{KELVIN}elvin@example.com"),
+        ("reader@kiwi.example.com", f"reader@{KELVIN}iwi.example.com"),
+        (f"{KELVIN}elvin@example.com", "kelvin@example.com"),
+    ],
+)
+async def test_allowlist_email_does_not_match_unicode_lookalikes(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, allowed: str, issued: str
+) -> None:
+    """A verified email matches an allowlist entry only if they differ in ASCII case alone."""
+    validator = make_validator(make_settings(oidc_allowed_users=allowed))
+    with pytest.raises(UserNotAllowed):
+        await validator.validate(_verified(issuer, issued))
+
+
+def _verified(issuer: FakeIssuer, email: str) -> str:
+    """A token for a non-allowlisted sub whose verified email is ``email``."""
+    return issuer.token(
+        sub="44444444-0000-4000-8000-000000000000", email=email, email_verified=True
+    )
+
+
+async def test_allowlist_email_ignores_ascii_case(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer
+) -> None:
+    validator = make_validator(make_settings(oidc_allowed_users="Ada@Example.com"))
+    user = await validator.validate(_verified(issuer, "ada@example.com"))
+    assert user.email_verified is True
 
 
 async def test_display_name_falls_back_without_email(

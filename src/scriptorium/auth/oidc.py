@@ -4,7 +4,13 @@ Validation is deliberately narrow: algorithms pinned to RS256/ES256 (and to the
 key's own type), ``iss`` byte-exact, ``aud`` membership, ``exp`` required,
 ``exp``/``nbf`` with 60 s leeway. Unknown ``kid`` values cause at most one JWKS
 refetch per cooldown window shared by all requests, so a stream of junk tokens
-cannot turn the server into a request amplifier against the issuer.
+cannot turn the server into a request amplifier against the issuer. The cached
+set is also refetched once it is older than ``OIDC_JWKS_MAX_AGE_SECONDS`` (or a
+shorter ``Cache-Control: max-age``), so a withdrawn key stops working; if that
+refresh fails, a set up to 24 h old is still used, and nothing older.
+
+Metadata and the JWKS are read with a size cap enforced while streaming, and the
+``jwks_uri`` must share the issuer's scheme, host and port.
 
 Nothing here logs a token, an email or raw claims.
 """
@@ -12,7 +18,9 @@ Nothing here logs a token, an email or raw claims.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import string
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -42,6 +50,10 @@ logger = logging.getLogger(__name__)
 ALLOWED_ALGORITHMS: Final = ("RS256", "ES256")
 LEEWAY_SECONDS: Final = 60
 JWKS_REFETCH_COOLDOWN_SECONDS: Final = 60.0
+JWKS_MIN_AGE_SECONDS: Final = 60.0
+"""Floor for a JWKS ``Cache-Control: max-age``, so the issuer cannot make us poll it."""
+JWKS_STALE_GRACE_SECONDS: Final = 24 * 3600.0
+"""Oldest cached JWKS still used when a refresh fails; beyond it, fail closed."""
 DISCOVERY_RETRY_SECONDS: Final = 10.0
 HTTP_TIMEOUT_SECONDS: Final = 10.0
 MAX_TOKEN_BYTES: Final = 16 * 1024
@@ -101,7 +113,28 @@ class User:
 
 
 def uid_hash_for(iss: str, sub: str) -> str:
-    return hashlib.sha256(f"{iss}|{sub}".encode()).hexdigest()
+    """SHA-256 of the issuer, a newline and the user claim, in hex (Architecture §6).
+
+    The storage directory is the first 16 hex characters. The issuer cannot contain
+    a newline (settings reject whitespace in URLs), so the pair is unambiguous.
+    ``sub`` is hashed exactly as given: the only normalisation anywhere is
+    :func:`ascii_lower` on an email used as the identity.
+    """
+    return hashlib.sha256((iss + "\n" + sub).encode()).hexdigest()
+
+
+_ASCII_LOWER: Final = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def ascii_lower(value: str) -> str:
+    """``value`` with A-Z lowered and every other character left byte-for-byte.
+
+    Used wherever emails are compared or become identities. ``str.lower`` would
+    apply Unicode case mapping (U+212A KELVIN SIGN lowers to ASCII ``k``), merging
+    addresses the issuer treats as distinct into one user or one allowlist entry.
+    No casefolding and no IDNA mapping, for the same reason.
+    """
+    return value.translate(_ASCII_LOWER)
 
 
 def claim_at_path(claims: Mapping[str, Any], path: str) -> Any:
@@ -122,12 +155,15 @@ def claim_at_path(claims: Mapping[str, Any], path: str) -> Any:
     return node
 
 
+def _scalar_matches(value: Any, wanted: str) -> bool:
+    # bool is an int subclass; True must never match an admin value of "True" or "1".
+    return isinstance(value, str | int) and not isinstance(value, bool) and str(value) == wanted
+
+
 def _claim_contains(value: Any, wanted: str) -> bool:
     if isinstance(value, list | tuple):
-        return any(isinstance(v, str | int) and str(v) == wanted for v in value)
-    if isinstance(value, str | int) and not isinstance(value, bool):
-        return str(value) == wanted
-    return False
+        return any(_scalar_matches(v, wanted) for v in value)
+    return _scalar_matches(value, wanted)
 
 
 def _scopes(claims: Mapping[str, Any]) -> frozenset[str]:
@@ -147,13 +183,25 @@ def _scopes(claims: Mapping[str, Any]) -> frozenset[str]:
 
 # ---- discovery --------------------------------------------------------------------------
 
-_CONFIG_REASONS: Final = frozenset({"issuer_mismatch", "bad_jwks_uri"})
+_CONFIG_REASONS: Final = frozenset(
+    {"issuer_mismatch", "bad_jwks_uri", "too_large", "not_json", "not_object"}
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderMetadata:
     issuer: str
     jwks_uri: str
+
+
+def _cache_max_age(headers: httpx.Headers) -> float | None:
+    """``max-age`` from a ``Cache-Control`` header, or None if absent or malformed."""
+    for directive in headers.get("cache-control", "").split(","):
+        name, _, value = directive.partition("=")
+        if name.strip().lower() == "max-age":
+            value = value.strip().strip('"')
+            return float(value) if value.isascii() and value.isdigit() else None
+    return None
 
 
 def discovery_urls(issuer: str) -> list[str]:
@@ -168,10 +216,34 @@ def discovery_urls(issuer: str) -> list[str]:
     ]
 
 
-def _same_security(issuer: str, url: str) -> bool:
-    """``url`` must be https unless the issuer itself is a plain-http dev issuer."""
-    scheme = urlsplit(url).scheme
-    return scheme == "https" or (scheme == "http" and urlsplit(issuer).scheme == "http")
+_DEFAULT_PORTS: Final = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """``(scheme, host, port)`` of a plain http(s) URL; None for anything odd."""
+    if any(c.isspace() or not c.isprintable() or c == "\\" for c in url):
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in _DEFAULT_PORTS or not parts.hostname:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    return parts.scheme, parts.hostname, port or _DEFAULT_PORTS[parts.scheme]
+
+
+def same_origin(issuer: str, url: str) -> bool:
+    """``url`` has the issuer's scheme, host and port.
+
+    Every URL Scriptorium fetches on the issuer's say-so (today only ``jwks_uri``)
+    must pass, so a tampered or misconfigured metadata document can neither point
+    key retrieval at another host nor downgrade it to plain http.
+    """
+    origin = _origin(url)
+    return origin is not None and origin == _origin(issuer)
 
 
 # ---- validator --------------------------------------------------------------------------
@@ -208,7 +280,9 @@ class OIDCValidator:
         # the user claim: an issuer whose subject is a self-chosen email or username
         # must not let an unverified "alice@example.com" through.
         self._allowed = frozenset(u for u in settings.oidc_allowed_users if "@" not in u)
-        self._allowed_emails = frozenset(u.lower() for u in settings.oidc_allowed_users if "@" in u)
+        self._allowed_emails = frozenset(
+            ascii_lower(u) for u in settings.oidc_allowed_users if "@" in u
+        )
 
         self._metadata: ProviderMetadata | None = None
         self._discovery_failed_at: float | None = None
@@ -216,6 +290,7 @@ class OIDCValidator:
         self._unnamed_keys: list[jwt.PyJWK] = []
         self._jwks_fetched_at: float | None = None
         self._jwks_failed_at: float | None = None
+        self._jwks_max_age = float(settings.oidc_jwks_max_age_seconds)
         self._lock = anyio.Lock()
         self.jwks_fetch_count = 0  # observability and tests
 
@@ -225,19 +300,29 @@ class OIDCValidator:
 
     # -- fetching ---------------------------------------------------------------
 
-    async def _get_json(self, url: str) -> dict[str, Any]:
-        response = await self._http.get(url, headers={"Accept": "application/json"})
-        if response.status_code != 200:
-            raise DiscoveryError(f"http_{response.status_code}")
-        if len(response.content) > MAX_METADATA_BYTES:
-            raise DiscoveryError("too_large")
+    async def _get_json(self, url: str) -> tuple[dict[str, Any], httpx.Headers]:
+        """GET a JSON object and the response headers, reading at most
+        :data:`MAX_METADATA_BYTES` of body."""
+        # identity: the cap then bounds what the issuer sends, not only what it inflates to.
+        headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
+        async with self._http.stream("GET", url, headers=headers) as response:
+            if response.status_code != 200:
+                raise DiscoveryError(f"http_{response.status_code}")
+            declared = response.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > MAX_METADATA_BYTES:
+                raise DiscoveryError("too_large")
+            raw = bytearray()
+            async for chunk in response.aiter_bytes():
+                raw += chunk
+                if len(raw) > MAX_METADATA_BYTES:
+                    raise DiscoveryError("too_large")
         try:
-            body = response.json()
-        except ValueError:
+            body = json.loads(raw)
+        except (ValueError, RecursionError):
             raise DiscoveryError("not_json") from None
         if not isinstance(body, dict):
             raise DiscoveryError("not_object")
-        return body
+        return body, response.headers
 
     async def discover(self) -> ProviderMetadata:
         """Fetch and validate the issuer's metadata (cached after success)."""
@@ -258,7 +343,7 @@ class OIDCValidator:
         reasons: list[str] = []
         for url in discovery_urls(self._issuer):
             try:
-                doc = await self._get_json(url)
+                doc, _ = await self._get_json(url)
             except DiscoveryError as exc:
                 reasons.append(exc.reason)
                 continue
@@ -270,7 +355,7 @@ class OIDCValidator:
                 reasons.append("issuer_mismatch")
                 continue
             jwks_uri = doc.get("jwks_uri")
-            if not isinstance(jwks_uri, str) or not _same_security(self._issuer, jwks_uri):
+            if not isinstance(jwks_uri, str) or not same_origin(self._issuer, jwks_uri):
                 reasons.append("bad_jwks_uri")
                 continue
             self._metadata = ProviderMetadata(issuer=self._issuer, jwks_uri=jwks_uri)
@@ -293,7 +378,7 @@ class OIDCValidator:
         metadata = await self._discover_locked()
         self.jwks_fetch_count += 1
         try:
-            doc = await self._get_json(metadata.jwks_uri)
+            doc, headers = await self._get_json(metadata.jwks_uri)
         except httpx.HTTPError as exc:
             raise DiscoveryError(type(exc).__name__) from None
         raw_keys = doc.get("keys")
@@ -319,6 +404,13 @@ class OIDCValidator:
         self._unnamed_keys = unnamed
         self._jwks_fetched_at = self._clock()
         self._jwks_failed_at = None
+        # The issuer may ask for a shorter cache life, never a longer one, and never one
+        # so short that every request would refetch.
+        max_age = float(self._settings.oidc_jwks_max_age_seconds)
+        advertised = _cache_max_age(headers)
+        if advertised is not None:
+            max_age = max(JWKS_MIN_AGE_SECONDS, min(max_age, advertised))
+        self._jwks_max_age = max_age
         log_event(
             logger,
             "oidc_jwks_fetched",
@@ -326,28 +418,53 @@ class OIDCValidator:
             count=len(keys) + len(unnamed),
         )
 
+    async def _refresh_jwks_locked(self, now: float) -> None:
+        failed_at = self._jwks_failed_at
+        if failed_at is not None and now - failed_at < DISCOVERY_RETRY_SECONDS:
+            raise DiscoveryError("cooldown")
+        try:
+            await self._fetch_jwks_locked()
+        except DiscoveryError as exc:
+            self._jwks_failed_at = now
+            log_event(
+                logger,
+                "oidc_jwks_fetch_failed",
+                level=logging.WARNING,
+                host=urlsplit(self._issuer).hostname,
+                reason=exc.reason,
+            )
+            raise
+
+    def _jwks_age(self, now: float) -> float | None:
+        return None if self._jwks_fetched_at is None else now - self._jwks_fetched_at
+
     async def _key_for(self, kid: str | None) -> jwt.PyJWK:
-        known = self._lookup(kid)
-        if known is not None:
-            return known
-        async with self._lock:
-            # Another request may have refreshed while we waited for the lock.
+        age = self._jwks_age(self._clock())
+        if age is not None and age <= self._jwks_max_age:
             known = self._lookup(kid)
             if known is not None:
                 return known
+        async with self._lock:
             now = self._clock()
-            if self._jwks_fetched_at is not None and now - self._jwks_fetched_at < self._cooldown:
-                raise TokenInvalid("unknown_kid")
-            if (
-                self._jwks_failed_at is not None
-                and now - self._jwks_failed_at < DISCOVERY_RETRY_SECONDS
-            ):
-                raise DiscoveryError("cooldown")
+            age = self._jwks_age(now)
+            if age is not None and age <= self._jwks_max_age:
+                # Another request may have refreshed while we waited for the lock.
+                known = self._lookup(kid)
+                if known is not None:
+                    return known
+                if age < self._cooldown:
+                    raise TokenInvalid("unknown_kid")
+            # The set is missing, too old, or lacks this kid: refetch.
             try:
-                await self._fetch_jwks_locked()
+                await self._refresh_jwks_locked(now)
             except DiscoveryError:
-                self._jwks_failed_at = now
-                raise
+                # The issuer is unreachable: keep trusting a set that is stale but not
+                # ancient, so an outage does not lock everyone out; past that, fail closed.
+                stale_ok = age is not None and age <= JWKS_STALE_GRACE_SECONDS
+                known = self._lookup(kid) if stale_ok else None
+                if known is None:
+                    raise
+                return known
         known = self._lookup(kid)
         if known is None:
             raise TokenInvalid("unknown_kid")
@@ -435,11 +552,18 @@ class OIDCValidator:
         email_claim = claims.get("email")
         email = email_claim if isinstance(email_claim, str) and email_claim else None
         email_verified = claims.get("email_verified") is True
+        if settings.oidc_user_claim == "email":
+            # An email is an identity only once the issuer has verified it, and ASCII
+            # letter case must not split one mailbox into two users (two storage
+            # directories). Non-ASCII stays as issued: see ascii_lower.
+            if not email_verified:
+                raise UserNotAllowed("email_not_verified")
+            sub = ascii_lower(sub)
 
         allowed = (
             settings.allow_all_issuer_users
             or sub in self._allowed
-            or (email is not None and email_verified and email.lower() in self._allowed_emails)
+            or (email is not None and email_verified and ascii_lower(email) in self._allowed_emails)
         )
         if not allowed:
             raise UserNotAllowed("not_on_allowlist")

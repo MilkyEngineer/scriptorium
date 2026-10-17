@@ -49,16 +49,31 @@ def env_name(field_name: str) -> str:
     return f"{ENV_PREFIX}{field_name.upper()}"
 
 
+def _env_spellings(name: str) -> list[str]:
+    """Values of every environment variable that settings would read as ``name``.
+
+    Settings match names case-insensitively (by ``str.lower``, as pydantic-settings
+    does), so ``scriptorium_master_keys`` sets ``SCRIPTORIUM_MASTER_KEYS`` too.
+    """
+    wanted = name.lower()
+    return [value for key, value in os.environ.items() if key.lower() == wanted]
+
+
 class _FileEnvSource(PydanticBaseSettingsSource):
     """Reads ``SCRIPTORIUM_<NAME>_FILE`` for every field (Docker secrets)."""
 
     def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
         file_var = env_name(field_name) + FILE_SUFFIX
-        path = os.environ.get(file_var)
-        if not path:
+        paths = [p for p in _env_spellings(file_var) if p]
+        if not paths:
             return None, field_name, False
-        if os.environ.get(env_name(field_name)):
+        if len(paths) > 1:
+            raise ConfigError(f"{file_var} is set more than once (in different letter cases)")
+        # Any spelling, even an empty one: the environment outranks the file, so the
+        # file's value would otherwise be dropped without a word.
+        if _env_spellings(env_name(field_name)):
             raise ConfigError(f"set either {env_name(field_name)} or {file_var}, not both")
+        path = paths[0]
         try:
             with open(path, "rb") as fh:
                 raw = fh.read(_MAX_SECRET_FILE_BYTES + 1)
@@ -88,7 +103,7 @@ def _split_csv(value: object) -> object:
 
 
 def _validate_url(value: str, *, require_path: str | None) -> str:
-    # "|" is the (iss, sub) separator in the user hash and is never valid unescaped in a URL.
+    # No whitespace: a newline separates (iss, sub) in the user hash (Architecture §6).
     if value != value.strip() or any(c in value for c in "\"'<>|` \t\r\n\\"):
         raise ValueError("must be a plain URL without quotes, '|' or whitespace")
     parts = urlsplit(value)
@@ -124,7 +139,21 @@ class Settings(BaseSettings):
     master_keys: SecretStr | None = None
     oidc_issuer: str
     oidc_audience: str | None = None
-    oidc_user_claim: str = "sub"
+    oidc_user_claim: str = Field(
+        default="sub",
+        description=(
+            "Claim that, with the issuer, identifies a user and names their storage. It must "
+            "be immutable at the issuer: a claim users can change lets them take over another "
+            "user's library. Anything but `sub` needs OIDC_UNSAFE_USER_CLAIM=true."
+        ),
+    )
+    oidc_unsafe_user_claim: bool = Field(
+        default=False,
+        description=(
+            "Explicit acknowledgement that OIDC_USER_CLAIM is not `sub`; the operator vouches "
+            "that the issuer never lets that claim change or be reassigned."
+        ),
+    )
     oidc_name_claim: str = "preferred_username"
     oidc_admin_claim: str | None = None
     oidc_admin_value: str | None = None
@@ -133,6 +162,16 @@ class Settings(BaseSettings):
     allow_all_issuer_users: bool = False
     # Optional: scopes every token must carry (from `scope` or `scp`). Empty = aud only.
     oidc_required_scopes: Annotated[tuple[str, ...], NoDecode] = ()
+    oidc_jwks_max_age_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=24 * 3600,
+        description=(
+            "Longest a fetched JWKS is trusted before it is refetched, so a key the issuer "
+            "withdraws stops being accepted within this time. A shorter Cache-Control max-age "
+            "on the JWKS response wins (never below 60 s)."
+        ),
+    )
     log_level: LogLevel = "info"
     max_inline_kb: int = Field(default=256, ge=1, le=16 * 1024)
     spike_tools: bool = False
@@ -176,6 +215,21 @@ class Settings(BaseSettings):
             raise ValueError("must not be empty")
         return value.strip()
 
+    @field_validator("oidc_admin_claim", "oidc_admin_value")
+    @classmethod
+    def _optional_text(cls, value: str | None) -> str | None:
+        # Blank counts as unset, so a stray space cannot half-configure admin gating.
+        return (value.strip() or None) if value is not None else None
+
+    @field_validator("oidc_audience")
+    @classmethod
+    def _audience(cls, value: str | None) -> str | None:
+        if not value:
+            return None  # unset or empty (compose passes unset variables through as "")
+        if not value.strip():
+            raise ValueError("is blank; leave it unset to use SCRIPTORIUM_PUBLIC_URL")
+        return value.strip()
+
     @field_validator("oidc_required_scopes")
     @classmethod
     def _scope_tokens(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -190,6 +244,17 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
+    def _identity_claim(self) -> Settings:
+        if self.oidc_user_claim != "sub" and not self.oidc_unsafe_user_claim:
+            raise ValueError(
+                f"{env_name('oidc_user_claim')} is not `sub`. The identity claim must be "
+                "immutable at the issuer (for example Entra ID's `oid`), or users could take "
+                f"over each other's storage; set {env_name('oidc_unsafe_user_claim')}=true to "
+                "confirm that it is."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _default_deny(self) -> Settings:
         if not self.oidc_allowed_users and not self.allow_all_issuer_users:
             raise ValueError(
@@ -197,13 +262,19 @@ class Settings(BaseSettings):
                 f"allowed `sub` values or verified emails, or set "
                 f"{env_name('allow_all_issuer_users')}=true to admit every user of the issuer."
             )
-        if self.master_keys is None or not self.master_keys.get_secret_value().strip():
+        if self.oidc_allowed_users and self.allow_all_issuer_users:
+            raise ValueError(
+                f"{env_name('allow_all_issuer_users')}=true admits every user of the issuer, "
+                f"but {env_name('oidc_allowed_users')} also lists users. Empty the list to "
+                "admit everyone, or unset the opt-out to admit only the listed users."
+            )
+        keys = _split_csv(self.master_keys.get_secret_value()) if self.master_keys else []
+        assert isinstance(keys, list)
+        if not keys:  # unset, blank, or only commas
             raise ValueError(
                 f"{env_name('master_keys')} (or {env_name('master_keys')}{FILE_SUFFIX}) is "
                 "required; generate a key with `scriptorium gen-master-key`."
             )
-        keys = _split_csv(self.master_keys.get_secret_value())
-        assert isinstance(keys, list)
         for position, key in enumerate(keys, start=1):
             try:
                 Fernet(key)
