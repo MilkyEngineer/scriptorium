@@ -1,0 +1,206 @@
+# Scriptorium — example Docker Compose stack (Architecture §13).
+#
+#   cp compose.example.yml compose.yml
+#   cp scriptorium.env.example scriptorium.env    # then edit
+#   cp .env.example .env                          # compose-level variables; then edit
+#   mkdir -p secrets && scriptorium gen-master-key > secrets/master_keys   # or: openssl rand -base64 32 | tr '+/' '-_'
+#   docker compose up -d                          # scriptorium + worker only
+#   docker compose --profile keycloak up -d       # ... plus the reference Keycloak (if you have no OIDC issuer)
+#
+# All relative paths below resolve against this directory (docker/).
+#
+# Reverse proxy topologies (docker/proxy/README.md):
+#   * proxy on THIS Docker host: leave SCRIPTORIUM_PUBLISH_ADDR at its default
+#     (127.0.0.1) and attach the proxy container to the `proxy` network; it then
+#     reaches scriptorium:8000 and keycloak:8080 directly and the published ports
+#     are only a loopback convenience.
+#   * proxy on ANOTHER machine: set SCRIPTORIUM_PUBLISH_ADDR in .env to an address
+#     of this host that only the proxy can reach (a LAN/VPN interface, firewalled),
+#     point the proxy at <that address>:8480 and :8481, and set
+#     SCRIPTORIUM_TRUSTED_PROXIES / KC_PROXY_TRUSTED_ADDRESSES to the proxy's address.
+# Never publish the metrics port (9100) or Keycloak's management port (9000).
+
+name: scriptorium
+
+x-scriptorium-common: &scriptorium-common
+  image: ghcr.io/milkyengineer/scriptorium:1
+  env_file: scriptorium.env
+  secrets: [scriptorium_master_keys]
+  read_only: true
+  tmpfs: ["/tmp"]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  volumes:
+    # /data MUST be a local POSIX filesystem (ext4, xfs, ZFS, btrfs) — not NFS/SMB,
+    # not a FUSE mount (sshfs, mergerfs, union/pool share paths). SQLite WAL needs
+    # POSIX locks and shared memory; the server refuses to start otherwise.
+    - ${SCRIPTORIUM_HOST_DATA_DIR:-/srv/scriptorium/data}:/data
+    # Optional, for SCRIPTORIUM_SNAPSHOT_STRATEGY=host: the host's ZFS/btrfs
+    # snapshot directory of the data dataset, read-only.
+    # - ${SCRIPTORIUM_HOST_SNAPSHOT_DIR:-/srv/scriptorium/data/.zfs/snapshot}:/data/snapshots:ro
+
+services:
+  scriptorium:
+    <<: *scriptorium-common
+    command: serve
+    networks: [proxy, internal]
+    ports:
+      # MCP + /.well-known + /dl + /healthz. See the topology note at the top.
+      - "${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:8480:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  scriptorium-worker:
+    <<: *scriptorium-common
+    command: worker
+    networks: [internal]
+    depends_on:
+      scriptorium:
+        condition: service_started
+    # Let a running download/commit finish before SIGKILL.
+    stop_grace_period: 60s
+    healthcheck:
+      # Checks the worker heartbeat row in /data/scriptorium.sqlite (§13).
+      test: ["CMD", "scriptorium", "healthcheck", "--worker"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ---- optional: only if you have no OIDC issuer.  `docker compose --profile keycloak up -d` ----
+  keycloak:
+    profiles: [keycloak]
+    image: quay.io/keycloak/keycloak:26.4.7
+    restart: unless-stopped
+    # Refuse to start with the placeholders unset: the realm import substitutes
+    # ${SCRIPTORIUM_AUDIENCE} and ${KC_HOSTNAME} from this environment, and an empty
+    # value would silently produce tokens Scriptorium rejects.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        for v in SCRIPTORIUM_AUDIENCE KC_HOSTNAME KC_DB_PASSWORD; do
+          if [ -z "$${!v:-}" ]; then
+            echo "keycloak: $$v is empty; set it in docker/.env" >&2
+            exit 64
+          fi
+        done
+        exec /opt/keycloak/bin/kc.sh "$$@"
+      - kc.sh
+    # Not `--optimized`: the stock image is not pre-built for PostgreSQL and the
+    # health endpoints (build-time options), so Keycloak re-augments on first start.
+    # Build a custom image with `kc.sh build` if start-up time matters.
+    command: ["start", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-}
+      KC_HOSTNAME: ${KC_HOSTNAME:-}
+      KC_HOSTNAME_ADMIN: ${KC_HOSTNAME_ADMIN:-http://127.0.0.1:8481}
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_PROXY_TRUSTED_ADDRESSES: ${KC_PROXY_TRUSTED_ADDRESSES:-127.0.0.1,172.16.0.0/12}
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "false"
+      # Temporary master-realm admin, created on the very first start only. Replace it
+      # with a permanent admin and then clear these two values (docker/keycloak/README.md).
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:-}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:-}
+      # Realm-import placeholder (docker/keycloak/realm-scriptorium.json); must equal
+      # SCRIPTORIUM_OIDC_AUDIENCE (default: SCRIPTORIUM_PUBLIC_URL) in scriptorium.env.
+      SCRIPTORIUM_AUDIENCE: ${SCRIPTORIUM_AUDIENCE:-}
+    volumes:
+      # Imported once, when the realm does not exist yet; later edits need a manual
+      # re-import (docker/keycloak/README.md).
+      - ./keycloak/realm-scriptorium.json:/opt/keycloak/data/import/realm-scriptorium.json:ro
+      - ./keycloak/create-admin.sh:/opt/keycloak/scriptorium/create-admin.sh:ro
+    networks: [proxy, internal, keycloak-db]
+    ports:
+      # Public endpoints go through the proxy; the admin console is reached here
+      # (KC_HOSTNAME_ADMIN), never through the public hostname.
+      - "${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:8481:8080"
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    healthcheck:
+      # The image has bash but no curl: talk HTTP to the management port directly.
+      test:
+        - CMD
+        - bash
+        - -c
+        - "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  keycloak-db:
+    profiles: [keycloak]
+    image: postgres:16.15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      # Empty → the postgres image refuses to initialise. Generate one into .env.
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-}
+    volumes:
+      # Back this up together with /data (§13 "Backups of the backup").
+      - ${KEYCLOAK_HOST_DB_DIR:-/srv/scriptorium/keycloak-db}:/var/lib/postgresql/data
+    networks: [keycloak-db]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---- optional: AGPL ink sidecar (§4.4); enables push_ink.  `--profile ink` ----
+  # Set SCRIPTORIUM_INK_SIDECAR_URL=http://scriptorium-ink:9000 in scriptorium.env.
+  scriptorium-ink:
+    profiles: [ink]
+    image: ghcr.io/milkyengineer/scriptorium-ink:1
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  # Shared with a reverse proxy running on this Docker host. If the proxy's own
+  # compose project owns the network, set `external: true` and its name here.
+  proxy:
+    name: ${SCRIPTORIUM_PROXY_NETWORK:-scriptorium-proxy}
+  # Service-to-service traffic. Not `internal: true`: the worker needs egress to the
+  # reMarkable cloud and Anthropic, the server to the issuer's JWKS.
+  internal: {}
+  # Keycloak <-> PostgreSQL only; no egress.
+  keycloak-db:
+    internal: true
+
+secrets:
+  # Outside /data; back it up separately (escrow copy). Never commit it. Compose
+  # bind-mounts the file with its host ownership and mode, so make it readable by
+  # the container's (non-root) user and nobody else.
+  scriptorium_master_keys:
+    file: ./secrets/master_keys
