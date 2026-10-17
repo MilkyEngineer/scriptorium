@@ -88,3 +88,15 @@ and rate limits.
 Cloudflare terminates TLS, so note content passes through it. §13 prefers the
 direct route. With the zone proxied, ACME http-01 still works as long as
 `/.well-known/acme-challenge/` reaches the origin; otherwise use DNS-01.
+
+## Firewalling the published ports (remote proxy)
+
+When the proxy is on another machine, every device on that LAN can reach the
+published ports directly, and Keycloak serves its admin console on the
+proxy-facing port too. A rule on the proxy or router cannot stop that, because
+LAN-to-LAN traffic never passes through it: the rule has to live on the Docker
+host, in Docker's `DOCKER-USER` chain. `docker-user-allowlist.sh` installs it:
+
+    LAN_IF=br0 HOST_ADDR=<this host> PROXY_ADDR=<proxy> ./docker-user-allowlist.sh
+
+Run it as root after Docker starts and persist it with a post-Docker boot hook.
