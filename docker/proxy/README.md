@@ -97,6 +97,6 @@ proxy-facing port too. A rule on the proxy or router cannot stop that, because
 LAN-to-LAN traffic never passes through it: the rule has to live on the Docker
 host, in Docker's `DOCKER-USER` chain. `docker-user-allowlist.sh` installs it:
 
-    LAN_IF=br0 HOST_ADDR=<this host> PROXY_ADDR=<proxy> ./docker-user-allowlist.sh
+    HOST_ADDR=<this host> PROXY_ADDR=<proxy> ./docker-user-allowlist.sh
 
 Run it as root after Docker starts and persist it with a post-Docker boot hook.
