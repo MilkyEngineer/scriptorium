@@ -17,7 +17,9 @@
 #   MAX_DELETE    refuse to prune if more than N would go (breaker)   (default 20)
 #   LOCK_FILE     serialises overlapping runs   (default /run/lock/scriptorium-snapshot.lock)
 #   MIRROR_DIR    with --mirror-only: directory on ANOTHER filesystem that receives a copy of
-#                 the newest snapshot (the "backup of the backup", §13)
+#                 the newest snapshot (the "backup of the backup", §13). It must be owned by
+#                 the user running the script and not writable by group or others, because
+#                 the script writes there as root.
 #
 # Options:
 #   --dry-run      print what would be created and deleted; change nothing (root not required)
@@ -113,6 +115,13 @@ if ((MIRROR_ONLY)); then
     case "$mirror_real/" in "$data_real/"* | "$snap_real/"*) die "MIRROR_DIR must be outside DATA_SUBVOL and SNAP_DIR" ;; esac
     [[ $(stat -c %d -- "$mirror_real") != $(stat -c %d -- "$snap_real") ]] \
         || die "MIRROR_DIR is on the same filesystem as SNAP_DIR; a mirror there protects nothing"
+    read -r m_uid m_mode < <(stat -c '%u %a' -- "$mirror_real")
+    [[ $m_uid == "$EUID" ]] || die "MIRROR_DIR must be owned by the user running this script (uid $EUID)"
+    [[ $((8#$m_mode & 8#022)) -eq 0 ]] || die "MIRROR_DIR must not be writable by group or others (chmod 700)"
+    for p in latest latest.snapshot; do
+        [[ ! -L $mirror_real/$p ]] || die "$mirror_real/$p is a symlink; refusing"
+    done
+    [[ ! -e $mirror_real/latest || -d $mirror_real/latest ]] || die "$mirror_real/latest is not a directory"
     newest=""
     shopt -s nullglob
     for path in "$snap_real"/*; do
@@ -132,8 +141,9 @@ if ((MIRROR_ONLY)); then
     ((DRY_RUN)) && rsync_opts+=(-n)
     rsync "${rsync_opts[@]}" -- "$snap_real/$newest/" "$mirror_real/latest/" || die "rsync failed"
     if ((!DRY_RUN)); then
-        printf '%s\n' "$newest" >"$mirror_real/latest.snapshot.tmp"
-        mv -f -- "$mirror_real/latest.snapshot.tmp" "$mirror_real/latest.snapshot"
+        marker=$(mktemp -- "$mirror_real/.latest.snapshot.XXXXXX") || die "cannot create marker"
+        printf '%s\n' "$newest" >"$marker"
+        mv -f -- "$marker" "$mirror_real/latest.snapshot"
     fi
     log "mirror now at $newest"
     exit 0

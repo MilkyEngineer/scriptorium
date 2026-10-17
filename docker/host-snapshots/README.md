@@ -135,7 +135,10 @@ if listing:
 ## Backup of the backup (§13)
 
 Snapshots live on the same filesystem as the data. Once a night, copy the newest
-one to another filesystem (a second pool, an array, a mounted backup disk):
+one to another filesystem (a second pool, an array, a mounted backup disk). The
+target directory must belong to the user running the job (root, for cron) and be
+mode 700: the script refuses a shared or world-writable directory, because root
+writing into one can be tricked by a planted symlink.
 
     MIRROR_DIR=/path/on/another/filesystem DATA_SUBVOL=... SNAP_DIR=... \
       snapshot-btrfs.sh --mirror-only
