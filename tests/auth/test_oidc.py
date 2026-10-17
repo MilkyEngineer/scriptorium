@@ -340,9 +340,16 @@ async def test_no_admin_claim_configured_means_no_admins(
 
 
 def test_claim_at_path() -> None:
-    claims = {"realm_access": {"roles": ["a"]}, "https://example.com/roles": ["b"]}
+    claims = {
+        "realm_access": {"roles": ["a"]},
+        "https://example.com/roles": ["b"],
+        "cognito:groups": ["c"],
+        "groups": ["d"],
+    }
     assert claim_at_path(claims, "realm_access.roles") == ["a"]
     assert claim_at_path(claims, "https://example.com/roles") == ["b"]
+    assert claim_at_path(claims, "cognito:groups") == ["c"]
+    assert claim_at_path(claims, "groups") == ["d"]
     assert claim_at_path(claims, "realm_access.missing") is None
     assert claim_at_path(claims, "realm_access.roles.deeper") is None
 
@@ -371,6 +378,42 @@ async def test_unverified_email_rejected(
         await validator.validate(token)
 
 
+async def test_dotted_top_level_claim_cannot_shadow_nested_roles(
+    validator: OIDCValidator, issuer: FakeIssuer
+) -> None:
+    token = issuer.token(
+        sub=ADMIN_SUB,
+        realm_access={"roles": []},
+        **{"realm_access.roles": ["scriptorium-admin"]},
+    )
+    assert (await validator.validate(token)).is_admin is False
+
+
+@pytest.mark.parametrize("claim", ["sub", "preferred_username"])
+async def test_email_entry_never_matches_the_user_claim(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, claim: str
+) -> None:
+    """An issuer whose subject is a self-chosen email must not bypass email_verified."""
+    validator = make_validator(
+        make_settings(oidc_user_claim=claim, oidc_allowed_users=ALLOWED_EMAIL)
+    )
+    unverified = issuer.token(
+        sub=ALLOWED_EMAIL,
+        preferred_username=ALLOWED_EMAIL,
+        email=ALLOWED_EMAIL,
+        email_verified=False,
+    )
+    with pytest.raises(UserNotAllowed):
+        await validator.validate(unverified)
+    verified = issuer.token(
+        sub=ALLOWED_EMAIL,
+        preferred_username=ALLOWED_EMAIL,
+        email=ALLOWED_EMAIL,
+        email_verified=True,
+    )
+    assert (await validator.validate(verified)).sub == ALLOWED_EMAIL
+
+
 async def test_unknown_user_rejected(validator: OIDCValidator, issuer: FakeIssuer) -> None:
     with pytest.raises(UserNotAllowed):
         await validator.validate(issuer.token(sub="33333333-0000-4000-8000-000000000000"))
@@ -395,9 +438,12 @@ async def test_custom_user_claim(
     assert user.uid_hash == hashlib.sha256(f"{ISSUER}|object-id-1".encode()).hexdigest()
 
 
-async def test_display_name_falls_back(validator: OIDCValidator, issuer: FakeIssuer) -> None:
-    token = issuer.token(preferred_username=None)
-    assert (await validator.validate(token)).display_name == ALLOWED_SUB[:8]
+async def test_display_name_falls_back_without_email(
+    validator: OIDCValidator, issuer: FakeIssuer
+) -> None:
+    token = issuer.token(preferred_username=None, email=ALLOWED_EMAIL, email_verified=True)
+    user = await validator.validate(token)
+    assert user.display_name == f"user-{user.uid_hash[:8]}"
 
 
 async def test_scp_list_claim(validator: OIDCValidator, issuer: FakeIssuer) -> None:

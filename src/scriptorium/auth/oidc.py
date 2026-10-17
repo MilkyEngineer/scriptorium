@@ -107,11 +107,13 @@ def uid_hash_for(iss: str, sub: str) -> str:
 def claim_at_path(claims: Mapping[str, Any], path: str) -> Any:
     """Value at a dotted claim path, e.g. ``realm_access.roles``.
 
-    A top-level claim whose name itself contains dots (Auth0's namespaced
-    ``https://example.com/roles``) is matched first.
+    A namespaced claim name (``https://example.com/roles``, ``cognito:groups``) is
+    looked up as a single top-level key. Otherwise the path is always walked, so a
+    top-level claim literally named ``realm_access.roles`` cannot shadow the
+    nested one.
     """
-    if path in claims:
-        return claims[path]
+    if "/" in path or ":" in path:
+        return claims.get(path)
     node: Any = claims
     for part in path.split("."):
         if not isinstance(node, Mapping) or part not in node:
@@ -202,7 +204,10 @@ class OIDCValidator:
         self._required_scopes = (
             frozenset(settings.oidc_required_scopes) if required_scopes is None else required_scopes
         )
-        self._allowed = frozenset(settings.oidc_allowed_users)
+        # Entries containing "@" are emails and match only a verified email claim, never
+        # the user claim: an issuer whose subject is a self-chosen email or username
+        # must not let an unverified "alice@example.com" through.
+        self._allowed = frozenset(u for u in settings.oidc_allowed_users if "@" not in u)
         self._allowed_emails = frozenset(u.lower() for u in settings.oidc_allowed_users if "@" in u)
 
         self._metadata: ProviderMetadata | None = None
@@ -450,14 +455,16 @@ class OIDCValidator:
                 claim_at_path(claims, settings.oidc_admin_claim), settings.oidc_admin_value
             )
 
+        uid_hash = uid_hash_for(self._issuer, sub)
         name_claim = claims.get(settings.oidc_name_claim)
         display_name = (
-            name_claim if isinstance(name_claim, str) and name_claim else (email or sub[:8])
+            # Never the email: the display name may be shown or logged where emails may not.
+            name_claim if isinstance(name_claim, str) and name_claim else f"user-{uid_hash[:8]}"
         )
         return User(
             iss=self._issuer,
             sub=sub,
-            uid_hash=uid_hash_for(self._issuer, sub),
+            uid_hash=uid_hash,
             display_name=display_name,
             email=email,
             email_verified=email_verified,
