@@ -221,7 +221,7 @@ Protected-resource metadata, served by Scriptorium (exact JSON):
 
 401 contract: no token → `WWW-Authenticate: Bearer resource_metadata="…", scope="scriptorium"`; expired or invalid token → the same plus `error="invalid_token"` so the client refreshes; insufficient scope → 403 `error="insufficient_scope"`. `/.well-known/*`, `/healthz`, `/dl/*` and the 401 path are handled by Scriptorium's own ASGI middleware **before** the MCP SDK sees the request. `resource` is `SCRIPTORIUM_PUBLIC_URL` byte-for-byte (no trailing slash) and must equal the URL the user types into Claude.
 
-Token validation: `iss` equals the configured issuer; `aud` (string or array) **contains** `SCRIPTORIUM_OIDC_AUDIENCE`; algorithms pinned to `RS256`/`ES256`; clock skew 60 s; JWKS cached, refetched on unknown `kid` at most once per 60 s (DoS cooldown) **and** when the cached set is older than `OIDC_JWKS_MAX_AGE_SECONDS` (default 3600, or a smaller `Cache-Control: max-age` from the issuer), so a key the issuer revokes stops being trusted within the hour; a refresh that fails falls back to a cached set no older than 24 h, otherwise the server fails closed. Scopes are not part of validation unless `OIDC_REQUIRED_SCOPES` is set: `aud` membership is the authorization check, because issuers differ in how (and whether) they expose a scope claim. The audience comes from a mapper at the AS; Scriptorium does not rely on the OAuth `resource` parameter being honoured.
+Token validation: `iss` equals the configured issuer; `aud` (string or array) **contains** `SCRIPTORIUM_OIDC_AUDIENCE`; algorithms pinned to `RS256`/`ES256`; clock skew 60 s; JWKS cached, refetched on unknown `kid` at most once per 60 s (DoS cooldown) **and** when the cached set is older than `OIDC_JWKS_MAX_AGE_SECONDS` (default 3600, or a smaller `Cache-Control: max-age` from the issuer), so a key the issuer revokes stops being trusted within the hour; a refresh that fails falls back to a cached set no older than 24 h, otherwise the server fails closed. `jwks_uri` must share the issuer's scheme, host and port and the metadata and key documents are size-capped while streaming. Authenticated non-POST requests to `/mcp` get 405 (no server-held streams in stateless mode). Scopes are not part of validation unless `OIDC_REQUIRED_SCOPES` is set: `aud` membership is the authorization check, because issuers differ in how (and whether) they expose a scope claim. The audience comes from a mapper at the AS; Scriptorium does not rely on the OAuth `resource` parameter being honoured.
 
 Key consequences:
 
@@ -236,7 +236,7 @@ Key consequences:
 | --- | --- |
 | `SCRIPTORIUM_OIDC_ISSUER` | Issuer URL. Discovery at `<issuer>/.well-known/openid-configuration` and/or RFC 8414. Required. |
 | `SCRIPTORIUM_OIDC_AUDIENCE` | Value that must appear in `aud` (default: `SCRIPTORIUM_PUBLIC_URL`). |
-| `SCRIPTORIUM_OIDC_USER_CLAIM` | Claim used, together with `iss`, as the stable user id (default `sub`). It must be **immutable at the issuer**: anything else (`email`, `preferred_username`) is refused at start-up unless `SCRIPTORIUM_OIDC_UNSAFE_USER_CLAIM=true`, and `email` is only ever used when `email_verified` is `true`, lower-cased. |
+| `SCRIPTORIUM_OIDC_USER_CLAIM` | Claim used, together with `iss`, as the stable user id (default `sub`). It must be **immutable at the issuer**: anything else (`email`, `preferred_username`) is refused at start-up unless `SCRIPTORIUM_OIDC_UNSAFE_USER_CLAIM=true`, and `email` is only ever used when `email_verified` is `true`, with ASCII letters case-folded and nothing else normalised (no Unicode casefold or IDNA, so look-alike addresses never merge). The allowlist match uses the same rule. |
 | `SCRIPTORIUM_OIDC_NAME_CLAIM` | Display name claim (default `preferred_username`, fallback `email`). |
 | `SCRIPTORIUM_OIDC_ADMIN_CLAIM` / `SCRIPTORIUM_OIDC_ADMIN_VALUE` | Claim path and value that grants admin tools, e.g. `realm_access.roles` / `scriptorium-admin`. |
 | `SCRIPTORIUM_OIDC_ALLOWED_USERS` | **Required.** Comma-separated `sub` values or emails. Emails match only when `email_verified` is `true`. The server refuses to start when this is empty unless `SCRIPTORIUM_ALLOW_ALL_ISSUER_USERS=true` is set explicitly. |
@@ -530,7 +530,7 @@ Environment variables, all prefixed `SCRIPTORIUM_`. Secrets may be given as `*_F
 | `MASTER_KEYS` | — | One or more urlsafe-base64 32-byte keys, comma-separated, newest first (MultiFernet; rotate by prepending and re-encrypting with `scriptorium admin rotate-keys`). Generate with `scriptorium gen-master-key`. Keep an escrow copy outside `/data`. Losing every key means every user relinks. |
 | `OIDC_*` | — | §5.2; `OIDC_ALLOWED_USERS` required |
 | `OIDC_REQUIRED_SCOPES` | empty | Scopes (from `scope` or `scp`) a token must carry; empty = `aud` alone decides (§5.1) |
-| `OIDC_JWKS_MAX_AGE_SECONDS` | `3600` | Cached JWKS is refreshed after this age (§5.1) |
+| `OIDC_JWKS_MAX_AGE_SECONDS` | `3600` | Cached JWKS is refreshed after this age; 60–86400 (§5.1) |
 | `OIDC_UNSAFE_USER_CLAIM` | `false` | Required to use an `OIDC_USER_CLAIM` other than `sub` (§5.2) |
 | `SPIKE_TOOLS` | `false` | Registers the `spike_*` test tools used by S6; never on in production |
 | `ALLOW_ALL_ISSUER_USERS` | `false` | Explicit opt-out of the allowlist |
