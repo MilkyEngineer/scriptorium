@@ -1,0 +1,157 @@
+# Scriptorium — Caddy reverse-proxy example (Architecture §13 per-path table).
+#
+# Needs Caddy >= 2.8 (client_ip matcher, trust_pool). TLS certificates come from
+# ACME automatically (http-01/tls-alpn-01 on ports 80/443). Replace example.com
+# names and the RFC 5737 addresses with your own.
+#
+# Caddy's reverse_proxy already passes Host unchanged and sets X-Forwarded-For,
+# X-Forwarded-Proto and X-Forwarded-Host, replacing (not appending to) values sent
+# by clients that are not in `trusted_proxies`.
+{
+	email hostmaster@example.com
+
+	servers {
+		# Optional Cloudflare (proxied DNS) variant: take the client address from
+		# CF-Connecting-IP, but only from Cloudflare's ranges, and require
+		# Authenticated Origin Pulls on both sites (the `tls` blocks below) so nothing
+		# else can connect at all. Keep the ranges current from
+		# https://www.cloudflare.com/ips/.
+		# trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 ...
+		# client_ip_headers CF-Connecting-IP
+		# trusted_proxies_strict
+	}
+}
+
+# Upstreams.
+# (a) Caddy runs on the Docker host and is attached to the `proxy` network:
+#       scriptorium:8000   keycloak:8080
+# (b) Caddy runs on another machine: the ports compose publishes on
+#     SCRIPTORIUM_PUBLISH_ADDR (here 192.0.2.10), and SCRIPTORIUM_TRUSTED_PROXIES /
+#     KC_PROXY_TRUSTED_ADDRESSES set to this machine's address:
+#       192.0.2.10:8480    192.0.2.10:8481
+# Change the two lines below to switch.
+
+(scriptorium_upstream) {
+	reverse_proxy scriptorium:8000 {
+		# Stream every response immediately (SSE on /mcp). Caddy has no upstream
+		# read timeout by default, so long-lived streams are not cut at 100 s.
+		flush_interval -1
+	}
+	# reverse_proxy 192.0.2.10:8480 {
+	# 	flush_interval -1
+	# }
+}
+
+(keycloak_upstream) {
+	reverse_proxy keycloak:8080
+	# reverse_proxy 192.0.2.10:8481
+}
+
+(cloudflare_origin_pull) {
+	# Uncomment with the Cloudflare variant above.
+	# tls {
+	# 	client_auth {
+	# 		mode require_and_verify
+	# 		trust_pool file /etc/caddy/cloudflare-origin-pull-ca.pem
+	# 	}
+	# }
+}
+
+# ---------------------------------------------------------------------------
+# mcp.example.com — Scriptorium
+# ---------------------------------------------------------------------------
+
+mcp.example.com {
+	import cloudflare_origin_pull
+	header Strict-Transport-Security "max-age=31536000"
+
+	# The matchers below are deliberately disjoint, so the order Caddy sorts the
+	# `handle` blocks in does not matter.
+
+	# Streamable HTTP MCP endpoint and protected-resource metadata (RFC 9728).
+	# OPTIONAL defence in depth (§13; bearer auth is the real control): uncomment
+	# the client_ip line, listing every network Claude Code runs from or Claude Code
+	# breaks; other sources then get the 404 below.
+	@mcp {
+		path /mcp /mcp/* /.well-known/*
+		# client_ip 160.79.104.0/21 203.0.113.0/24
+	}
+	handle @mcp {
+		import scriptorium_upstream
+	}
+
+	# Signed downloads for users' browsers. Rate-limit them with the
+	# caddy-ratelimit plugin if you build Caddy with it.
+	handle /dl/* {
+		import scriptorium_upstream
+	}
+
+	# Proxy / monitoring only.
+	@healthz_allowed {
+		path /healthz
+		client_ip 127.0.0.1 198.51.100.0/24
+	}
+	handle @healthz_allowed {
+		import scriptorium_upstream
+	}
+
+	# Everything else, including /healthz from elsewhere: not exposed. Metrics live
+	# on :9100 and are never proxied.
+	handle {
+		respond 404
+	}
+}
+
+# ---------------------------------------------------------------------------
+# auth.example.com — Keycloak (only with the `keycloak` compose profile)
+# ---------------------------------------------------------------------------
+
+auth.example.com {
+	import cloudflare_origin_pull
+	header Strict-Transport-Security "max-age=31536000"
+
+	# Admin console and master realm: deny from the internet (§5.3, §13); the
+	# console is reached on KC_HOSTNAME_ADMIN. Keep a LAN/admin CIDR only if needed.
+	@admin_allowed {
+		path /admin /admin/* /realms/master /realms/master/*
+		client_ip 198.51.100.0/24
+	}
+	@admin_denied {
+		path /admin /admin/* /realms/master /realms/master/*
+		not client_ip 198.51.100.0/24
+	}
+	handle @admin_allowed {
+		import keycloak_upstream
+	}
+	handle @admin_denied {
+		respond 403
+	}
+
+	# Clients are pre-registered; no dynamic client registration from outside.
+	handle /realms/scriptorium/clients-registrations/* {
+		respond 403
+	}
+
+	# Public realm endpoints: OIDC protocol, login actions, identity brokering,
+	# discovery.
+	@realm path_regexp realm ^/realms/scriptorium/(protocol/openid-connect/|login-actions/|broker/[^/]+/(endpoint|login)|\.well-known/)
+	handle @realm {
+		import keycloak_upstream
+	}
+	# Optional: the account console, if users should manage their own password/2FA.
+	# handle /realms/scriptorium/account* {
+	# 	import keycloak_upstream
+	# }
+
+	# Theme assets, and RFC 8414 metadata for the path-based issuer
+	# (/.well-known/oauth-authorization-server/realms/scriptorium).
+	@public path /resources/* /.well-known/*
+	handle @public {
+		import keycloak_upstream
+	}
+
+	# Everything else (/, other realms, /health, /metrics): not exposed.
+	handle {
+		respond 404
+	}
+}
