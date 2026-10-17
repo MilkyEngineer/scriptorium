@@ -101,7 +101,12 @@ class User:
 
 
 def uid_hash_for(iss: str, sub: str) -> str:
-    return hashlib.sha256(f"{iss}|{sub}".encode()).hexdigest()
+    """SHA-256 of the issuer, a newline and the user claim, in hex (Architecture §6).
+
+    The storage directory is the first 16 hex characters. The issuer cannot contain
+    a newline (settings reject whitespace in URLs), so the pair is unambiguous.
+    """
+    return hashlib.sha256((iss + "\n" + sub).encode()).hexdigest()
 
 
 def claim_at_path(claims: Mapping[str, Any], path: str) -> Any:

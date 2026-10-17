@@ -43,7 +43,8 @@ async def test_valid_rs256(validator: OIDCValidator, issuer: FakeIssuer) -> None
     user = await validator.validate(issuer.token("rsa-1"))
     assert user.iss == ISSUER
     assert user.sub == ALLOWED_SUB
-    assert user.uid_hash == hashlib.sha256(f"{ISSUER}|{ALLOWED_SUB}".encode()).hexdigest()
+    # Architecture §6: sha256(iss + "\n" + user_claim); storage uses the first 16 hex chars.
+    assert user.uid_hash == hashlib.sha256(f"{ISSUER}\n{ALLOWED_SUB}".encode()).hexdigest()
     assert user.display_name == "reader"
     assert user.is_admin is False
     assert user.scopes == frozenset({"openid", "scriptorium", "email"})
@@ -435,7 +436,7 @@ async def test_custom_user_claim(
     )
     user = await validator.validate(issuer.token(oid="object-id-1"))
     assert user.sub == "object-id-1"
-    assert user.uid_hash == hashlib.sha256(f"{ISSUER}|object-id-1".encode()).hexdigest()
+    assert user.uid_hash == hashlib.sha256(f"{ISSUER}\nobject-id-1".encode()).hexdigest()
 
 
 async def test_display_name_falls_back_without_email(

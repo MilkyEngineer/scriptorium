@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from scriptorium.auth.context import (
@@ -47,4 +49,11 @@ def test_uid_hash_is_iss_and_sub() -> None:
     assert uid_hash_for("https://a.example.com", "x") != uid_hash_for("https://b.example.com", "x")
     # The issuer cannot contain the separator (config rejects it), so the pair is unambiguous.
     iss = "https://a.example.com"
-    assert uid_hash_for(iss, "x|y") != uid_hash_for(iss, "x")
+    assert uid_hash_for(iss, "x\ny") != uid_hash_for(iss, "x")
+
+
+def test_uid_hash_matches_architecture_section_6() -> None:
+    """users/<uid>/ is sha256(iss + "\\n" + user_claim)[:16]; the full hex is kept."""
+    expected = hashlib.sha256(b"https://auth.example.com/realms/r\nsub-1").hexdigest()
+    assert uid_hash_for("https://auth.example.com/realms/r", "sub-1") == expected
+    assert len(expected) == 64

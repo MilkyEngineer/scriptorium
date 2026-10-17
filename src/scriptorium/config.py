@@ -88,7 +88,7 @@ def _split_csv(value: object) -> object:
 
 
 def _validate_url(value: str, *, require_path: str | None) -> str:
-    # "|" is the (iss, sub) separator in the user hash and is never valid unescaped in a URL.
+    # No whitespace: a newline separates (iss, sub) in the user hash (Architecture §6).
     if value != value.strip() or any(c in value for c in "\"'<>|` \t\r\n\\"):
         raise ValueError("must be a plain URL without quotes, '|' or whitespace")
     parts = urlsplit(value)
