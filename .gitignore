@@ -1,0 +1,30 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local config and secrets
+.env
+*.env
+!*.env.example
+secrets/
+*.pem
+*_deploy
+*_deploy.pub
+
+# Runtime data
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
