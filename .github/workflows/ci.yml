@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Action versions are pinned to exact releases; uv matches the Dockerfile's UV_IMAGE.
+env:
+  UV_VERSION: "0.13.1"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  types:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run mypy
+
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest -q
+
+  licence:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      # Exactly what the image ships (no dev tools, so the metadata fallback is used).
+      - name: Runtime dependencies
+        run: |
+          uv sync --locked --no-dev
+          uv run --no-sync scriptorium licence-check
+      # Everything, via pip-licenses.
+      - name: Runtime and dev dependencies
+        run: |
+          uv sync --locked
+          uv run scriptorium licence-check
+
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3.6.0
+      - uses: docker/setup-buildx-action@v3.10.0
+      - name: Build linux/amd64 and linux/arm64 (no push)
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Load linux/amd64 for a smoke test
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: scriptorium:ci
+          cache-from: type=gha
+      - name: Smoke test (read-only root, tmpfs /tmp, non-root)
+        run: |
+          set -eu
+          test "$(docker run --rm --entrypoint id scriptorium:ci -u)" = "1000"
+          docker run --rm --read-only --tmpfs /tmp scriptorium:ci licence-check
+          status=0
+          docker run --rm --read-only --tmpfs /tmp scriptorium:ci worker || status=$?
+          test "$status" -eq 2
+          key="$(docker run --rm --read-only --tmpfs /tmp scriptorium:ci gen-master-key)"
+          docker run -d --name smoke --read-only --tmpfs /tmp -p 127.0.0.1:8000:8000 \
+            -e SCRIPTORIUM_PUBLIC_URL=http://localhost:8000/mcp \
+            -e SCRIPTORIUM_OIDC_ISSUER=https://auth.example.com/realms/ci \
+            -e SCRIPTORIUM_OIDC_ALLOWED_USERS=ci-user \
+            -e SCRIPTORIUM_MASTER_KEYS="$key" \
+            scriptorium:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/healthz && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/.well-known/oauth-protected-resource
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp)"
+          test "$code" = "401"
+          docker exec smoke scriptorium healthcheck
+      - name: Container logs
+        if: always()
+        run: docker logs smoke || true
