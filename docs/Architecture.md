@@ -397,11 +397,11 @@ All conversion happens in the worker; clients send text or a URL. This is what m
 
 | Tool | Input | Conversion | Lands as |
 | --- | --- | --- | --- |
-| `push_markdown(title, folder, markdown)` | Markdown text (≤ `MAX_INLINE_KB`, default 256) | markdown-it (**`html=False`**) → HTML → PDF (WeasyPrint in a sandboxed subprocess) at the device page size | Annotatable PDF |
+| `push_markdown(title, folder, markdown)` | Markdown text (≤ `MAX_INLINE_KB`, default 64) | markdown-it (**`html=False`**) → HTML → PDF (WeasyPrint in a sandboxed subprocess) at the device page size | Annotatable PDF |
 | `push_file(title, folder, kind, url \| data_base64)` | `pdf`, `epub` | Pass-through | Document |
 | `push_ink(title, folder, kind, url \| data_base64)` | `png`, `jpg`, `svg`, `pdf` | `scriptorium-ink` sidecar (rmink, AGPL, optional; §4.4) → `.rm` v6 strokes in a `.rmdoc` (Move geometry) | Native notebook; strokes are erasable and extendable. Hidden when the sidecar is not configured |
 
-**Inline data is small by nature.** A Claude client produces tool arguments as output tokens, so a few hundred KB is the realistic ceiling, and claude.ai cannot hand a chat attachment's bytes to a tool. `MAX_INLINE_KB` therefore defaults to 256; anything larger comes by `url`. In practice "push from a phone" means Markdown or a URL, and the documentation says so.
+**Inline data is small by nature.** A Claude client produces tool arguments as output tokens: S6 measured that claude.ai would not build a 64 KB argument and stalled on a 4 KB literal, and claude.ai cannot hand a chat attachment's bytes to a tool. Realistic inline Markdown is a few KB; `MAX_INLINE_KB` is a server-side ceiling that defaults to 64, and anything larger comes by `url`. In practice "push from a phone" means Markdown or a URL, and the documentation says so.
 
 **Markdown → PDF sandbox.** Raw HTML disabled; WeasyPrint runs with a custom `url_fetcher` that permits only `data:` URIs (no `file:`, no `http(s):`), fonts bundled in the image (DejaVu + Noto Sans CJK; `XDG_CACHE_HOME=/tmp/fontconfig` for the read-only rootfs), in a subprocess with a 30 s CPU limit, 512 MB RSS limit and no network namespace where the runtime permits.
 
@@ -444,7 +444,7 @@ What restore cannot bring back: device settings, Wi-Fi, templates, splash screen
 - **User context** comes from the bearer token; no tool accepts a user id or a filesystem path. `tools/list` is filtered per request (admin tools, `push_ink`).
 - **Document identifiers**: a UUID, or a `/`-separated path of visible names from the root (`Notes/Projects/2026-10`). Ambiguous paths return `ambiguous` with the candidate UUIDs. Folders likewise. Cloud-supplied names are display data only; filesystem names are always UUIDs (allowlist `^[0-9a-f-]{36}(\.(metadata|content|pagedata|pdf|epub))?$`), and every resolved path is asserted to stay inside the account root.
 - **Pages** are 1-based in every tool.
-- **Pagination**: list-like tools take `limit` (≤ 100, default 50) and `cursor`, and return `next_cursor`. Text results are capped at 64 KB; `read_document` paginates by page range.
+- **Pagination**: list-like tools take `limit` (≤ 100, default 50) and `cursor`, and return `next_cursor`. Text results are capped at 32 KB (Claude Code persists results of about 64 KB to a file and shows the model a 2 KB preview; S6); `read_document` paginates by page range.
 - **Timestamps** are ISO 8601 UTC in and out.
 - **Errors** are MCP tool errors (`isError: true`) with `{code, message, hint}`; codes: `not_linked`, `needs_relink`, `not_found`, `ambiguous`, `stale_hash`, `quota_exceeded`, `ocr_cap_reached`, `pending`, `refused`, `confirm_required`, `sync_anomaly`, `invalid_argument`.
 - **Long operations** return `{job, state}`; `read_page` on a cache miss waits up to 20 s then returns `pending` with the job id.
@@ -473,7 +473,7 @@ What restore cannot bring back: device settings, Wi-Fi, templates, splash screen
 | `search(query, folder=null, limit, cursor)` | FTS over transcripts, names and paths; returns page refs with snippets. |
 | `read_page(document, page)` | Transcript (triggers OCR per mode on cache miss; in lazy mode returns the image and asks the client to transcribe). |
 | `read_document(document, format="markdown" \| "pdf", pages=null)` | Whole document: sectioned Markdown of transcripts (paginated), or a rendered PDF via signed download URL. |
-| `page_image(document, page, scale=1)` | PNG of the page for Claude to look at. |
+| `page_image(document, page, scale=1)` | PNG of the page for Claude to look at (an image block, which every client delivers to the model), plus a Markdown `/dl/` link with a filename for the person, because claude.ai mobile shows image blocks as text and resource links are invisible on claude.ai, Desktop and mobile (S6). Default size about 200 KB (longest side 1024 px). |
 | `versions(document)` / `read_page(document, page, version=<generation>)` | Version history (§6). |
 | `link_page(document, page, kind, ref)` / `links(document, page)` | Store or list external references (opaque strings ≤ 1 KB). |
 
@@ -543,7 +543,7 @@ Environment variables, all prefixed `SCRIPTORIUM_`. Secrets may be given as `*_F
 | `OCR_MODEL` | `claude-sonnet-5-5` | |
 | `OCR_MONTHLY_CAP_USD` / `OCR_USER_MONTHLY_CAP_USD` | `20` / `10` | Global and per-user caps on server-key spend, all call types |
 | `OCR_PRICE_IN_PER_MTOK` / `OCR_PRICE_OUT_PER_MTOK` | list price of `OCR_MODEL` | For cost accounting |
-| `MAX_INLINE_KB` / `MAX_FETCH_MB` | `256` / `50` | §9 |
+| `MAX_INLINE_KB` / `MAX_FETCH_MB` | `64` / `50` | §9; S6 |
 | `PUSH_URL_ALLOWLIST` | empty | Host suffixes; empty = confirmation required per fetch |
 | `INK_SIDECAR_URL` | unset | e.g. `http://scriptorium-ink:9000`; `push_ink` is hidden when unset |
 | `DEFAULT_QUOTA_GB` | `20` | Per user |
@@ -673,7 +673,7 @@ Details, procedures and acceptance criteria live in `docs/Plan/`. Summary:
 | **S3** | Do Paper Pro Move `.rm` files render correctly with rmscene? | The dedicated test notebook (≥ 20 pages, colour, highlighter, typed text, annotated PDF) renders without errors and matches reference photos; panel geometry confirmed **Result: passed; geometry, colours and extents recorded in `docs/Spikes/S3.md`; fork tag `scriptorium-s3`** | M1 |
 | **S4** | How does the cloud behave on a free account, and what does the 50-day cut-off look like? | On a free account: list/download/upload work (or are documented as Connect-only); an aged document's state is observed (absent from root / blobs 404 / flagged) and the tombstone `deletion_cause` heuristic is specified from the evidence | M1 |
 | **S5** | Two containers + SQLite WAL on the operator's `/data` filesystem; host snapshot feasibility | 24 h soak of server + worker with concurrent reads/writes, no `SQLITE_BUSY` escalations or corruption; `statfs` refusal verified on a FUSE mount; a host snapshot is listed and readable from the container | M1 **Result: steps 1 and 3 passed on the operator's host (btrfs); 24 h soak running (`docs/Spikes/S5.md`)** |
-| **S6** | What do Claude clients actually render from this server? | Image blocks on claude.ai mobile; resource links vs signed URLs; max practical tool-argument size; `tools/list` filtering per user — all measured and written down | M1 |
+| **S6** | What do Claude clients actually render from this server? | Image blocks on claude.ai mobile; resource links vs signed URLs; max practical tool-argument size; `tools/list` filtering per user — all measured and written down | M1 **Result: passed; matrix and defaults in `docs/Spikes/S6.md` (image blocks reach the model everywhere but the person only on web/Desktop; resource links invisible; `/dl/` URLs copy-paste on claude.ai, clickable in terminals; 64 KB results intact except Claude Code persists them; 4 KB literal arguments stall the client; admin tools listed without reconnect)** |
 
 ### Milestones
 
