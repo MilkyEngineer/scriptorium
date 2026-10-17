@@ -13,7 +13,9 @@
 # exist yet the script creates it: Docker adopts an existing chain and keeps its
 # rules, so running this from an early boot hook closes the ports before any
 # container is reachable (no wait, no race). Idempotent: re-running replaces the
-# rules it owns. Persist it with whatever your host runs at boot (an early boot hook, with a copy of this script on the boot medium). Outcome goes to syslog via logger.
+# rules it owns. Persist it with whatever your host runs at boot; on appliance-style
+# hosts whose data pools mount late, keep a copy of this script on the boot medium
+# and call it from the early boot hook. Outcome goes to syslog via logger.
 #
 #   HOST_ADDR=192.0.2.10 PROXY_ADDR=192.0.2.1 ./docker-user-allowlist.sh
 set -euo pipefail
