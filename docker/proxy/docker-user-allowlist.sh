@@ -9,9 +9,10 @@
 # `--ctdir ORIGINAL` leaves reply packets alone; connections whose original
 # destination is not HOST_ADDR:port (container egress, other services) never match.
 #
-# Run as root after the Docker daemon is up (it creates DOCKER-USER). Idempotent:
-# re-running replaces the rules it owns. Persist it with whatever your host runs
-# after Docker starts (an early boot hook, with a copy of this script on the boot medium).
+# Run as root. It waits up to WAIT_SECONDS (default 1800) for the Docker daemon
+# to create DOCKER-USER, so it can be started from an early boot hook in the
+# background. Idempotent: re-running replaces the rules it owns. Persist it with
+# whatever your host runs at boot (an early boot hook, with a copy of this script on the boot medium).
 #
 #   HOST_ADDR=192.0.2.10 PROXY_ADDR=192.0.2.1 ./docker-user-allowlist.sh
 set -euo pipefail
@@ -19,13 +20,17 @@ set -euo pipefail
 HOST_ADDR="${HOST_ADDR:?this host's LAN address the ports are published on}"
 PROXY_ADDR="${PROXY_ADDR:?the reverse proxy's address}"
 PORTS="${PORTS:-8480 8481}"
+WAIT_SECONDS="${WAIT_SECONDS:-1800}"
 TAG="scriptorium-allowlist"
 
-for _ in $(seq 1 60); do
-  iptables -nL DOCKER-USER >/dev/null 2>&1 && break
-  sleep 2
+deadline=$(( $(date +%s) + WAIT_SECONDS ))
+until iptables -nL DOCKER-USER >/dev/null 2>&1; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "DOCKER-USER chain missing after ${WAIT_SECONDS}s; is Docker running?" >&2
+    exit 1
+  fi
+  sleep 5
 done
-iptables -nL DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing; is Docker running?" >&2; exit 1; }
 
 # Drop the rules from a previous run (matched by their comment), then re-add.
 while read -r num; do
