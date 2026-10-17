@@ -216,7 +216,11 @@ def resolve_client(
 
 
 class ForwardedHeadersMiddleware:
-    """Puts ``client_ip`` and ``scheme`` on the request state (for logs and rate limits)."""
+    """Puts ``client_ip`` and ``scheme`` on the request state (for logs and rate limits).
+
+    A trusted proxy's ``X-Forwarded-Proto`` also becomes the ASGI scope's scheme, so
+    any URL Starlette derives from the request says https behind a TLS proxy.
+    """
 
     def __init__(self, app: ASGIApp, trusted: Sequence[IPNetwork]) -> None:
         self.app = app
@@ -236,6 +240,9 @@ class ForwardedHeadersMiddleware:
             state = scope.setdefault("state", {})
             state["client_ip"] = ip
             state["scheme"] = proto
+            # resolve_client returns the scope's own scheme unless a trusted proxy said
+            # http or https, so this changes nothing for anyone else.
+            scope["scheme"] = proto
         await self.app(scope, receive, send)
 
 
@@ -535,7 +542,7 @@ def create_app(
         Route(MCP_PATH, mcp_app),
         Route(MCP_PATH + "/", mcp_app),
     ]
-    return Starlette(
+    app = Starlette(
         routes=routes,
         middleware=[
             Middleware(ForwardedHeadersMiddleware, trusted=settings.trusted_proxies),
@@ -543,3 +550,8 @@ def create_app(
         ],
         lifespan=lifespan,
     )
+    # A slash redirect builds its Location from the client's Host header (an open
+    # redirect, and /dl tokens in URLs), and no client needs one: every path here is
+    # exact. Starlette 0.52's constructor does not take this flag.
+    app.router.redirect_slashes = False
+    return app

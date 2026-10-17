@@ -229,6 +229,27 @@ async def test_unknown_path_is_404_without_auth(http: httpx.AsyncClient) -> None
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/mcp//",
+        "/healthz/",
+        f"/dl/{'A' * 43}/",
+        "/.well-known/oauth-protected-resource/",
+        "/.well-known/oauth-protected-resource/mcp/",
+    ],
+)
+@pytest.mark.parametrize("host", ["mcp.example.com", "evil.example.com"])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_no_trailing_slash_redirects(
+    http: httpx.AsyncClient, path: str, host: str, method: str
+) -> None:
+    """A slash redirect would echo the Host header into Location (an open redirect)."""
+    response = await http.request(method, path, headers={"Host": host})
+    assert response.status_code == 404
+    assert "location" not in response.headers
+
+
 def test_spike_tools_only_when_enabled() -> None:
     assert len(build_registry(make_settings(spike_tools=False))) == 0
     assert len(build_registry(make_settings(spike_tools=True))) == 7
@@ -497,15 +518,26 @@ async def test_client_ip_on_request_state(issuer: FakeIssuer) -> None:
 
     async def probe(request: Request) -> PlainTextResponse:
         seen.update(request.state._state)
+        seen["url"] = str(request.url)
         return PlainTextResponse("ok")
 
     inner = Starlette(routes=[Route("/", probe)])
     wrapped = ForwardedHeadersMiddleware(inner, TRUSTED)
+    forwarded = {"X-Forwarded-For": "198.51.100.1", "X-Forwarded-Proto": "https"}
     transport = httpx.ASGITransport(app=wrapped, client=("172.18.0.2", 4000))
     async with httpx.AsyncClient(transport=transport, base_url="http://mcp.example.com") as c:
-        await c.get("/", headers={"X-Forwarded-For": "198.51.100.1", "X-Forwarded-Proto": "https"})
+        await c.get("/", headers=forwarded)
     assert seen["client_ip"] == "198.51.100.1"
     assert seen["scheme"] == "https"
+    assert seen["url"] == "https://mcp.example.com/"  # the scope's scheme follows the proxy
+
+    # From an untrusted peer the same headers change nothing.
+    transport = httpx.ASGITransport(app=wrapped, client=("203.0.113.9", 4000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://mcp.example.com") as c:
+        await c.get("/", headers=forwarded)
+    assert seen["client_ip"] == "203.0.113.9"
+    assert seen["scheme"] == "http"
+    assert seen["url"] == "http://mcp.example.com/"
 
 
 # ---- the command line (serve's entry point) -----------------------------------------------
