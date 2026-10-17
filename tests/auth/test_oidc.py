@@ -531,6 +531,30 @@ async def test_admin_role_as_string_claim(
     assert (await validator.validate(issuer.token(role="administrator"))).is_admin is False
 
 
+@pytest.mark.parametrize(
+    ("admin_value", "claim", "is_admin"),
+    [
+        ("True", True, False),
+        ("True", [True], False),
+        ("1", [True], False),
+        ("1", True, False),
+        ("1", [1], True),
+        ("1", 1, True),
+        ("admin", ["x", "admin"], True),
+        ("admin", {"admin": True}, False),
+    ],
+)
+async def test_admin_claim_never_matches_booleans(
+    make_validator: Callable[..., OIDCValidator],
+    issuer: FakeIssuer,
+    admin_value: str,
+    claim: object,
+    is_admin: bool,
+) -> None:
+    validator = make_validator(make_settings(oidc_admin_claim="role", oidc_admin_value=admin_value))
+    assert (await validator.validate(issuer.token(role=claim))).is_admin is is_admin
+
+
 async def test_no_admin_claim_configured_means_no_admins(
     make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer
 ) -> None:

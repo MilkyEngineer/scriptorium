@@ -155,12 +155,15 @@ def claim_at_path(claims: Mapping[str, Any], path: str) -> Any:
     return node
 
 
+def _scalar_matches(value: Any, wanted: str) -> bool:
+    # bool is an int subclass; True must never match an admin value of "True" or "1".
+    return isinstance(value, str | int) and not isinstance(value, bool) and str(value) == wanted
+
+
 def _claim_contains(value: Any, wanted: str) -> bool:
     if isinstance(value, list | tuple):
-        return any(isinstance(v, str | int) and str(v) == wanted for v in value)
-    if isinstance(value, str | int) and not isinstance(value, bool):
-        return str(value) == wanted
-    return False
+        return any(_scalar_matches(v, wanted) for v in value)
+    return _scalar_matches(value, wanted)
 
 
 def _scopes(claims: Mapping[str, Any]) -> frozenset[str]:
