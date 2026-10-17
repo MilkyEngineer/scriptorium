@@ -1,0 +1,133 @@
+{
+    "cPages": {
+        "lastOpened": {
+            "timestamp": "1:7",
+            "value": "ba3daa02-7e76-4f3b-bd80-da62f5cd77cb"
+        },
+        "original": {
+            "timestamp": "0:0",
+            "value": -1
+        },
+        "pages": [
+            {
+                "id": "00000000-0000-4000-8000-000000000101",
+                "idx": {
+                    "timestamp": "1:2",
+                    "value": "ba"
+                },
+                "modifed": "1792229757447",
+                "template": {
+                    "timestamp": "1:1",
+                    "value": "P Lined heading"
+                }
+            },
+            {
+                "id": "00000000-0000-4000-8000-000000000102",
+                "idx": {
+                    "timestamp": "1:2",
+                    "value": "bb"
+                },
+                "modifed": "1792229867139",
+                "template": {
+                    "timestamp": "1:2",
+                    "value": "P Lined heading"
+                }
+            },
+            {
+                "id": "00000000-0000-4000-8000-000000000103",
+                "idx": {
+                    "timestamp": "1:2",
+                    "value": "bc"
+                },
+                "modifed": "1792230003937",
+                "template": {
+                    "timestamp": "1:2",
+                    "value": "P Lined heading"
+                }
+            },
+            {
+                "id": "00000000-0000-4000-8000-000000000104",
+                "idx": {
+                    "timestamp": "1:2",
+                    "value": "bd"
+                },
+                "modifed": "1792230112445",
+                "template": {
+                    "timestamp": "1:2",
+                    "value": "P Lined heading"
+                }
+            },
+            {
+                "id": "00000000-0000-4000-8000-000000000105",
+                "idx": {
+                    "timestamp": "1:2",
+                    "value": "be"
+                },
+                "modifed": "1792230261451",
+                "template": {
+                    "timestamp": "1:2",
+                    "value": "P Lined heading"
+                }
+            },
+            {
+                "id": "00000000-0000-4000-8000-000000000106",
+                "idx": {
+                    "timestamp": "1:2",
+                    "value": "bf"
+                },
+                "modifed": "1792230334455",
+                "template": {
+                    "timestamp": "1:2",
+                    "value": "P Lined heading"
+                }
+            },
+            {
+                "id": "00000000-0000-4000-8000-000000000107",
+                "idx": {
+                    "timestamp": "1:2",
+                    "value": "bg"
+                },
+                "modifed": "1792230476445",
+                "scrollTime": {
+                    "timestamp": "1:1",
+                    "value": "2026-10-17T09:48:36Z"
+                },
+                "template": {
+                    "timestamp": "1:2",
+                    "value": "P Lined heading"
+                },
+                "verticalScroll": {
+                    "timestamp": "1:1",
+                    "value": 3267.4242424242425
+                }
+            }
+        ],
+        "uuids": [
+            {
+                "first": "00000000-0000-4000-8000-000000000500",
+                "second": 1
+            }
+        ]
+    },
+    "coverPageNumber": -1,
+    "customZoomCenterX": 0,
+    "customZoomCenterY": 936,
+    "customZoomOrientation": "portrait",
+    "customZoomPageHeight": 1872,
+    "customZoomPageWidth": 1404,
+    "customZoomScale": 1,
+    "documentMetadata": {},
+    "extraMetadata": {},
+    "fileType": "notebook",
+    "fontName": "",
+    "formatVersion": 2,
+    "lineHeight": 100,
+    "orientation": "portrait",
+    "pageCount": 7,
+    "pageTags": [],
+    "sizeInBytes": "392384",
+    "tags": [],
+    "textAlignment": "justify",
+    "textScale": 1,
+    "zoomMode": "bestFit"
+}

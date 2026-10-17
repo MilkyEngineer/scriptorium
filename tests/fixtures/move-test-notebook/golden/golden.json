@@ -1,0 +1,114 @@
+{
+ "scale_px_per_unit": 1.163415,
+ "pdf_units_per_pt": 3.138889,
+ "pages": {
+  "notebook-01": {
+   "viewbox_units": [
+    -410.0,
+    0.0,
+    820.0,
+    1458.0
+   ],
+   "px": [
+    954,
+    1696
+   ],
+   "sha256": "2ee4945b81ed11658668985ec10552b6567241c4d6b6fc6ada6e7f9eb7bce41f"
+  },
+  "notebook-02": {
+   "viewbox_units": [
+    -410.0,
+    0.0,
+    820.0,
+    1458.0
+   ],
+   "px": [
+    954,
+    1696
+   ],
+   "sha256": "30ee053cbabcb73ada2fd60cea90df6e5406e20bbff2c2b4eb6e1e58af953c2f"
+  },
+  "notebook-03": {
+   "viewbox_units": [
+    -410.0,
+    0.0,
+    820.0,
+    1472.5
+   ],
+   "px": [
+    954,
+    1713
+   ],
+   "sha256": "6334563b41e64d57b28ba687cb3155d7e453e98e973edfde2ec356d83b1b3890"
+  },
+  "notebook-04": {
+   "viewbox_units": [
+    -410.0,
+    0.0,
+    820.0,
+    1458.0
+   ],
+   "px": [
+    954,
+    1696
+   ],
+   "sha256": "e148628b9134ca81046d78cf5cb7593211a31566a504a33444e4272559723539"
+  },
+  "notebook-05": {
+   "viewbox_units": [
+    -410.0,
+    0.0,
+    820.0,
+    1458.0
+   ],
+   "px": [
+    954,
+    1696
+   ],
+   "sha256": "a6ee3239d9a0c41a3f9e6b6ebe93c6bc3f5ec125e15ba56961914b70c3364d9c"
+  },
+  "notebook-06": {
+   "viewbox_units": [
+    -410.0,
+    0.0,
+    820.0,
+    1458.0
+   ],
+   "px": [
+    954,
+    1696
+   ],
+   "sha256": "6d42c42163a304b142fcdb944b35ce71ef01e36a11b257fc958d37965789a06b"
+  },
+  "notebook-07": {
+   "viewbox_units": [
+    -713.5,
+    0.0,
+    1431.7,
+    3759.8
+   ],
+   "px": [
+    1666,
+    4374
+   ],
+   "sha256": "e5fbd99abea8af8ab4ed29e77c42c6e86fa3b3b09c14b66f58a00954ce384a69"
+  },
+  "pdf-01": {
+   "viewbox_units": [
+    -960.5,
+    0,
+    1921.0,
+    2486.0
+   ],
+   "px": [
+    2235,
+    2892
+   ],
+   "pdf_page_px": [
+    2235,
+    2892
+   ],
+   "sha256": "35c12f97b14c8443946c9721c1e5fb86cd4ac9c7e4a8e8d6f1af9013ea1ed317"
+  }
+ }
+}

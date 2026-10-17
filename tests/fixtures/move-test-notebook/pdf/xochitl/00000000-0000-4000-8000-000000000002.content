@@ -1,0 +1,64 @@
+{
+    "cPages": {
+        "lastOpened": {
+            "timestamp": "2:1",
+            "value": "53ddc010-77dd-4ad3-8b5d-b1c44a9058c8"
+        },
+        "original": {
+            "timestamp": "2:1",
+            "value": 1
+        },
+        "pages": [
+            {
+                "id": "00000000-0000-4000-8000-000000000101",
+                "idx": {
+                    "timestamp": "2:1",
+                    "value": "b"
+                },
+                "modifed": "1792230716575",
+                "redir": {
+                    "timestamp": "2:1",
+                    "value": 0
+                }
+            }
+        ],
+        "uuids": [
+            {
+                "first": "00000000-0000-4000-8000-000000000500",
+                "second": 2
+            },
+            {
+                "first": "00000000-0000-4000-8000-000000000500",
+                "second": 1
+            }
+        ]
+    },
+    "coverPageNumber": -1,
+    "customZoomCenterX": 0,
+    "customZoomCenterY": 936,
+    "customZoomOrientation": "portrait",
+    "customZoomPageHeight": 1872,
+    "customZoomPageWidth": 1404,
+    "customZoomScale": 1,
+    "documentMetadata": {
+        "title": "This is a test PDF document"
+    },
+    "dummyDocument": false,
+    "extraMetadata": {},
+    "fileType": "pdf",
+    "fontName": "",
+    "formatVersion": 2,
+    "keyboardMetadata": {
+        "count": 0,
+        "timestamp": 0
+    },
+    "lineHeight": -1,
+    "orientation": "portrait",
+    "pageCount": 1,
+    "pageTags": [],
+    "sizeInBytes": "53507",
+    "tags": [],
+    "textAlignment": "justify",
+    "textScale": 1,
+    "zoomMode": "bestFit"
+}
