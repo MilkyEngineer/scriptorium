@@ -189,6 +189,24 @@ def test_audience_override(env: pytest.MonkeyPatch) -> None:
     assert load_settings().audience == "scriptorium-api"
 
 
+@pytest.mark.parametrize("claim", ["email", "oid", "preferred_username"])
+def test_user_claim_other_than_sub_needs_explicit_opt_in(
+    env: pytest.MonkeyPatch, claim: str
+) -> None:
+    env.setenv("SCRIPTORIUM_OIDC_USER_CLAIM", claim)
+    with pytest.raises(ConfigError, match="SCRIPTORIUM_OIDC_UNSAFE_USER_CLAIM") as info:
+        load_settings()
+    assert "immutable" in str(info.value)
+    env.setenv("SCRIPTORIUM_OIDC_UNSAFE_USER_CLAIM", "true")
+    assert load_settings().oidc_user_claim == claim
+
+
+def test_sub_needs_no_opt_in(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_OIDC_USER_CLAIM", " sub ")
+    settings = load_settings()
+    assert (settings.oidc_user_claim, settings.oidc_unsafe_user_claim) == ("sub", False)
+
+
 def test_admin_claim_and_value_together(env: pytest.MonkeyPatch) -> None:
     env.setenv("SCRIPTORIUM_OIDC_ADMIN_CLAIM", "realm_access.roles")
     with pytest.raises(ConfigError, match="OIDC_ADMIN_VALUE"):

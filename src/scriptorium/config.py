@@ -124,7 +124,21 @@ class Settings(BaseSettings):
     master_keys: SecretStr | None = None
     oidc_issuer: str
     oidc_audience: str | None = None
-    oidc_user_claim: str = "sub"
+    oidc_user_claim: str = Field(
+        default="sub",
+        description=(
+            "Claim that, with the issuer, identifies a user and names their storage. It must "
+            "be immutable at the issuer: a claim users can change lets them take over another "
+            "user's library. Anything but `sub` needs OIDC_UNSAFE_USER_CLAIM=true."
+        ),
+    )
+    oidc_unsafe_user_claim: bool = Field(
+        default=False,
+        description=(
+            "Explicit acknowledgement that OIDC_USER_CLAIM is not `sub`; the operator vouches "
+            "that the issuer never lets that claim change or be reassigned."
+        ),
+    )
     oidc_name_claim: str = "preferred_username"
     oidc_admin_claim: str | None = None
     oidc_admin_value: str | None = None
@@ -188,6 +202,17 @@ class Settings(BaseSettings):
     def _bind(cls, value: str) -> str:
         _parse_bind(value)
         return value
+
+    @model_validator(mode="after")
+    def _identity_claim(self) -> Settings:
+        if self.oidc_user_claim != "sub" and not self.oidc_unsafe_user_claim:
+            raise ValueError(
+                f"{env_name('oidc_user_claim')} is not `sub`. The identity claim must be "
+                "immutable at the issuer (for example Entra ID's `oid`), or users could take "
+                f"over each other's storage; set {env_name('oidc_unsafe_user_claim')}=true to "
+                "confirm that it is."
+            )
+        return self
 
     @model_validator(mode="after")
     def _default_deny(self) -> Settings:

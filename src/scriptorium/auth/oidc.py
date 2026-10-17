@@ -440,6 +440,12 @@ class OIDCValidator:
         email_claim = claims.get("email")
         email = email_claim if isinstance(email_claim, str) and email_claim else None
         email_verified = claims.get("email_verified") is True
+        if settings.oidc_user_claim == "email":
+            # An email is an identity only once the issuer has verified it, and letter
+            # case must not split one mailbox into two users (two storage directories).
+            if not email_verified:
+                raise UserNotAllowed("email_not_verified")
+            sub = sub.lower()
 
         allowed = (
             settings.allow_all_issuer_users

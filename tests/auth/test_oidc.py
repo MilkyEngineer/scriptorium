@@ -21,7 +21,9 @@ from scriptorium.auth.oidc import (
     UserNotAllowed,
     claim_at_path,
     discovery_urls,
+    uid_hash_for,
 )
+from scriptorium.config import Settings
 from tests.conftest import (
     ADMIN_SUB,
     ALLOWED_EMAIL,
@@ -396,7 +398,11 @@ async def test_email_entry_never_matches_the_user_claim(
 ) -> None:
     """An issuer whose subject is a self-chosen email must not bypass email_verified."""
     validator = make_validator(
-        make_settings(oidc_user_claim=claim, oidc_allowed_users=ALLOWED_EMAIL)
+        make_settings(
+            oidc_user_claim=claim,
+            oidc_unsafe_user_claim=claim != "sub",
+            oidc_allowed_users=ALLOWED_EMAIL,
+        )
     )
     unverified = issuer.token(
         sub=ALLOWED_EMAIL,
@@ -432,11 +438,41 @@ async def test_custom_user_claim(
     make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer
 ) -> None:
     validator = make_validator(
-        make_settings(oidc_user_claim="oid", oidc_allowed_users="object-id-1")
+        make_settings(
+            oidc_user_claim="oid", oidc_unsafe_user_claim=True, oidc_allowed_users="object-id-1"
+        )
     )
     user = await validator.validate(issuer.token(oid="object-id-1"))
     assert user.sub == "object-id-1"
     assert user.uid_hash == hashlib.sha256(f"{ISSUER}\nobject-id-1".encode()).hexdigest()
+
+
+def _email_identity_settings() -> Settings:
+    return make_settings(
+        oidc_user_claim="email", oidc_unsafe_user_claim=True, oidc_allowed_users=ALLOWED_EMAIL
+    )
+
+
+@pytest.mark.parametrize("verified", [False, "true", 1, None])
+async def test_email_user_claim_requires_verified_email(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, verified: object
+) -> None:
+    """With OIDC_USER_CLAIM=email an unverified (or unstated) email is no identity at all."""
+    validator = make_validator(_email_identity_settings())
+    token = issuer.token(email=ALLOWED_EMAIL, email_verified=verified)
+    with pytest.raises(UserNotAllowed, match="email_not_verified"):
+        await validator.validate(token)
+
+
+async def test_email_user_claim_ignores_letter_case(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer
+) -> None:
+    """READER@… and reader@… are one mailbox, so one identity and one storage directory."""
+    validator = make_validator(_email_identity_settings())
+    upper = await validator.validate(issuer.token(email="READER@example.com", email_verified=True))
+    lower = await validator.validate(issuer.token(email="reader@example.com", email_verified=True))
+    assert upper.sub == lower.sub == "reader@example.com"
+    assert upper.uid_hash == lower.uid_hash == uid_hash_for(ISSUER, "reader@example.com")
 
 
 async def test_display_name_falls_back_without_email(
