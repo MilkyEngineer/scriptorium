@@ -133,6 +133,15 @@ async def test_healthz_without_token(http: httpx.AsyncClient) -> None:
     assert response.json() == {"status": "ok", "version": __version__}
 
 
+async def test_healthz_does_not_depend_on_the_issuer(
+    http: httpx.AsyncClient, issuer: FakeIssuer
+) -> None:
+    """The container healthcheck (and CI's smoke test) run with no reachable issuer."""
+    issuer.down = True
+    assert (await http.get("/healthz")).status_code == 200
+    assert sum(issuer.hits.values()) == 0
+
+
 @pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
 async def test_mcp_without_token_is_401_with_challenge(http: httpx.AsyncClient, path: str) -> None:
     response = await http.post(path, json=_rpc("tools/list"), headers=MCP_HEADERS)
