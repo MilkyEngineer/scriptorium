@@ -140,6 +140,28 @@ async def test_mcp_without_token_is_401_with_challenge(http: httpx.AsyncClient, 
     assert response.headers.get_list("www-authenticate") == [CHALLENGE]
 
 
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+@pytest.mark.parametrize("method", ["GET", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"])
+async def test_mcp_non_post_is_405_once_authenticated(
+    http: httpx.AsyncClient, issuer: FakeIssuer, path: str, method: str
+) -> None:
+    """Stateless JSON mode has no server-initiated SSE stream and no session to delete."""
+    headers = {"Authorization": f"Bearer {issuer.token()}", "Accept": "text/event-stream"}
+    response = await http.request(method, path, headers=headers)
+    assert response.status_code == 405
+    assert response.headers["allow"] == "POST"
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+async def test_mcp_non_post_without_token_keeps_the_401_contract(
+    http: httpx.AsyncClient, path: str, method: str
+) -> None:
+    response = await http.request(method, path, headers={"Accept": "text/event-stream"})
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == CHALLENGE
+
+
 async def test_other_auth_scheme_counts_as_no_token(http: httpx.AsyncClient) -> None:
     headers = {"Authorization": "Basic dXNlcjpwYXNz", **MCP_HEADERS}
     response = await http.post("/mcp", json=_rpc("tools/list"), headers=headers)

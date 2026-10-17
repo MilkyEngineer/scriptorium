@@ -7,9 +7,9 @@ Request flow, outermost first:
 2. ``AccessLogMiddleware``: one structured line per request, capability tokens redacted.
 3. Scriptorium's own routes, which need no token: protected-resource metadata,
    ``/healthz`` and ``/dl/<token>``.
-4. ``/mcp``: ``BearerAuthMiddleware`` (the 401/403 contract), which binds the
-   user to the request, then the MCP SDK's Streamable HTTP transport in
-   stateless mode.
+4. ``/mcp``: ``BearerAuthMiddleware`` (the 401/403 contract, then 405 for
+   anything but POST), which binds the user to the request, then the MCP SDK's
+   Streamable HTTP transport in stateless mode.
 
 Request bodies on ``/mcp`` are limited by the SDK's body-limit middleware to
 :data:`MCP_MAX_REQUEST_BODY_BYTES`; nothing else here reads a body.
@@ -373,8 +373,22 @@ class BearerAuthMiddleware:
             await (response or unavailable_response())(scope, receive, send)
             return
         scope.setdefault("state", {})["uid"] = user.log_uid
+        if scope.get("method") != "POST":
+            # Stateless JSON mode never opens a server-initiated SSE stream (GET) and has
+            # no session to delete (DELETE); a GET would otherwise hold a stream open.
+            await _method_not_allowed()(scope, receive, send)
+            return
         with user_context(user):
             await self.app(scope, receive, send)
+
+
+def _method_not_allowed() -> Response:
+    return Response(
+        "Method Not Allowed",
+        status_code=405,
+        media_type="text/plain",
+        headers={"Allow": "POST", "Cache-Control": "no-store"},
+    )
 
 
 # ---- MCP -------------------------------------------------------------------------------------
