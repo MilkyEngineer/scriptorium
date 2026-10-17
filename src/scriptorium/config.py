@@ -49,16 +49,31 @@ def env_name(field_name: str) -> str:
     return f"{ENV_PREFIX}{field_name.upper()}"
 
 
+def _env_spellings(name: str) -> list[str]:
+    """Values of every environment variable that settings would read as ``name``.
+
+    Settings match names case-insensitively (by ``str.lower``, as pydantic-settings
+    does), so ``scriptorium_master_keys`` sets ``SCRIPTORIUM_MASTER_KEYS`` too.
+    """
+    wanted = name.lower()
+    return [value for key, value in os.environ.items() if key.lower() == wanted]
+
+
 class _FileEnvSource(PydanticBaseSettingsSource):
     """Reads ``SCRIPTORIUM_<NAME>_FILE`` for every field (Docker secrets)."""
 
     def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
         file_var = env_name(field_name) + FILE_SUFFIX
-        path = os.environ.get(file_var)
-        if not path:
+        paths = [p for p in _env_spellings(file_var) if p]
+        if not paths:
             return None, field_name, False
-        if os.environ.get(env_name(field_name)):
+        if len(paths) > 1:
+            raise ConfigError(f"{file_var} is set more than once (in different letter cases)")
+        # Any spelling, even an empty one: the environment outranks the file, so the
+        # file's value would otherwise be dropped without a word.
+        if _env_spellings(env_name(field_name)):
             raise ConfigError(f"set either {env_name(field_name)} or {file_var}, not both")
+        path = paths[0]
         try:
             with open(path, "rb") as fh:
                 raw = fh.read(_MAX_SECRET_FILE_BYTES + 1)
@@ -200,6 +215,21 @@ class Settings(BaseSettings):
             raise ValueError("must not be empty")
         return value.strip()
 
+    @field_validator("oidc_admin_claim", "oidc_admin_value")
+    @classmethod
+    def _optional_text(cls, value: str | None) -> str | None:
+        # Blank counts as unset, so a stray space cannot half-configure admin gating.
+        return (value.strip() or None) if value is not None else None
+
+    @field_validator("oidc_audience")
+    @classmethod
+    def _audience(cls, value: str | None) -> str | None:
+        if not value:
+            return None  # unset or empty (compose passes unset variables through as "")
+        if not value.strip():
+            raise ValueError("is blank; leave it unset to use SCRIPTORIUM_PUBLIC_URL")
+        return value.strip()
+
     @field_validator("oidc_required_scopes")
     @classmethod
     def _scope_tokens(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -232,13 +262,19 @@ class Settings(BaseSettings):
                 f"allowed `sub` values or verified emails, or set "
                 f"{env_name('allow_all_issuer_users')}=true to admit every user of the issuer."
             )
-        if self.master_keys is None or not self.master_keys.get_secret_value().strip():
+        if self.oidc_allowed_users and self.allow_all_issuer_users:
+            raise ValueError(
+                f"{env_name('allow_all_issuer_users')}=true admits every user of the issuer, "
+                f"but {env_name('oidc_allowed_users')} also lists users. Empty the list to "
+                "admit everyone, or unset the opt-out to admit only the listed users."
+            )
+        keys = _split_csv(self.master_keys.get_secret_value()) if self.master_keys else []
+        assert isinstance(keys, list)
+        if not keys:  # unset, blank, or only commas
             raise ValueError(
                 f"{env_name('master_keys')} (or {env_name('master_keys')}{FILE_SUFFIX}) is "
                 "required; generate a key with `scriptorium gen-master-key`."
             )
-        keys = _split_csv(self.master_keys.get_secret_value())
-        assert isinstance(keys, list)
         for position, key in enumerate(keys, start=1):
             try:
                 Fernet(key)

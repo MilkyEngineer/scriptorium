@@ -42,7 +42,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     import os
 
     for name in list(os.environ):
-        if name.startswith("SCRIPTORIUM_"):
+        if name.upper().startswith("SCRIPTORIUM_"):  # settings match names in any case
             monkeypatch.delenv(name, raising=False)
 
 

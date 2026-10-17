@@ -75,8 +75,23 @@ def test_explicit_opt_out_allows_empty_allowlist(env: pytest.MonkeyPatch) -> Non
     assert load_settings().allow_all_issuer_users is True
 
 
+def test_allow_all_with_an_allowlist_is_ambiguous(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_ALLOW_ALL_ISSUER_USERS", "true")
+    with pytest.raises(ConfigError, match="SCRIPTORIUM_ALLOW_ALL_ISSUER_USERS") as info:
+        load_settings()
+    assert "SCRIPTORIUM_OIDC_ALLOWED_USERS" in str(info.value)
+    assert "reader@example.com" not in str(info.value)
+
+
 def test_missing_master_keys_refused(env: pytest.MonkeyPatch) -> None:
     env.delenv("SCRIPTORIUM_MASTER_KEYS")
+    with pytest.raises(ConfigError, match="gen-master-key"):
+        load_settings()
+
+
+@pytest.mark.parametrize("value", [",,", " , ", ",", "   "])
+def test_master_keys_that_split_to_nothing_refused(env: pytest.MonkeyPatch, value: str) -> None:
+    env.setenv("SCRIPTORIUM_MASTER_KEYS", value)
     with pytest.raises(ConfigError, match="gen-master-key"):
         load_settings()
 
@@ -127,6 +142,35 @@ def test_both_forms_refused(env: pytest.MonkeyPatch, tmp_path: Path) -> None:
     secret = tmp_path / "master_keys"
     secret.write_text(MASTER_KEY)
     env.setenv("SCRIPTORIUM_MASTER_KEYS_FILE", str(secret))
+    with pytest.raises(ConfigError, match="not both"):
+        load_settings()
+
+
+def test_lower_case_name_and_file_refused(env: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Settings read names case-insensitively, so the conflict check must too."""
+    secret = tmp_path / "master_keys"
+    secret.write_text(MASTER_KEY)
+    env.delenv("SCRIPTORIUM_MASTER_KEYS")
+    env.setenv("scriptorium_master_keys", Fernet.generate_key().decode())
+    env.setenv("SCRIPTORIUM_MASTER_KEYS_FILE", str(secret))
+    with pytest.raises(ConfigError, match="not both"):
+        load_settings()
+
+
+def test_lower_case_file_variant_is_read(env: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    secret = tmp_path / "master_keys"
+    secret.write_text(MASTER_KEY)
+    env.delenv("SCRIPTORIUM_MASTER_KEYS")
+    env.setenv("scriptorium_master_keys_file", str(secret))
+    assert load_settings().master_key_list() == [MASTER_KEY]
+
+
+def test_empty_name_and_file_refused(env: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """An empty variable outranks the file, so the file would be silently ignored."""
+    audience = tmp_path / "audience"
+    audience.write_text("scriptorium-api")
+    env.setenv("SCRIPTORIUM_OIDC_AUDIENCE", "")
+    env.setenv("SCRIPTORIUM_OIDC_AUDIENCE_FILE", str(audience))
     with pytest.raises(ConfigError, match="not both"):
         load_settings()
 
@@ -185,8 +229,17 @@ def test_issuer_must_be_https(env: pytest.MonkeyPatch) -> None:
 
 
 def test_audience_override(env: pytest.MonkeyPatch) -> None:
-    env.setenv("SCRIPTORIUM_OIDC_AUDIENCE", "scriptorium-api")
+    env.setenv("SCRIPTORIUM_OIDC_AUDIENCE", " scriptorium-api ")
     assert load_settings().audience == "scriptorium-api"
+    env.setenv("SCRIPTORIUM_OIDC_AUDIENCE", "")  # compose passes unset variables as ""
+    assert load_settings().audience == PUBLIC_URL
+
+
+@pytest.mark.parametrize("blank", [" ", "\t", "  \n "])
+def test_blank_audience_refused(env: pytest.MonkeyPatch, blank: str) -> None:
+    env.setenv("SCRIPTORIUM_OIDC_AUDIENCE", blank)
+    with pytest.raises(ConfigError, match="SCRIPTORIUM_OIDC_AUDIENCE"):
+        load_settings()
 
 
 @pytest.mark.parametrize("claim", ["email", "oid", "preferred_username"])
@@ -223,6 +276,34 @@ def test_admin_claim_and_value_together(env: pytest.MonkeyPatch) -> None:
         load_settings()
     env.setenv("SCRIPTORIUM_OIDC_ADMIN_VALUE", "scriptorium-admin")
     assert load_settings().oidc_admin_value == "scriptorium-admin"
+
+
+def test_admin_claim_and_value_are_stripped(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_OIDC_ADMIN_CLAIM", " realm_access.roles ")
+    env.setenv("SCRIPTORIUM_OIDC_ADMIN_VALUE", "scriptorium-admin\n")
+    settings = load_settings()
+    assert settings.oidc_admin_claim == "realm_access.roles"
+    assert settings.oidc_admin_value == "scriptorium-admin"
+
+
+@pytest.mark.parametrize(
+    ("claim", "value"),
+    [("realm_access.roles", " "), ("realm_access.roles", ""), ("  ", "scriptorium-admin")],
+)
+def test_admin_claim_or_value_blank_refused(
+    env: pytest.MonkeyPatch, claim: str, value: str
+) -> None:
+    env.setenv("SCRIPTORIUM_OIDC_ADMIN_CLAIM", claim)
+    env.setenv("SCRIPTORIUM_OIDC_ADMIN_VALUE", value)
+    with pytest.raises(ConfigError, match="or neither"):
+        load_settings()
+
+
+def test_admin_claim_and_value_both_blank_means_no_admins(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_OIDC_ADMIN_CLAIM", " ")
+    env.setenv("SCRIPTORIUM_OIDC_ADMIN_VALUE", "")
+    settings = load_settings()
+    assert (settings.oidc_admin_claim, settings.oidc_admin_value) == (None, None)
 
 
 def test_required_scopes(env: pytest.MonkeyPatch) -> None:
