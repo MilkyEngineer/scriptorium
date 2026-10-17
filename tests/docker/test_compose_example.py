@@ -126,7 +126,10 @@ def test_published_ports(compose: dict[str, Any]) -> None:
                 ("${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:", "127.0.0.1:8482:")
             ), (name, text)
     assert services["scriptorium"]["ports"] == ["${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:8480:8000"]
-    assert services["keycloak"]["ports"] == ["${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:8481:8080"]
+    assert services["keycloak"]["ports"] == [
+        "${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:8481:8080",
+        "127.0.0.1:8482:8080",
+    ]
     for name in ("scriptorium-worker", "keycloak-db", "scriptorium-ink"):
         assert "ports" not in services[name], name
 
