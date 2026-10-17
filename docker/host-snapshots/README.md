@@ -131,3 +131,17 @@ if listing:
     print(conn.execute("PRAGMA integrity_check").fetchone())
 '
 ```
+
+## Backup of the backup (§13)
+
+Snapshots live on the same filesystem as the data. Once a night, copy the newest
+one to another filesystem (a second pool, an array, a mounted backup disk):
+
+    MIRROR_DIR=/path/on/another/filesystem DATA_SUBVOL=... SNAP_DIR=... \
+      snapshot-btrfs.sh --mirror-only
+
+The copy goes to `MIRROR_DIR/latest/` (rsync from the read-only snapshot, never
+from the live directory) and `MIRROR_DIR/latest.snapshot` records which snapshot
+it holds, written only after the copy completes. Restoring from it is an rsync
+back into a fresh data directory. Back up `secrets/` and the Keycloak database
+separately; they are not under `/data`.

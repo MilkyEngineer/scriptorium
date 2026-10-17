@@ -16,9 +16,13 @@
 #   KEEP_WEEKLY   newest snapshot of each of the last N ISO weeks     (default 8)
 #   MAX_DELETE    refuse to prune if more than N would go (breaker)   (default 20)
 #   LOCK_FILE     serialises overlapping runs   (default /run/lock/scriptorium-snapshot.lock)
+#   MIRROR_DIR    with --mirror-only: directory on ANOTHER filesystem that receives a copy of
+#                 the newest snapshot (the "backup of the backup", §13)
 #
 # Options:
-#   --dry-run     print what would be created and deleted; change nothing (root not required)
+#   --dry-run      print what would be created and deleted; change nothing (root not required)
+#   --mirror-only  take no snapshot and prune nothing; rsync the newest snapshot to
+#                  MIRROR_DIR/latest (atomic marker MIRROR_DIR/latest.snapshot names its source)
 #
 # Only direct children of SNAP_DIR whose names match the timestamp pattern and that are btrfs
 # subvolumes are ever deleted, with `btrfs subvolume delete` (never rm). The newest snapshot is
@@ -33,9 +37,11 @@ usage() {
 }
 
 DRY_RUN=0
+MIRROR_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --dry-run | -n) DRY_RUN=1 ;;
+        --mirror-only) MIRROR_ONLY=1 ;;
         --help | -h)
             usage
             exit 0
@@ -72,8 +78,12 @@ for var in KEEP_HOURLY KEEP_DAILY KEEP_WEEKLY MAX_DELETE; do
     [[ ${!var} =~ ^[0-9]+$ ]] || die "$var must be a non-negative integer"
 done
 command -v btrfs >/dev/null 2>&1 || die "btrfs (btrfs-progs) not found"
+if ((MIRROR_ONLY)); then
+    : "${MIRROR_DIR:?set MIRROR_DIR to the mirror directory (another filesystem)}"
+    command -v rsync >/dev/null 2>&1 || die "rsync not found"
+fi
 date -u -d 2026-01-05 +%G-W%V >/dev/null 2>&1 || die "GNU date is required (date -d)"
-if ((!DRY_RUN)) && ((EUID != 0)); then
+if ((!DRY_RUN)) && ((EUID != 0)) && ((!MIRROR_ONLY)); then
     die "must run as root: deleting a btrfs subvolume needs it (use --dry-run to preview)"
 fi
 
@@ -94,6 +104,39 @@ if ((!DRY_RUN)); then
     else
         log "warning: flock not found; overlapping runs are not prevented"
     fi
+fi
+
+# ---- mirror ---------------------------------------------------------------------------------
+if ((MIRROR_ONLY)); then
+    mirror_real=$(realpath -e -- "$MIRROR_DIR") || die "MIRROR_DIR does not exist"
+    [[ -d $mirror_real && $mirror_real != / ]] || die "MIRROR_DIR must be an existing directory"
+    case "$mirror_real/" in "$data_real/"* | "$snap_real/"*) die "MIRROR_DIR must be outside DATA_SUBVOL and SNAP_DIR" ;; esac
+    [[ $(stat -c %d -- "$mirror_real") != $(stat -c %d -- "$snap_real") ]] \
+        || die "MIRROR_DIR is on the same filesystem as SNAP_DIR; a mirror there protects nothing"
+    newest=""
+    shopt -s nullglob
+    for path in "$snap_real"/*; do
+        name=${path##*/}
+        [[ $name =~ $NAME_RE ]] || continue
+        [[ -d $path && ! -L $path && $(stat -c %i -- "$path") == 256 ]] || continue
+        [[ $name > "$newest" ]] && newest=$name
+    done
+    shopt -u nullglob
+    [[ -n $newest ]] || die "no snapshot in $snap_real to mirror"
+    if [[ -f $mirror_real/latest.snapshot && $(<"$mirror_real/latest.snapshot") == "$newest" ]]; then
+        log "mirror already at $newest"
+        exit 0
+    fi
+    log "mirroring $newest to $mirror_real/latest"
+    rsync_opts=(-a --delete --numeric-ids --no-specials --no-devices)
+    ((DRY_RUN)) && rsync_opts+=(-n)
+    rsync "${rsync_opts[@]}" -- "$snap_real/$newest/" "$mirror_real/latest/" || die "rsync failed"
+    if ((!DRY_RUN)); then
+        printf '%s\n' "$newest" >"$mirror_real/latest.snapshot.tmp"
+        mv -f -- "$mirror_real/latest.snapshot.tmp" "$mirror_real/latest.snapshot"
+    fi
+    log "mirror now at $newest"
+    exit 0
 fi
 
 # ---- create ---------------------------------------------------------------------------------
