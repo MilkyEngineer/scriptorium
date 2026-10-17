@@ -1,0 +1,18 @@
+# The build context needs only pyproject.toml, uv.lock, README.md, LICENSE, src/ and
+# docker/entrypoint.sh. Everything else stays out, above all data and secrets.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!docker/entrypoint.sh
+
+# Never, even if re-included above by mistake.
+**/__pycache__
+**/*.pyc
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/secrets/
