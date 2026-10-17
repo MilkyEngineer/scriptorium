@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import string
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -109,8 +110,24 @@ def uid_hash_for(iss: str, sub: str) -> str:
 
     The storage directory is the first 16 hex characters. The issuer cannot contain
     a newline (settings reject whitespace in URLs), so the pair is unambiguous.
+    ``sub`` is hashed exactly as given: the only normalisation anywhere is
+    :func:`ascii_lower` on an email used as the identity.
     """
     return hashlib.sha256((iss + "\n" + sub).encode()).hexdigest()
+
+
+_ASCII_LOWER: Final = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def ascii_lower(value: str) -> str:
+    """``value`` with A-Z lowered and every other character left byte-for-byte.
+
+    Used wherever emails are compared or become identities. ``str.lower`` would
+    apply Unicode case mapping (U+212A KELVIN SIGN lowers to ASCII ``k``), merging
+    addresses the issuer treats as distinct into one user or one allowlist entry.
+    No casefolding and no IDNA mapping, for the same reason.
+    """
+    return value.translate(_ASCII_LOWER)
 
 
 def claim_at_path(claims: Mapping[str, Any], path: str) -> Any:
@@ -243,7 +260,9 @@ class OIDCValidator:
         # the user claim: an issuer whose subject is a self-chosen email or username
         # must not let an unverified "alice@example.com" through.
         self._allowed = frozenset(u for u in settings.oidc_allowed_users if "@" not in u)
-        self._allowed_emails = frozenset(u.lower() for u in settings.oidc_allowed_users if "@" in u)
+        self._allowed_emails = frozenset(
+            ascii_lower(u) for u in settings.oidc_allowed_users if "@" in u
+        )
 
         self._metadata: ProviderMetadata | None = None
         self._discovery_failed_at: float | None = None
@@ -480,16 +499,17 @@ class OIDCValidator:
         email = email_claim if isinstance(email_claim, str) and email_claim else None
         email_verified = claims.get("email_verified") is True
         if settings.oidc_user_claim == "email":
-            # An email is an identity only once the issuer has verified it, and letter
-            # case must not split one mailbox into two users (two storage directories).
+            # An email is an identity only once the issuer has verified it, and ASCII
+            # letter case must not split one mailbox into two users (two storage
+            # directories). Non-ASCII stays as issued: see ascii_lower.
             if not email_verified:
                 raise UserNotAllowed("email_not_verified")
-            sub = sub.lower()
+            sub = ascii_lower(sub)
 
         allowed = (
             settings.allow_all_issuer_users
             or sub in self._allowed
-            or (email is not None and email_verified and email.lower() in self._allowed_emails)
+            or (email is not None and email_verified and ascii_lower(email) in self._allowed_emails)
         )
         if not allowed:
             raise UserNotAllowed("not_on_allowlist")

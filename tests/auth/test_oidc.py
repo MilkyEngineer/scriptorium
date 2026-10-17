@@ -22,6 +22,7 @@ from scriptorium.auth.oidc import (
     TokenExpired,
     TokenInvalid,
     UserNotAllowed,
+    ascii_lower,
     claim_at_path,
     discovery_urls,
     uid_hash_for,
@@ -577,6 +578,77 @@ async def test_email_user_claim_ignores_letter_case(
     lower = await validator.validate(issuer.token(email="reader@example.com", email_verified=True))
     assert upper.sub == lower.sub == "reader@example.com"
     assert upper.uid_hash == lower.uid_hash == uid_hash_for(ISSUER, "reader@example.com")
+
+
+KELVIN = "\N{KELVIN SIGN}"  # U+212A: str.lower() maps it to ASCII "k"
+
+
+def test_ascii_lower_folds_ascii_letters_only() -> None:
+    assert ascii_lower("Ada@Example.com") == "ada@example.com"
+    assert ascii_lower(f"{KELVIN}elvin@example.com") == f"{KELVIN}elvin@example.com"
+    assert ascii_lower(f"{KELVIN}elvin@example.com") != "kelvin@example.com"
+    assert ascii_lower(f"reader@{KELVIN}iwi.example.com") != "reader@kiwi.example.com"
+    dotted_i = "\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}"
+    assert ascii_lower(dotted_i) == dotted_i  # str.lower() gives two code points
+
+
+@pytest.mark.parametrize(
+    ("issued", "ascii_form"),
+    [
+        (f"{KELVIN}elvin@example.com", "kelvin@example.com"),  # Kelvin sign in the local part
+        (f"reader@{KELVIN}iwi.example.com", "reader@kiwi.example.com"),  # and in the domain
+    ],
+)
+async def test_email_identity_does_not_merge_unicode_lookalikes(
+    make_validator: Callable[..., OIDCValidator],
+    issuer: FakeIssuer,
+    issued: str,
+    ascii_form: str,
+) -> None:
+    validator = make_validator(
+        make_settings(
+            oidc_user_claim="email",
+            oidc_unsafe_user_claim=True,
+            oidc_allowed_users="",
+            allow_all_issuer_users=True,
+        )
+    )
+    lookalike = await validator.validate(issuer.token(email=issued, email_verified=True))
+    genuine = await validator.validate(issuer.token(email=ascii_form, email_verified=True))
+    assert lookalike.sub == issued  # kept byte-for-byte
+    assert lookalike.uid_hash != genuine.uid_hash
+
+
+@pytest.mark.parametrize(
+    ("allowed", "issued"),
+    [
+        ("kelvin@example.com", f"{KELVIN}elvin@example.com"),
+        ("reader@kiwi.example.com", f"reader@{KELVIN}iwi.example.com"),
+        (f"{KELVIN}elvin@example.com", "kelvin@example.com"),
+    ],
+)
+async def test_allowlist_email_does_not_match_unicode_lookalikes(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, allowed: str, issued: str
+) -> None:
+    """A verified email matches an allowlist entry only if they differ in ASCII case alone."""
+    validator = make_validator(make_settings(oidc_allowed_users=allowed))
+    with pytest.raises(UserNotAllowed):
+        await validator.validate(_verified(issuer, issued))
+
+
+def _verified(issuer: FakeIssuer, email: str) -> str:
+    """A token for a non-allowlisted sub whose verified email is ``email``."""
+    return issuer.token(
+        sub="44444444-0000-4000-8000-000000000000", email=email, email_verified=True
+    )
+
+
+async def test_allowlist_email_ignores_ascii_case(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer
+) -> None:
+    validator = make_validator(make_settings(oidc_allowed_users="Ada@Example.com"))
+    user = await validator.validate(_verified(issuer, "ada@example.com"))
+    assert user.email_verified is True
 
 
 async def test_display_name_falls_back_without_email(
