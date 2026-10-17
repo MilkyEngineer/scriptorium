@@ -120,8 +120,11 @@ def test_published_ports(compose: dict[str, Any]) -> None:
             text = str(port)
             assert "9100" not in text, name
             assert "9000" not in text, name
-            # Publish address is configurable and defaults to loopback.
-            assert text.startswith("${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:"), (name, text)
+            # Publish address is configurable and defaults to loopback; the Keycloak
+            # admin binding is loopback only and never follows SCRIPTORIUM_PUBLISH_ADDR.
+            assert text.startswith(
+                ("${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:", "127.0.0.1:8482:")
+            ), (name, text)
     assert services["scriptorium"]["ports"] == ["${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:8480:8000"]
     assert services["keycloak"]["ports"] == ["${SCRIPTORIUM_PUBLISH_ADDR:-127.0.0.1}:8481:8080"]
     for name in ("scriptorium-worker", "keycloak-db", "scriptorium-ink"):
