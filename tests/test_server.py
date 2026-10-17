@@ -463,6 +463,42 @@ def test_download_store_tokens_and_eviction(clock: FakeClock) -> None:
         store.mint(b"x" * 11, media_type="text/plain", owner="u", filename="c")
 
 
+def test_download_store_owner_at_volume_cannot_evict_another_owner(clock: FakeClock) -> None:
+    store = InMemoryDownloadStore(
+        clock=clock, max_bytes=1000, max_owner_bytes=100, max_owner_items=4
+    )
+    alice, bob = "a" * 64, "b" * 64
+    theirs = store.mint(b"x" * 10, media_type="text/plain", owner=bob, filename="b")
+
+    # Alice mints twice the global budget; without per-owner caps Bob's token would go.
+    mine = [
+        store.mint(b"y" * 10, media_type="text/plain", owner=alice, filename="a")
+        for _ in range(200)
+    ]
+    assert store.get(theirs) is not None
+    assert [store.get(t) is not None for t in mine] == [False] * 196 + [True] * 4
+
+    # The byte cap: Alice's own oldest links make room, never Bob's.
+    big = [
+        store.mint(b"z" * 40, media_type="text/plain", owner=alice, filename="a") for _ in range(3)
+    ]
+    assert [store.get(t) is not None for t in big] == [False, True, True]
+    assert all(store.get(t) is None for t in mine)
+    assert store.get(theirs) is not None
+    with pytest.raises(ValueError, match="budget"):
+        store.mint(b"x" * 101, media_type="text/plain", owner=alice, filename="a")
+
+
+def test_download_store_global_budget_still_evicts_oldest(clock: FakeClock) -> None:
+    store = InMemoryDownloadStore(clock=clock, max_bytes=100, max_owner_bytes=60)
+    first = store.mint(b"x" * 50, media_type="text/plain", owner="b" * 64, filename="b")
+    second = store.mint(b"y" * 50, media_type="text/plain", owner="a" * 64, filename="a")
+    third = store.mint(b"z" * 10, media_type="text/plain", owner="c" * 64, filename="c")
+    assert store.get(first) is None  # the oldest overall, once the global budget is hit
+    assert store.get(second) is not None
+    assert store.get(third) is not None
+
+
 def test_loggable_path_redacts_tokens() -> None:
     assert loggable_path("/dl/abcdef") == "/dl/<token>"
     assert loggable_path("/mcp") == "/mcp"
