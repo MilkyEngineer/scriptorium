@@ -221,7 +221,7 @@ Protected-resource metadata, served by Scriptorium (exact JSON):
 
 401 contract: no token → `WWW-Authenticate: Bearer resource_metadata="…", scope="scriptorium"`; expired or invalid token → the same plus `error="invalid_token"` so the client refreshes; insufficient scope → 403 `error="insufficient_scope"`. `/.well-known/*`, `/healthz`, `/dl/*` and the 401 path are handled by Scriptorium's own ASGI middleware **before** the MCP SDK sees the request. `resource` is `SCRIPTORIUM_PUBLIC_URL` byte-for-byte (no trailing slash) and must equal the URL the user types into Claude.
 
-Token validation: `iss` equals the configured issuer; `aud` (string or array) **contains** `SCRIPTORIUM_OIDC_AUDIENCE`; algorithms pinned to `RS256`/`ES256`; clock skew 60 s; JWKS cached, refetched on unknown `kid` at most once per 60 s (DoS cooldown). The audience comes from a mapper at the AS; Scriptorium does not rely on the OAuth `resource` parameter being honoured.
+Token validation: `iss` equals the configured issuer; `aud` (string or array) **contains** `SCRIPTORIUM_OIDC_AUDIENCE`; algorithms pinned to `RS256`/`ES256`; clock skew 60 s; JWKS cached, refetched on unknown `kid` at most once per 60 s (DoS cooldown) **and** when the cached set is older than `OIDC_JWKS_MAX_AGE_SECONDS` (default 3600, or a smaller `Cache-Control: max-age` from the issuer), so a key the issuer revokes stops being trusted within the hour; a refresh that fails falls back to a cached set no older than 24 h, otherwise the server fails closed. Scopes are not part of validation unless `OIDC_REQUIRED_SCOPES` is set: `aud` membership is the authorization check, because issuers differ in how (and whether) they expose a scope claim. The audience comes from a mapper at the AS; Scriptorium does not rely on the OAuth `resource` parameter being honoured.
 
 Key consequences:
 
@@ -236,7 +236,7 @@ Key consequences:
 | --- | --- |
 | `SCRIPTORIUM_OIDC_ISSUER` | Issuer URL. Discovery at `<issuer>/.well-known/openid-configuration` and/or RFC 8414. Required. |
 | `SCRIPTORIUM_OIDC_AUDIENCE` | Value that must appear in `aud` (default: `SCRIPTORIUM_PUBLIC_URL`). |
-| `SCRIPTORIUM_OIDC_USER_CLAIM` | Claim used, together with `iss`, as the stable user id (default `sub`). |
+| `SCRIPTORIUM_OIDC_USER_CLAIM` | Claim used, together with `iss`, as the stable user id (default `sub`). It must be **immutable at the issuer**: anything else (`email`, `preferred_username`) is refused at start-up unless `SCRIPTORIUM_OIDC_UNSAFE_USER_CLAIM=true`, and `email` is only ever used when `email_verified` is `true`, lower-cased. |
 | `SCRIPTORIUM_OIDC_NAME_CLAIM` | Display name claim (default `preferred_username`, fallback `email`). |
 | `SCRIPTORIUM_OIDC_ADMIN_CLAIM` / `SCRIPTORIUM_OIDC_ADMIN_VALUE` | Claim path and value that grants admin tools, e.g. `realm_access.roles` / `scriptorium-admin`. |
 | `SCRIPTORIUM_OIDC_ALLOWED_USERS` | **Required.** Comma-separated `sub` values or emails. Emails match only when `email_verified` is `true`. The server refuses to start when this is empty unless `SCRIPTORIUM_ALLOW_ALL_ISSUER_USERS=true` is set explicitly. |
@@ -254,7 +254,7 @@ Expected to work: Keycloak (reference, §5.3), Authentik, Authelia, Zitadel, Aut
 
 ### 5.3 Keycloak reference configuration (optional profile)
 
-For operators who have no issuer. Nothing in Scriptorium depends on it; it exists so the requirements in §5.2 have one worked, tested example. The realm is shipped as `docker/keycloak/realm-scriptorium.json` and loaded with `start --import-realm`, so the configuration below is reproducible, not clicked together. Keycloak is **pinned to the exact version S2 verifies** (26.4.x or later: RFC 8414 metadata for path-based issuers, port-agnostic loopback redirects).
+For operators who have no issuer. Nothing in Scriptorium depends on it; it exists so the requirements in §5.2 have one worked, tested example. The realm is shipped as `docker/keycloak/realm-scriptorium.json` and loaded with `start --import-realm`, so the configuration below is reproducible, not clicked together. Keycloak is **pinned to the exact version S2 verifies**: `quay.io/keycloak/keycloak:26.4.7` (RFC 8414 metadata for path-based issuers, port-agnostic loopback redirects, `${VAR}` substitution from the environment at `--import-realm`). Client ID Metadata Documents need 26.6 or later and are therefore not part of the reference configuration.
 
 **Client registration — decision: pre-registered public clients, no anonymous DCR.** Keycloak's Trusted Hosts policy matches hostnames or single IPs (with reverse-DNS for wildcards) and has no CIDR support, so it cannot be limited to Anthropic's egress range; anonymous DCR also registers a new client on every fresh Claude connection and runs into the default Max Clients (200). Two clients instead:
 
@@ -271,7 +271,7 @@ Alternatives S2 evaluates and documents: (a) DCR with "Host Sending Request Must
 
 **Identity.** Self-registration **off**. Identity brokers (Microsoft personal/work tenant, Google) optional, with "first broker login" set to **require manual account linking** rather than auto-link by email, so a stranger's Google account cannot become an existing user. Scriptorium's `ALLOWED_USERS` is the second gate.
 
-**Exposure.** `KC_HOSTNAME_ADMIN` points at an internal URL; the proxy denies `/admin` and `/realms/master` from the internet; `--http-enabled=true --proxy-headers=xforwarded` behind the TLS-terminating proxy.
+**Exposure.** `KC_HOSTNAME_ADMIN` points at a loopback-only second binding of the same container (`127.0.0.1:8482`, reached over an SSH tunnel); the proxy denies `/admin` and `/realms/master` from the internet; `--http-enabled=true --proxy-headers=xforwarded` behind the TLS-terminating proxy. `hostname-admin` only rewrites URLs: Keycloak still serves the console on every port it listens on (S2), so when the proxy runs on another machine the proxy-facing port must be firewalled to the proxy's address.
 
 ### 5.4 Personal access tokens (Claude Code, scripts)
 
@@ -281,7 +281,7 @@ Claude Code can pass a static header (`--header "Authorization: Bearer …"`). S
 
 ## 6. Storage layout
 
-All state under one volume, `/data`. `/data` must be a local POSIX filesystem (ext4, xfs, ZFS, btrfs). The server refuses to start if `statfs` reports a FUSE, NFS or SMB filesystem, because SQLite WAL depends on POSIX locks and a shared-memory file; the error message says where to mount instead.
+All state under one volume, `/data`. `/data` must be a local POSIX filesystem (ext4, xfs, ZFS, btrfs). The server refuses to start unless the filesystem type read from `/proc/self/mountinfo` is on an allowlist (ext4, xfs, btrfs, zfs, f2fs, bcachefs; `statfs` cannot tell FUSE subtypes apart), and functional probes pass: a file can be written and fsynced, a POSIX lock taken in one process is seen by a second process, and a WAL-mode database written by one connection is readable by another. FUSE (including union/pool paths), network and overlay filesystems are refused because SQLite WAL depends on POSIX locks and a shared-memory file; the error message says where to mount instead (S5, `users/fs.py`).
 
 ```
 /data/
@@ -417,7 +417,7 @@ Upload path: PDF/EPUB upload is upstream's known-good blob path (`.content`/`.me
 
 - The archive is the backup: xochitl layout, original UUIDs, retained blobs, tombstones instead of deletes.
 - Point-in-time snapshots are a **host** responsibility; a container cannot run `zfs`/`btrfs` and should not be privileged. Strategies (`SNAPSHOT_STRATEGY`):
-  - `host` — the operator schedules `zfs snapshot` / `btrfs subvolume snapshot` of the `/data` dataset on the Docker host (cron/systemd timer; example scripts in `docker/host-snapshots/`) and mounts the snapshot directory read-only at `/data/snapshots`. Scriptorium only *lists and reads* snapshots by naming convention (`scriptorium-YYYYMMDDTHHMMZ`); `admin_snapshot_now` is unavailable.
+  - `host` — the operator schedules `zfs snapshot` / `btrfs subvolume snapshot` of the `/data` dataset on the Docker host (cron/systemd timer; example scripts in `docker/host-snapshots/`) and mounts the snapshot directory read-only at `/data/snapshots`. Scriptorium only *lists and reads* snapshots by naming convention (`YYYY-MM-DDTHH-MM-SSZ`, the id regex is the allowlist; anything else in the directory is ignored); `admin_snapshot_now` is unavailable. The snapshot directory is a sibling of the data subvolume, never inside it, so snapshots do not nest. Pruning needs root (btrfs subvolume deletion), so the host cron both creates and prunes; the container never writes there. Reading an index from a snapshot: a read-only snapshot taken mid-write carries a non-empty `-wal`, which SQLite's `immutable=1` silently ignores (rows lost); such databases are opened with `mode=ro` on the read-only mount, and `immutable=1` is used only when the `-wal` is absent or empty (S5, `backup/snapshots.py`).
   - `restic` — the worker runs `restic backup` from inside the container to `RESTIC_REPO` (password from a Docker secret, independent of the master key). SQLite files are copied with `VACUUM INTO` first so the backup is consistent. `admin_snapshot_now` triggers a run.
   - `none` — `snapshots()` reports "external".
 - Retention (restic): 7 daily, 4 weekly, 6 monthly (configurable). Host strategies keep their own retention.
@@ -529,6 +529,10 @@ Environment variables, all prefixed `SCRIPTORIUM_`. Secrets may be given as `*_F
 | `DATA_DIR` | `/data` | Must be a local POSIX filesystem |
 | `MASTER_KEYS` | — | One or more urlsafe-base64 32-byte keys, comma-separated, newest first (MultiFernet; rotate by prepending and re-encrypting with `scriptorium admin rotate-keys`). Generate with `scriptorium gen-master-key`. Keep an escrow copy outside `/data`. Losing every key means every user relinks. |
 | `OIDC_*` | — | §5.2; `OIDC_ALLOWED_USERS` required |
+| `OIDC_REQUIRED_SCOPES` | empty | Scopes (from `scope` or `scp`) a token must carry; empty = `aud` alone decides (§5.1) |
+| `OIDC_JWKS_MAX_AGE_SECONDS` | `3600` | Cached JWKS is refreshed after this age (§5.1) |
+| `OIDC_UNSAFE_USER_CLAIM` | `false` | Required to use an `OIDC_USER_CLAIM` other than `sub` (§5.2) |
+| `SPIKE_TOOLS` | `false` | Registers the `spike_*` test tools used by S6; never on in production |
 | `ALLOW_ALL_ISSUER_USERS` | `false` | Explicit opt-out of the allowlist |
 | `POLL_SECONDS` | `600` | |
 | `SYNC_CONCURRENCY` / `SYNC_WORKERS` / `RENDER_WORKERS` | `2` / `4` / `2` | |
@@ -577,7 +581,7 @@ services:
   # ---- optional: only if you have no OIDC issuer.  `docker compose --profile keycloak up` ----
   keycloak:
     profiles: [keycloak]
-    image: quay.io/keycloak/keycloak:26.4.0          # pin the exact version S2 verified
+    image: quay.io/keycloak/keycloak:26.4.7          # the exact version S2 verified
     command: start --import-realm --hostname https://auth.example.com --hostname-admin https://keycloak-admin.internal --http-enabled true --proxy-headers xforwarded
     environment: { KC_DB: postgres, ... }
     volumes: ["./keycloak:/opt/keycloak/data/import:ro"]
@@ -597,7 +601,7 @@ secrets:
 
 The default `docker compose up` starts only `scriptorium` and `scriptorium-worker`; `scriptorium.env` points `SCRIPTORIUM_OIDC_ISSUER` at whatever issuer the operator already runs. The `keycloak` profile is a convenience for operators who have none; the `auth.example.com` rows in the proxy table below apply only to it (an existing issuer has its own exposure rules).
 
-**Reverse proxy** (any of Caddy, Traefik, nginx; TLS via ACME; examples in `docker/proxy/`). It may run on the Docker host or on another machine on the operator's network; in the latter case the `scriptorium` and `keycloak` services publish their ports on an interface reachable only by the proxy, and `X-Forwarded-*` headers are trusted from that address alone (`TRUSTED_PROXIES`). The bearer token is the primary access control on `/mcp`; IP allowlisting is defence in depth and is **optional**, because Claude Code and the signed downloads need user-side access. Per-path rules:
+**Reverse proxy** (any of Caddy, Traefik, nginx; TLS via ACME; examples in `docker/proxy/`). It may run on the Docker host or on another machine on the operator's network; in the latter case the `scriptorium` and `keycloak` services publish their ports on an interface reachable only by the proxy, and `X-Forwarded-*` headers are trusted from that address alone (`TRUSTED_PROXIES`). The bearer token is the primary access control on `/mcp`; IP allowlisting is defence in depth and is **optional**, because Claude Code and the signed downloads need user-side access. The proxy must allow request bodies of at least 4 MB on `/mcp` (the server's own limit; nginx defaults to 1 MB) and must not buffer responses. Per-path rules:
 
 | Host / path | Reachable from | Notes |
 | --- | --- | --- |
@@ -668,7 +672,7 @@ Details, procedures and acceptance criteria live in `docs/Plan/`. Summary:
 | **S2** | Does Keycloak + Claude's OAuth client work end to end with pre-registered clients? | claude.ai (web + mobile) and Claude Code complete login; admin role present in the token; refresh after expiry and after 24 h idle; two concurrent refreshes; Claude Code from a network outside any allowlist; DCR and CIMD compared and documented; exact Keycloak version and realm JSON committed | M1 |
 | **S3** | Do Paper Pro Move `.rm` files render correctly with rmscene? | The dedicated test notebook (≥ 20 pages, colour, highlighter, typed text, annotated PDF) renders without errors and matches reference photos; panel geometry confirmed **Result: passed; geometry, colours and extents recorded in `docs/Spikes/S3.md`; fork tag `scriptorium-s3`** | M1 |
 | **S4** | How does the cloud behave on a free account, and what does the 50-day cut-off look like? | On a free account: list/download/upload work (or are documented as Connect-only); an aged document's state is observed (absent from root / blobs 404 / flagged) and the tombstone `deletion_cause` heuristic is specified from the evidence | M1 |
-| **S5** | Two containers + SQLite WAL on the operator's `/data` filesystem; host snapshot feasibility | 24 h soak of server + worker with concurrent reads/writes, no `SQLITE_BUSY` escalations or corruption; `statfs` refusal verified on a FUSE mount; a host snapshot is listed and readable from the container | M1 |
+| **S5** | Two containers + SQLite WAL on the operator's `/data` filesystem; host snapshot feasibility | 24 h soak of server + worker with concurrent reads/writes, no `SQLITE_BUSY` escalations or corruption; `statfs` refusal verified on a FUSE mount; a host snapshot is listed and readable from the container | M1 **Result: steps 1 and 3 passed on the operator's host (btrfs); 24 h soak running (`docs/Spikes/S5.md`)** |
 | **S6** | What do Claude clients actually render from this server? | Image blocks on claude.ai mobile; resource links vs signed URLs; max practical tool-argument size; `tools/list` filtering per user — all measured and written down | M1 |
 
 ### Milestones
