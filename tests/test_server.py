@@ -277,6 +277,18 @@ def test_spike_tools_only_when_enabled() -> None:
     assert len(build_registry(make_settings(spike_tools=True))) == 7
 
 
+def test_no_tool_schema_declares_mcp_param_headers() -> None:
+    """The SDK checks Mcp-Param-* headers against ``get_tool_input_schema``, which is not
+    user-aware: it answers for admin tools too, and its 400s could reveal their schemas
+    to anyone. With no ``x-mcp-header`` in any schema there is nothing to reveal; a tool
+    that needs one must make that lookup user-aware first."""
+    registry = build_registry(make_settings(spike_tools=True))
+    for spec in registry:
+        schema = registry.input_schema(spec.name)
+        assert schema is not None
+        assert "x-mcp-header" not in json.dumps(schema), spec.name
+
+
 # ---- MCP round trips -----------------------------------------------------------------------
 
 
