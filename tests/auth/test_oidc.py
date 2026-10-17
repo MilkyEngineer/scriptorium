@@ -5,14 +5,17 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from scriptorium.auth.oidc import (
+    MAX_METADATA_BYTES,
     DiscoveryError,
     InsufficientScope,
     OIDCValidator,
@@ -29,6 +32,7 @@ from tests.conftest import (
     ALLOWED_EMAIL,
     ALLOWED_SUB,
     ISSUER,
+    JWKS_URI,
     OIDC_DISCOVERY,
     PUBLIC_URL,
     RFC8414_DISCOVERY,
@@ -311,6 +315,106 @@ async def test_discovery_mismatch_falls_back_to_rfc8414(
     metadata = await validator.discover()
     assert metadata.issuer == ISSUER
     assert issuer.hits[RFC8414_DISCOVERY] == 1
+
+
+@pytest.mark.parametrize(
+    "jwks_uri",
+    [
+        "https://evil.example.com/realms/scriptorium/protocol/openid-connect/certs",
+        "https://auth.example.com.evil.example.com/certs",
+        "http://auth.example.com/realms/scriptorium/protocol/openid-connect/certs",
+        "https://auth.example.com:8443/certs",
+        "https://reader@auth.example.com/certs",
+        "https://evil.example.com\\@auth.example.com/certs",
+        "//evil.example.com/certs",
+        "/realms/scriptorium/certs",
+    ],
+)
+async def test_jwks_uri_must_share_the_issuers_origin(
+    validator: OIDCValidator, issuer: FakeIssuer, jwks_uri: str
+) -> None:
+    issuer.jwks_uri_value = jwks_uri
+    with pytest.raises(DiscoveryError, match="bad_jwks_uri"):
+        await validator.discover()
+    assert issuer.jwks_hits == 0
+    assert not any("evil" in url for url in issuer.hits)
+
+
+@pytest.mark.parametrize(
+    "jwks_uri",
+    [JWKS_URI, "https://AUTH.example.com:443/realms/scriptorium/protocol/openid-connect/certs"],
+)
+async def test_jwks_uri_on_the_issuers_origin_accepted(
+    validator: OIDCValidator, issuer: FakeIssuer, jwks_uri: str
+) -> None:
+    issuer.jwks_uri_value = jwks_uri
+    assert (await validator.discover()).jwks_uri == jwks_uri
+
+
+class CountingBody:
+    """A streamed response body that counts the bytes it hands out (up to 64 MiB)."""
+
+    CHUNK = 64 * 1024
+
+    def __init__(self) -> None:
+        self.handed_out = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while self.handed_out < 64 * 1024 * 1024:
+            self.handed_out += self.CHUNK
+            yield b" " * self.CHUNK
+
+
+@asynccontextmanager
+async def validator_serving(
+    respond: Callable[[httpx.Request], httpx.Response],
+) -> AsyncIterator[OIDCValidator]:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        yield OIDCValidator(make_settings(), http=client, clock=FakeClock())
+
+
+async def test_oversized_metadata_is_aborted_while_streaming() -> None:
+    bodies: list[CountingBody] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        bodies.append(CountingBody())
+        return httpx.Response(200, content=bodies[-1])
+
+    async with validator_serving(respond) as validator:
+        with pytest.raises(DiscoveryError, match="too_large"):
+            await validator.discover()
+    assert len(bodies) == 2  # OIDC discovery, then the RFC 8414 fallback
+    for body in bodies:
+        assert MAX_METADATA_BYTES < body.handed_out <= MAX_METADATA_BYTES + CountingBody.CHUNK
+
+
+async def test_oversized_content_length_is_refused_before_reading() -> None:
+    bodies: list[CountingBody] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        bodies.append(CountingBody())
+        headers = {"Content-Length": str(MAX_METADATA_BYTES + 1)}
+        return httpx.Response(200, headers=headers, content=bodies[-1])
+
+    async with validator_serving(respond) as validator:
+        with pytest.raises(DiscoveryError, match="too_large"):
+            await validator.discover()
+    assert [body.handed_out for body in bodies] == [0, 0]
+
+
+async def test_oversized_jwks_is_aborted(issuer: FakeIssuer) -> None:
+    body = CountingBody()
+    real = issuer.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == JWKS_URI:
+            return httpx.Response(200, content=body)
+        return real(request)
+
+    async with validator_serving(handler) as streaming:
+        with pytest.raises(DiscoveryError, match="too_large"):
+            await streaming.validate(issuer.token())
+    assert body.handed_out <= MAX_METADATA_BYTES + CountingBody.CHUNK
 
 
 # ---- admin and allowlist ----------------------------------------------------------------

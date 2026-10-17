@@ -6,12 +6,16 @@ key's own type), ``iss`` byte-exact, ``aud`` membership, ``exp`` required,
 refetch per cooldown window shared by all requests, so a stream of junk tokens
 cannot turn the server into a request amplifier against the issuer.
 
+Metadata and the JWKS are read with a size cap enforced while streaming, and the
+``jwks_uri`` must share the issuer's scheme, host and port.
+
 Nothing here logs a token, an email or raw claims.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -152,7 +156,9 @@ def _scopes(claims: Mapping[str, Any]) -> frozenset[str]:
 
 # ---- discovery --------------------------------------------------------------------------
 
-_CONFIG_REASONS: Final = frozenset({"issuer_mismatch", "bad_jwks_uri"})
+_CONFIG_REASONS: Final = frozenset(
+    {"issuer_mismatch", "bad_jwks_uri", "too_large", "not_json", "not_object"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,10 +179,34 @@ def discovery_urls(issuer: str) -> list[str]:
     ]
 
 
-def _same_security(issuer: str, url: str) -> bool:
-    """``url`` must be https unless the issuer itself is a plain-http dev issuer."""
-    scheme = urlsplit(url).scheme
-    return scheme == "https" or (scheme == "http" and urlsplit(issuer).scheme == "http")
+_DEFAULT_PORTS: Final = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """``(scheme, host, port)`` of a plain http(s) URL; None for anything odd."""
+    if any(c.isspace() or not c.isprintable() or c == "\\" for c in url):
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in _DEFAULT_PORTS or not parts.hostname:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    return parts.scheme, parts.hostname, port or _DEFAULT_PORTS[parts.scheme]
+
+
+def same_origin(issuer: str, url: str) -> bool:
+    """``url`` has the issuer's scheme, host and port.
+
+    Every URL Scriptorium fetches on the issuer's say-so (today only ``jwks_uri``)
+    must pass, so a tampered or misconfigured metadata document can neither point
+    key retrieval at another host nor downgrade it to plain http.
+    """
+    origin = _origin(url)
+    return origin is not None and origin == _origin(issuer)
 
 
 # ---- validator --------------------------------------------------------------------------
@@ -231,14 +261,23 @@ class OIDCValidator:
     # -- fetching ---------------------------------------------------------------
 
     async def _get_json(self, url: str) -> dict[str, Any]:
-        response = await self._http.get(url, headers={"Accept": "application/json"})
-        if response.status_code != 200:
-            raise DiscoveryError(f"http_{response.status_code}")
-        if len(response.content) > MAX_METADATA_BYTES:
-            raise DiscoveryError("too_large")
+        """GET a JSON object, reading no more than :data:`MAX_METADATA_BYTES` of body."""
+        # identity: the cap then bounds what the issuer sends, not only what it inflates to.
+        headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
+        async with self._http.stream("GET", url, headers=headers) as response:
+            if response.status_code != 200:
+                raise DiscoveryError(f"http_{response.status_code}")
+            declared = response.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > MAX_METADATA_BYTES:
+                raise DiscoveryError("too_large")
+            raw = bytearray()
+            async for chunk in response.aiter_bytes():
+                raw += chunk
+                if len(raw) > MAX_METADATA_BYTES:
+                    raise DiscoveryError("too_large")
         try:
-            body = response.json()
-        except ValueError:
+            body = json.loads(raw)
+        except (ValueError, RecursionError):
             raise DiscoveryError("not_json") from None
         if not isinstance(body, dict):
             raise DiscoveryError("not_object")
@@ -275,7 +314,7 @@ class OIDCValidator:
                 reasons.append("issuer_mismatch")
                 continue
             jwks_uri = doc.get("jwks_uri")
-            if not isinstance(jwks_uri, str) or not _same_security(self._issuer, jwks_uri):
+            if not isinstance(jwks_uri, str) or not same_origin(self._issuer, jwks_uri):
                 reasons.append("bad_jwks_uri")
                 continue
             self._metadata = ProviderMetadata(issuer=self._issuer, jwks_uri=jwks_uri)
