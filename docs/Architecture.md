@@ -226,7 +226,7 @@ Token validation: `iss` equals the configured issuer; `aud` (string or array) **
 Key consequences:
 
 - A **Scriptorium user is an identity at the AS**, keyed on `(iss, sub)`, not a Claude account. Two Claude accounts (for example a personal and an organisational one) that log in to the AS as the same user share one storage, one reMarkable link, one OCR configuration. Nothing is keyed on the Claude account.
-- A reMarkable account can be linked to **one** Scriptorium user at a time. Linking a cloud account that is already linked elsewhere is refused with a generic message ("already linked to another user; ask an administrator"); only `admin_users` shows who. `admin_transfer_link(from, to)` moves a link when a user loses their AS identity. The reMarkable account identity used for this rule is derived from the device token (candidate: the token's profile/user-id claim — **S0 verifies**); if no stable identity is available, the rule degrades to "one device token per user" and the registry warns.
+- A reMarkable account can be linked to **one** Scriptorium user at a time. Linking a cloud account that is already linked elsewhere is refused with a generic message ("already linked to another user; ask an administrator"); only `admin_users` shows who. `admin_transfer_link(from, to)` moves a link when a user loses their AS identity. The reMarkable account identity used for this rule is the device token's `auth0-userid` claim, which S0 verified is identical across registrations and equals the user token's `sub`; the registry stores only its SHA-256. The user token's `auth0-profile` object (email, names) is never stored or logged.
 - Claude Code uses a loopback redirect on a random port; the AS must accept `http://localhost/callback` and `http://127.0.0.1/callback` **port-agnostically**. Keycloak does this for loopback hosts when the URI is registered without a port; **S2** verifies on the pinned version.
 - Claude's hosted clients call the AS and `/mcp` from Anthropic's egress range (`160.79.104.0/21`); **Claude Code calls both from the user's machine**, and users' browsers call the login pages. Any IP allowlist must account for all three (§13).
 
@@ -663,7 +663,7 @@ Details, procedures and acceptance criteria live in `docs/Plan/`. Summary:
 
 | ID | Question | Pass criterion | Gates |
 | --- | --- | --- | --- |
-| **S0** | Is `remarkable-mcp` usable as a per-user library without AGPL deps? | Installs with neither `pymupdf` nor `ebooklib`; two clients with different tokens and cache dirs in one process, no env reads at call time; upload with a caller-supplied UUID; a stable reMarkable account identity is extractable from the device token (or documented as unavailable). Else: vendoring plan written | M1 |
+| **S0** | Is `remarkable-mcp` usable as a per-user library without AGPL deps? | Installs with neither `pymupdf` nor `ebooklib`; two clients with different tokens and cache dirs in one process, no env reads at call time; upload with a caller-supplied UUID; a stable reMarkable account identity is extractable from the device token (or documented as unavailable). Else: vendoring plan written. **Result: passed, fork tag `scriptorium-s0`, identity claim `auth0-userid`** | M1 |
 | **S1** | Can we upload a native notebook through the cloud API, including under a reused UUID? | An archived notebook re-uploaded under a new UUID opens on the Move; edits round-trip; re-upload under its **original** UUID after deletion restores it; running the job twice creates no duplicate; a generation conflict is retried correctly | M3 (push), M4 (restore) |
 | **S2** | Does Keycloak + Claude's OAuth client work end to end with pre-registered clients? | claude.ai (web + mobile) and Claude Code complete login; admin role present in the token; refresh after expiry and after 24 h idle; two concurrent refreshes; Claude Code from a network outside any allowlist; DCR and CIMD compared and documented; exact Keycloak version and realm JSON committed | M1 |
 | **S3** | Do Paper Pro Move `.rm` files render correctly with rmscene? | The dedicated test notebook (≥ 20 pages, colour, highlighter, typed text, annotated PDF) renders without errors and matches reference photos; panel geometry confirmed | M1 |
@@ -688,7 +688,7 @@ Details, procedures and acceptance criteria live in `docs/Plan/`. Summary:
 
 1. Does the reMarkable cloud rate-limit or flag an always-on client that polls every 10 minutes? (S4/S5 soak observes it; the fallback is a longer interval.)
 2. Which `.content` fields does the Move require for a notebook it will open (template, orientation, `fileType`, page geometry)? (S1)
-3. Is there a stable account identity in the device token for the one-account rule? (S0)
+3. ~~Is there a stable account identity in the device token for the one-account rule? (S0)~~ Yes: `auth0-userid`, see `docs/Spikes/S0.md`.
 4. Whether typed-text native notebooks from Markdown are good enough for a later `push_markdown(as="notebook")`.
 5. Policy: before notes belonging to an organisation are synced to a personal, internet-reachable server, confirm that the organisation's data policy permits it. Scriptorium cannot enforce this; the operator documentation must state it.
 6. Native, clean-room MIT image-to-ink converter on rmscene, so the AGPL `scriptorium-ink` sidecar can be retired.
