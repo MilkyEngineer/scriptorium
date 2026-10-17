@@ -176,7 +176,7 @@ Checked 2026-10-17 (PyPI metadata unless stated):
 | Dependency | Licence | Decision |
 | --- | --- | --- |
 | remarkable-mcp (fork), rmscene, mcp, markdown-it-py, PyJWT | MIT | Use |
-| resvg-py | MIT (per its GitHub repo; PyPI has no licence field) | Use for SVG → PNG |
+| resvg-py | MIT (repository); wheel bundles the resvg crate, MPL-2.0. Wheel metadata has no licence field, so `pip-licenses` reports UNKNOWN: the licence gate allowlists `resvg_py` by name (S0) | Use for SVG → PNG |
 | pypdfium2 | BSD-3 / Apache-2.0 | Use for PDF page rasterising |
 | WeasyPrint | BSD-3 | Use for Markdown/HTML → PDF (sandboxed, §9) |
 | httpx, cryptography, pydantic | BSD-3 / Apache-2.0 / MIT | Use |

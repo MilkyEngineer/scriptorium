@@ -9,7 +9,7 @@ This folder turns `docs/Architecture.md` (v0.2) into an ordered, gated plan that
 ## Rules of engagement
 
 - **Spike before feature.** If a task depends on behaviour marked "verify" or "to confirm" in the architecture, it is a spike first. Write `docs/Spikes/<id>.md` with: question, procedure, evidence (scrubbed), result, decision.
-- **Scratch account only.** All cloud writes during development go to a dedicated scratch reMarkable account and a scratch folder. Never run `restore(overwrite)`, `push_*`, or `admin_purge_*` against anyone's real library until M4 acceptance.
+- **Scratch account, or a scratch folder with a kill switch.** All cloud writes during development go to a dedicated scratch reMarkable account. If the operator has no second account, the operator may instead designate one folder in their own library as the scratch folder: every write names that folder as parent, every written UUID is minted by the test run and recorded, the run aborts if the root it read back differs from the root it wrote in anything other than its own UUIDs, and the operator removes the folder from the tablet afterwards. Read-only spikes (listing, download, token decoding) may run against a real account. Never run `restore(overwrite)`, `push_*`, or `admin_purge_*` against anyone's real library until M4 acceptance.
 - **No production secrets in the coding session.** The session gets a development master key, a development issuer realm, a scratch device token. The operator keeps production keys.
 - **Public repo hygiene.** Cassettes and fixtures are scrubbed of tokens, UUIDs that map to real documents, and note content before commit. Fixture notebooks are written for the purpose.
 - **Licence gate is non-negotiable.** `uv sync` must never pull `pymupdf`, `ebooklib`, `rmink` or any GPL/AGPL package into the image. CI fails otherwise; so should you.
@@ -21,7 +21,7 @@ Things the coding session must stop and ask the operator for (also listed in `CL
 
 | When | What |
 | --- | --- |
-| S0/S4 | A one-time code from the scratch reMarkable account (and whether it has Connect) |
+| S0/S4 | A one-time code (read-only use for S0; scratch account or scratch folder for S4) and whether the account has Connect |
 | S1, S3, M3, M4 | Checking a document on the physical tablet; exporting the test notebook |
 | S2 | The issuer: existing OIDC provider details, or permission to run the Keycloak profile; public hostnames; TLS; a test from claude.ai (hosted, Anthropic egress) |
 | S5 | What filesystem backs `/data`; whether host snapshots are available |
