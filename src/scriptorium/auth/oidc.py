@@ -129,12 +129,18 @@ def _claim_contains(value: Any, wanted: str) -> bool:
 
 
 def _scopes(claims: Mapping[str, Any]) -> frozenset[str]:
-    scope = claims.get("scope", claims.get("scp"))
-    if isinstance(scope, str):
-        return frozenset(scope.split())
-    if isinstance(scope, list):
-        return frozenset(s for s in scope if isinstance(s, str))
-    return frozenset()
+    """Granted scopes: ``scope`` (RFC 9068, space-separated) and/or ``scp`` (Entra, Okta).
+
+    Either claim may be a space-separated string or a list of strings.
+    """
+    found: set[str] = set()
+    for name in ("scope", "scp"):
+        value = claims.get(name)
+        if isinstance(value, str):
+            found.update(value.split())
+        elif isinstance(value, list):
+            found.update(s for s in value if isinstance(s, str) and s)
+    return frozenset(found)
 
 
 # ---- discovery --------------------------------------------------------------------------
@@ -182,7 +188,7 @@ class OIDCValidator:
         http: httpx.AsyncClient | None = None,
         clock: Clock = time.monotonic,
         refetch_cooldown: float = JWKS_REFETCH_COOLDOWN_SECONDS,
-        required_scopes: frozenset[str] = frozenset(),
+        required_scopes: frozenset[str] | None = None,
     ) -> None:
         self._settings = settings
         self._issuer = settings.oidc_issuer
@@ -191,7 +197,11 @@ class OIDCValidator:
         self._http = http or httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False)
         self._clock = clock
         self._cooldown = refetch_cooldown
-        self._required_scopes = required_scopes
+        # aud is the authoritative check (§5.1); scopes are an optional extra because
+        # bring-your-own issuers name or omit the scope claim differently.
+        self._required_scopes = (
+            frozenset(settings.oidc_required_scopes) if required_scopes is None else required_scopes
+        )
         self._allowed = frozenset(settings.oidc_allowed_users)
         self._allowed_emails = frozenset(u.lower() for u in settings.oidc_allowed_users if "@" in u)
 

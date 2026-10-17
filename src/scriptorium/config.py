@@ -131,6 +131,8 @@ class Settings(BaseSettings):
     # repr=False: the list may hold email addresses, which must never reach a log.
     oidc_allowed_users: Annotated[tuple[str, ...], NoDecode] = Field(default=(), repr=False)
     allow_all_issuer_users: bool = False
+    # Optional: scopes every token must carry (from `scope` or `scp`). Empty = aud only.
+    oidc_required_scopes: Annotated[tuple[str, ...], NoDecode] = ()
     log_level: LogLevel = "info"
     max_inline_kb: int = Field(default=256, ge=1, le=16 * 1024)
     spike_tools: bool = False
@@ -147,7 +149,7 @@ class Settings(BaseSettings):
         # No dotenv: compose's env_file injects the environment instead.
         return (init_settings, env_settings, _FileEnvSource(settings_cls))
 
-    @field_validator("trusted_proxies", "oidc_allowed_users", mode="before")
+    @field_validator("trusted_proxies", "oidc_allowed_users", "oidc_required_scopes", mode="before")
     @classmethod
     def _csv(cls, value: object) -> object:
         return _split_csv(value)
@@ -173,6 +175,13 @@ class Settings(BaseSettings):
         if not value.strip():
             raise ValueError("must not be empty")
         return value.strip()
+
+    @field_validator("oidc_required_scopes")
+    @classmethod
+    def _scope_tokens(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not s.isprintable() or " " in s or '"' in s or "\\" in s for s in value):
+            raise ValueError("each scope must be a single printable token without quotes")
+        return value
 
     @field_validator("bind")
     @classmethod

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib.util
 import ipaddress
@@ -184,8 +185,8 @@ async def test_mcp_issuer_down_is_503(http: httpx.AsyncClient, issuer: FakeIssue
 async def test_insufficient_scope_is_403(
     issuer: FakeIssuer, make_validator: Callable[..., OIDCValidator]
 ) -> None:
-    settings = make_settings()
-    validator = make_validator(settings, required_scopes=frozenset({"scriptorium"}))
+    settings = make_settings(oidc_required_scopes="scriptorium")
+    validator = make_validator(settings)
     app = create_app(settings, validator=validator)
     token = issuer.token(scope="openid email")
     async with (
@@ -197,6 +198,30 @@ async def test_insufficient_scope_is_403(
         response = await http.post("/mcp", json=_rpc("tools/list"), headers=_bearer(token))
     assert response.status_code == 403
     assert response.headers["www-authenticate"] == f'{CHALLENGE}, error="insufficient_scope"'
+
+
+async def test_default_app_accepts_token_without_scope_claim(
+    app: Starlette, issuer: FakeIssuer
+) -> None:
+    """aud is the authoritative check; no scope is required unless configured."""
+    async with mcp_session(app, issuer.token(scope=None)) as (client, _):
+        names = {tool.name for tool in (await client.list_tools()).tools}
+    assert names == USER_TOOLS
+
+
+async def test_required_scope_accepted_from_scp(
+    issuer: FakeIssuer, make_validator: Callable[..., OIDCValidator]
+) -> None:
+    settings = make_settings(oidc_required_scopes="scriptorium")
+    app = create_app(settings, validator=make_validator(settings))
+    async with (
+        running(app),
+        mcp_session(app, issuer.token(scope=None, scp=["scriptorium"])) as (
+            client,
+            _,
+        ),
+    ):
+        assert {tool.name for tool in (await client.list_tools()).tools} == USER_TOOLS
 
 
 async def test_unknown_path_is_404_without_auth(http: httpx.AsyncClient) -> None:
@@ -268,6 +293,27 @@ async def test_tool_list_follows_the_token_without_reconnect(
     assert "admin_spike_ping" not in before
     assert "admin_spike_ping" in after
     assert "admin_spike_ping" not in again
+
+
+@ERAS
+async def test_concurrent_users_do_not_share_identity(
+    app: Starlette, issuer: FakeIssuer, mode: str
+) -> None:
+    """Interleaved requests from two users each see only their own identity."""
+
+    async def whoami(token: str) -> list[bool]:
+        async with mcp_session(app, token, mode=mode) as (client, _):
+            seen = []
+            for _ in range(5):
+                result = await client.call_tool("spike_whoami", {})
+                assert result.structured_content is not None
+                seen.append(bool(result.structured_content["is_admin"]))
+                await asyncio.sleep(0)
+            return seen
+
+    plain, admin = await asyncio.gather(whoami(issuer.token()), whoami(issuer.admin_token()))
+    assert plain == [False] * 5
+    assert admin == [True] * 5
 
 
 async def test_whoami_reports_hash_not_email(app: Starlette, issuer: FakeIssuer) -> None:

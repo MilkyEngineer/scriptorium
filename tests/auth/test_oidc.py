@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from scriptorium.auth.oidc import (
     DiscoveryError,
+    InsufficientScope,
     OIDCValidator,
     TokenExpired,
     TokenInvalid,
@@ -402,6 +403,45 @@ async def test_display_name_falls_back(validator: OIDCValidator, issuer: FakeIss
 async def test_scp_list_claim(validator: OIDCValidator, issuer: FakeIssuer) -> None:
     token = issuer.token(scope=None, scp=["scriptorium", 7])
     assert (await validator.validate(token)).scopes == frozenset({"scriptorium"})
+
+
+async def test_scp_string_claim(validator: OIDCValidator, issuer: FakeIssuer) -> None:
+    token = issuer.token(scope=None, scp="scriptorium openid")
+    assert (await validator.validate(token)).scopes == frozenset({"scriptorium", "openid"})
+
+
+async def test_no_scope_claim_is_fine_by_default(
+    validator: OIDCValidator, issuer: FakeIssuer
+) -> None:
+    assert (await validator.validate(issuer.token(scope=None))).scopes == frozenset()
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"scope": "openid scriptorium"},
+        {"scope": None, "scp": "scriptorium"},
+        {"scope": None, "scp": ["scriptorium"]},
+        {"scope": "openid", "scp": ["scriptorium"]},
+    ],
+)
+async def test_required_scope_present(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, claims: dict[str, Any]
+) -> None:
+    validator = make_validator(make_settings(oidc_required_scopes="scriptorium"))
+    assert await validator.validate(issuer.token(**claims))
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [{"scope": "openid email"}, {"scope": None}, {"scope": None, "scp": ["openid"]}],
+)
+async def test_required_scope_missing(
+    make_validator: Callable[..., OIDCValidator], issuer: FakeIssuer, claims: dict[str, Any]
+) -> None:
+    validator = make_validator(make_settings(oidc_required_scopes="scriptorium"))
+    with pytest.raises(InsufficientScope):
+        await validator.validate(issuer.token(**claims))
 
 
 # ---- privacy ----------------------------------------------------------------------------

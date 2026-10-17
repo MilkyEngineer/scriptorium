@@ -197,6 +197,15 @@ def test_admin_claim_and_value_together(env: pytest.MonkeyPatch) -> None:
     assert load_settings().oidc_admin_value == "scriptorium-admin"
 
 
+def test_required_scopes(env: pytest.MonkeyPatch) -> None:
+    assert load_settings().oidc_required_scopes == ()
+    env.setenv("SCRIPTORIUM_OIDC_REQUIRED_SCOPES", "scriptorium, offline_access")
+    assert load_settings().oidc_required_scopes == ("scriptorium", "offline_access")
+    env.setenv("SCRIPTORIUM_OIDC_REQUIRED_SCOPES", "two words")
+    with pytest.raises(ConfigError, match="OIDC_REQUIRED_SCOPES"):
+        load_settings()
+
+
 def test_trusted_proxies_csv(env: pytest.MonkeyPatch) -> None:
     env.setenv("SCRIPTORIUM_TRUSTED_PROXIES", "10.0.0.0/8, fd00::/8")
     assert load_settings().trusted_proxies == (
