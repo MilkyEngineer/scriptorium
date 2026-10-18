@@ -14,7 +14,7 @@ from typing import Any
 
 import pypdfium2 as pdfium
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops
 from remarkable_mcp.strokes import append_strokes
 from rmscene import read_blocks, write_blocks
 from rmscene.scene_stream import SceneLineItemBlock
@@ -69,14 +69,31 @@ def _pixels(png: bytes) -> Image.Image:
         return im.convert("RGB")
 
 
+def _pixel_difference(a: Image.Image, b: Image.Image) -> tuple[int, float]:
+    """``(max channel difference, fraction of pixels that differ)`` between two RGB images."""
+    diff = ImageChops.difference(a, b)
+    extrema = diff.getextrema()
+    max_channel = max(hi for _, hi in extrema)
+    differing = sum(1 for px in diff.getdata() if px != (0, 0, 0))
+    return max_channel, differing / (a.width * a.height)
+
+
 def _assert_matches_golden(result: RenderResult, name: str) -> None:
     golden = GOLDEN_JSON["pages"][name]
     x, y, w, h = golden["viewbox_units"]
     assert (result.width, result.height) == tuple(golden["px"])
     assert result.extent_units == pytest.approx((x, y, x + w, y + h), abs=0.06)
-    # Byte-for-byte: the encode is Pillow's default PNG writer, which is deterministic.
-    assert hashlib.sha256(result.png).hexdigest() == golden["sha256"]
-    assert result.png == (GOLDEN / f"{name}.png").read_bytes()
+    golden_png = (GOLDEN / f"{name}.png").read_bytes()
+    assert hashlib.sha256(golden_png).hexdigest() == golden["sha256"], "golden file changed"
+    if result.png == golden_png:
+        return  # byte-identical (the case on the machine that produced the goldens)
+    # Pixel-identical is what matters: the PNG bytes depend on the zlib and resvg builds in
+    # the wheels, which differ between platforms (CI on Linux vs the goldens made on macOS).
+    max_channel, fraction = _pixel_difference(_pixels(result.png), _pixels(golden_png))
+    assert (max_channel, fraction) == (0, 0.0), (
+        f"{name}: pixels differ from the golden (max channel diff {max_channel}, "
+        f"{fraction:.4%} of pixels)"
+    )
 
 
 # ----------------------------------------------------------------------------- goldens
