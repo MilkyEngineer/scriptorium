@@ -637,6 +637,15 @@ class GlobalStore:
             )
             return cur.rowcount == 1
 
+    def confirmation_spent(self, digest: str) -> bool:
+        """Whether :meth:`spend_confirmation` recorded ``digest`` (rows are pruned after twice
+        the token lifetime, by when the token has expired anyway)."""
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            raise InvalidArgumentError("confirmation digest is malformed")
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM confirmations WHERE sha256 = ?", (digest,)).fetchone()
+        return row is not None
+
     # ---- audit ---------------------------------------------------------------------------
 
     def audit(

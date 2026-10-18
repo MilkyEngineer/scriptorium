@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Callable
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from scriptorium.accounts import device_token_name, poll_lock
 from scriptorium.auth.oidc import OIDCValidator
 from scriptorium.cloud.scope import SETTING_SYNC_SCOPE
+from scriptorium.errors import NotFoundError
+from scriptorium.tools import account as account_tools
+from scriptorium.users.secrets import SecretBox
 from tests.cloud.fake_cloud import NOTEBOOK, PDF
 from tests.conftest import FakeIssuer, make_settings
-from tests.tools.helpers import Served, serve
+from tests.tools.helpers import Served, serve, text_of
 from tests.worker.helpers import Linked
 
 WORK = "Synthetic Work"
@@ -135,3 +141,179 @@ async def test_a_damaged_stored_scope_is_replaced(library: Served, linked: Linke
     result = await library.ok("set_sync_scope", {"mode": "all"})
     assert result["previous"] is None and result["changed"] is True
     assert linked.index().get_setting(SETTING_SYNC_SCOPE) is None
+
+
+# ---- disconnect_remarkable(keep_archive=false) ---------------------------------------------------
+
+
+def _files(root: Path) -> set[Path]:
+    """Every file under ``root`` but SQLite's transient journal files, relative to it."""
+    return {
+        p.relative_to(root)
+        for p in root.rglob("*")
+        if p.is_file() and not p.name.endswith(("-wal", "-shm", "-journal"))
+    }
+
+
+def _moved_to(linked: Linked) -> Path:
+    (moved,) = (linked.settings.data_dir / "users" / linked.uid / "removed").iterdir()
+    return moved
+
+
+async def _dry_run(library: Served) -> dict[str, Any]:
+    return await library.ok("disconnect_remarkable", {"keep_archive": False})
+
+
+async def _execute(library: Served, confirmation: str, *, as_user: str | None = None) -> Any:
+    """The execute call's structured result, or its error payload."""
+    args = {"keep_archive": False, "confirmation_token": confirmation}
+    result = await library.call("disconnect_remarkable", args, token=as_user)
+    return json.loads(text_of(result))
+
+
+async def test_the_dry_run_changes_nothing_and_reports_counts(
+    library: Served, linked: Linked, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    before = _files(linked.paths.root)
+
+    dry = await _dry_run(library)
+
+    assert dry["dry_run"] is True and dry["account"] == linked.acct and dry["linked"] is True
+    assert set(dry["summary"]) == {"documents", "pages", "blobs", "bytes"}
+    assert dry["summary"]["documents"] == 2
+    assert dry["summary"]["pages"] > 0
+    assert dry["summary"]["blobs"] == sum(1 for p in before if p.parts[0] == "blobs")
+    assert dry["summary"]["bytes"] >= sum((linked.paths.root / p).stat().st_size for p in before)
+    assert re.fullmatch(r"[A-Za-z0-9_-]{54}", dry["confirmation_token"])
+    assert dry["expires_at"].endswith("Z")
+    assert _files(linked.paths.root) == before
+    row = linked.store.account(linked.uid, linked.acct)
+    assert row is not None and row.active and row.removed_at is None
+    assert SecretBox(linked.settings, linked.uid).open(device_token_name(linked.acct))
+    # The token is the caller's to hold: it is neither logged nor audited.
+    server_side = "\n".join(
+        f"{r.getMessage()} {getattr(r, 'scriptorium_fields', '')}"
+        for r in caplog.records
+        if not r.name.startswith("mcp.client")
+    )
+    assert dry["confirmation_token"] not in server_side
+    assert all(dry["confirmation_token"] not in repr(row) for row in library.audit_rows())
+
+
+async def test_executing_moves_the_account_aside_and_deletes_nothing(
+    library: Served, linked: Linked
+) -> None:
+    before = _files(linked.paths.root)
+    dry = await _dry_run(library)
+
+    done = await _execute(library, dry["confirmation_token"])
+
+    assert done["removed"] is True and done["account"] == linked.acct
+    assert done["archive_kept"] is False and "my.remarkable.com" in done["message"]
+    assert not linked.paths.root.exists()
+    moved = _moved_to(linked)
+    assert moved.name.startswith(f"{linked.acct}-") and moved.name.endswith("Z")
+    assert before <= _files(moved)  # one rename: every file is there, nothing deleted
+    row = linked.store.account(linked.uid, linked.acct)
+    assert row is not None and not row.active and row.removed_at is not None
+    assert SecretBox(linked.settings, linked.uid).open(device_token_name(linked.acct)) is None
+    assert linked.store.active_accounts() == []
+
+    status = await library.ok("account_status")
+    assert status["status"] == "not_linked"
+    (other,) = status["other_accounts"]
+    assert other["account"] == linked.acct and other["removed_at"].endswith("Z")
+    assert (await library.error("list", {"account": linked.acct}))["code"] == "not_found"
+    assert (await library.error("list"))["code"] == "not_linked"
+    with pytest.raises(NotFoundError):
+        library.services.index(linked.uid, linked.acct)
+    assert not linked.paths.root.exists()  # nothing above recreated it
+
+    again = await _execute(library, dry["confirmation_token"])
+    assert (again["code"], again["reason"]) == ("refused", "used")
+    # A new link is a new account: the removed one is never reused.
+    relinked = await library.ok("connect_remarkable", {"code": "abcd1234"})
+    assert relinked["account"] != linked.acct
+
+
+async def test_a_removal_token_is_bound_to_its_user_account_and_time(
+    library: Served, linked: Linked
+) -> None:
+    token = (await _dry_run(library))["confirmation_token"]
+    keep = await library.error(
+        "disconnect_remarkable", {"keep_archive": True, "confirmation_token": token}
+    )
+    assert keep["code"] == "invalid_argument"
+    malformed = await _execute(library, "not-a-token")
+    assert (malformed["code"], malformed["reason"]) == ("refused", "malformed")
+    # Another user with an account of their own cannot use it.
+    other = library.issuer.admin_token()
+    library.registrar.token = "second-device-token"
+    library.identities["second-device-token"] = "b" * 64
+    await library.ok("connect_remarkable", {"code": "abcd1234"}, token=other)
+    stolen = await _execute(library, token, as_user=other)
+    assert (stolen["code"], stolen["reason"]) == ("refused", "not_bound")
+    # Ten minutes later it has expired.
+    linked.clock.now += timedelta(minutes=11)
+    late = await _execute(library, token)
+    assert (late["code"], late["reason"]) == ("refused", "expired")
+    assert linked.paths.root.is_dir()
+    # A token from before a relink names the old account.
+    fresh = (await _dry_run(library))["confirmation_token"]
+    await library.ok("disconnect_remarkable")
+    library.registrar.token = "third-device-token"
+    library.identities["third-device-token"] = "c" * 64
+    await library.ok("connect_remarkable", {"code": "abcd1234"})
+    moved = await _execute(library, fresh)
+    assert (moved["code"], moved["reason"]) == ("refused", "not_bound")
+    assert linked.paths.root.is_dir()
+
+
+async def test_a_running_poll_makes_the_removal_wait_then_refuse(
+    library: Served, linked: Linked, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(account_tools, "REMOVE_LOCK_WAIT_S", 0.3)
+    token = (await _dry_run(library))["confirmation_token"]
+    with poll_lock(linked.paths) as held:
+        assert held == "held"
+        busy = await _execute(library, token)
+    assert (busy["code"], busy["reason"]) == ("refused", "busy")
+    assert linked.paths.root.is_dir()
+    row = linked.store.account(linked.uid, linked.acct)
+    assert row is not None and row.active
+    # The token was not spent: once the poll is over it works.
+    done = await _execute(library, token)
+    assert done["removed"] is True
+    assert not linked.paths.root.exists()
+
+
+async def test_a_failed_move_leaves_the_archive_readable(
+    library: Served, linked: Linked, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(paths: object, destination: object) -> None:
+        raise PermissionError("synthetic")
+
+    monkeypatch.setattr(account_tools, "move_aside", fail)
+    token = (await _dry_run(library))["confirmation_token"]
+
+    failed = await _execute(library, token)
+
+    assert (failed["code"], failed["reason"]) == ("refused", "move_failed")
+    row = linked.store.account(linked.uid, linked.acct)
+    assert row is not None and not row.active and row.removed_at is None
+    assert linked.paths.root.is_dir()
+    listed = await library.ok("list", {"account": linked.acct})
+    assert {item["uuid"] for item in listed["items"]} == {NOTEBOOK, PDF}
+
+
+async def test_an_archive_kept_at_disconnect_can_be_removed_later(
+    library: Served, linked: Linked
+) -> None:
+    await library.ok("disconnect_remarkable")
+    dry = await _dry_run(library)
+    assert dry["account"] == linked.acct and dry["linked"] is False
+    done = await _execute(library, dry["confirmation_token"])
+    assert done["removed"] is True
+    refused = await library.error("disconnect_remarkable", {"keep_archive": False})
+    assert refused["code"] == "not_linked"

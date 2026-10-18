@@ -117,7 +117,8 @@ class Account:
 
 
 def open_account(svc: Services, user: User, acct: str | None) -> Account:
-    """The user's account ``acct``, or by default the active (else the latest) one."""
+    """The user's account ``acct``, or by default the active (else the latest) one. Accounts
+    removed with ``disconnect_remarkable(keep_archive=false)`` are not served."""
     uid = svc.uid(user)
     rows = svc.store.accounts(uid)
     row: AccountRow | None
@@ -129,7 +130,14 @@ def open_account(svc: Services, user: User, acct: str | None) -> Account:
                 "You have no account with that id.",
                 "account_status lists your accounts.",
             )
+        if row.removed_at is not None:
+            raise ToolError(
+                ErrorCode.NOT_FOUND,
+                "That account's archive was removed from this server.",
+                "account_status lists your accounts.",
+            )
     else:
+        rows = [r for r in rows if r.removed_at is None]
         active = [r for r in rows if r.active]
         row = active[-1] if active else (rows[-1] if rows else None)
         if row is None:

@@ -633,12 +633,19 @@ def test_mark_removed_is_scoped_to_the_user(gs: GlobalStore) -> None:
 def test_spend_confirmation_records_each_digest_once(gs: GlobalStore) -> None:
     now = datetime(2026, 10, 18, tzinfo=UTC)
     digest = "ab" * 32
+    assert not gs.confirmation_spent(digest)
     assert gs.spend_confirmation(digest, now=now)
+    assert gs.confirmation_spent(digest)
     assert not gs.spend_confirmation(digest, now=now + timedelta(seconds=5))
     assert gs.spend_confirmation("cd" * 32, now=now)
     for bad in ("AB" * 32, "ab" * 31, "", "zz" * 32):
         with pytest.raises(InvalidArgumentError):
             gs.spend_confirmation(bad, now=now)
+        with pytest.raises(InvalidArgumentError):
+            gs.confirmation_spent(bad)
+    # Pruned once no token that old can still be valid.
+    assert gs.spend_confirmation("ef" * 32, now=now + timedelta(hours=1))
+    assert not gs.confirmation_spent(digest)
 
 
 def test_admin_audit_keys_take_a_uid_and_a_length(gs: GlobalStore) -> None:

@@ -18,6 +18,12 @@ the user and never logged or audited (the audit records how many there are).
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import stat
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Annotated, Final, Literal
 
 from mcp_types import CallToolResult
@@ -31,6 +37,9 @@ from scriptorium.accounts import (
     STATE_NEEDS_RELINK,
     STATE_TOKEN_REJECTIONS,
     device_token_name,
+    move_aside,
+    poll_lock,
+    removal_destination,
 )
 from scriptorium.auth.oidc import User
 from scriptorium.cloud.scope import (
@@ -53,6 +62,8 @@ from scriptorium.cloud.sync import (
 from scriptorium.config import API_KEY_RE
 from scriptorium.db.connect import from_db_time
 from scriptorium.errors import RefusedError
+from scriptorium.library.index import Index
+from scriptorium.logging import log_event
 from scriptorium.ocr.errors import OcrRefused, OcrUnavailable
 from scriptorium.ocr.modes import USER_KEY_SECRET
 from scriptorium.ocr.pipeline import (
@@ -64,6 +75,7 @@ from scriptorium.ocr.pipeline import (
 )
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
 from scriptorium.tools._conventions import (
+    CONFIRMATION_TTL_SECONDS,
     READ_ONLY,
     RESULT_CAP_BYTES,
     ErrorCode,
@@ -72,8 +84,12 @@ from scriptorium.tools._conventions import (
     ToolError,
     invalid_argument,
     iso_utc,
+    issue_confirmation_token,
     json_result,
+    refuse_spent_token,
+    spend_confirmation_token,
     tool_annotations,
+    verify_confirmation_token,
 )
 from scriptorium.tools._library import (
     ACCT_PATTERN,
@@ -92,8 +108,15 @@ from scriptorium.tools._library import (
 from scriptorium.tools._ocr import account_ocr, forget_key_refusals, ocr_mode, ocr_summary
 from scriptorium.tools._services import KEY_CHECK_WINDOW_S, Services
 from scriptorium.users.secrets import SecretBox
-from scriptorium.users.store import worker_heartbeat_path
+from scriptorium.users.store import (
+    AccountPaths,
+    AccountRow,
+    account_paths,
+    worker_heartbeat_path,
+)
 from scriptorium.worker import HEARTBEAT_STALE_SECONDS, heartbeat_age, read_heartbeat
+
+logger = logging.getLogger(__name__)
 
 DEVICES_URL: Final = "https://my.remarkable.com/"
 CONSOLE_URL: Final = "https://console.anthropic.com/settings/keys"
@@ -186,10 +209,14 @@ async def connect_remarkable(ctx: ToolContext, args: ConnectArgs) -> CallToolRes
 class DisconnectArgs(ToolArgs):
     keep_archive: bool = Field(
         default=True,
-        description="Keep the archive on this server (the only option in this release).",
+        description="Keep the archive readable on this server (the default). false removes "
+        "it from Scriptorium's reach in two steps: a dry run, then a call with its token.",
     )
     confirmation_token: str | None = Field(
-        default=None, max_length=512, description="Not used while keep_archive is true."
+        default=None,
+        max_length=512,
+        description="With keep_archive=false: the token the dry run returned (valid 10 "
+        "minutes). Without it the call is a dry run that changes nothing.",
     )
 
 
@@ -214,22 +241,185 @@ def _disconnect(svc: Services, user: User) -> dict[str, object]:
     }
 
 
-async def disconnect_remarkable(ctx: ToolContext, args: DisconnectArgs) -> CallToolResult:
-    """Unlink your reMarkable account: stop polling and delete the device token from this
-    server. The archive is kept and stays readable. Scriptorium cannot revoke the token at
-    reMarkable, so the reply tells you where to remove the device yourself."""
-    if not args.keep_archive:
+REMOVE_TOOL: Final = "disconnect_remarkable"
+REMOVE_LOCK_WAIT_S: Final = 10.0
+"""How long the execute step waits for a running poll of the account to end."""
+_REMOVE_LOCK_STEP_S: Final = 0.2
+
+
+def _removal_target(svc: Services, user: User) -> tuple[str, AccountRow]:
+    """The account keep_archive=false acts on: the linked one, else the latest disconnected
+    one that was not removed (so an archive kept earlier can still be removed)."""
+    uid = svc.uid(user)
+    rows = [r for r in svc.store.accounts(uid) if r.removed_at is None]
+    active = [r for r in rows if r.active]
+    row = active[-1] if active else (rows[-1] if rows else None)
+    if row is None:
+        raise not_linked()
+    return uid, row
+
+
+def _bound_args(acct: str) -> dict[str, object]:
+    """What a removal token is bound to besides the user and the tool: the arguments and the
+    account, so a token from a dry run never removes an account linked after it."""
+    return {"keep_archive": False, "account": acct}
+
+
+def _archive_summary(paths: AccountPaths, index: Index) -> dict[str, int]:
+    """Counts only (§11.1): documents (any state), pages, blob files, bytes on disk."""
+    counts = index.counts()
+    blobs = 0
+    total = 0
+    for directory, _dirs, files in os.walk(paths.root, followlinks=False):
+        in_blobs = Path(directory).is_relative_to(paths.blobs)
+        for name in files:
+            try:
+                info = os.lstat(os.path.join(directory, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+                blobs += in_blobs
+    return {
+        "documents": counts["documents"] + counts["trashed"] + counts["tombstoned"],
+        "pages": counts["pages"],
+        "blobs": blobs,
+        "bytes": total,
+    }
+
+
+def _removal_dry_run(svc: Services, user: User) -> dict[str, object]:
+    uid, row = _removal_target(svc, user)
+    paths = account_paths(svc.settings.data_dir, uid, row.acct)
+    summary = _archive_summary(paths, svc.index(uid, row.acct))
+    now = svc.clock()
+    token = issue_confirmation_token(
+        svc.settings, uid=uid, tool=REMOVE_TOOL, args=_bound_args(row.acct), now=now
+    )
+    return {
+        "dry_run": True,
+        "account": row.acct,
+        "linked": row.active,
+        "summary": summary,
+        "confirmation_token": token,
+        "expires_at": iso_utc(now + timedelta(seconds=CONFIRMATION_TTL_SECONDS)),
+        "message": (
+            "Nothing was changed. Calling disconnect_remarkable again with keep_archive=false "
+            "and this confirmation_token within 10 minutes stops polling, deletes the device "
+            "token from this server and moves this account's archive (the counts above, "
+            "trashed and deleted documents included) out of Scriptorium's reach: no tool can "
+            "read it afterwards. Nothing is deleted from the server's disk by this; the "
+            "operator can reclaim the space."
+        ),
+    }
+
+
+def _busy() -> ToolError:
+    return ToolError(
+        ErrorCode.REFUSED,
+        "A sync of this account is running.",
+        "Call disconnect_remarkable again in a minute with the same token.",
+        extra={"reason": "busy"},
+    )
+
+
+def _remove(svc: Services, user: User, token: str) -> dict[str, object]:
+    refuse_spent_token(svc.store, token)  # before the target: a used token's account is gone
+    uid, row = _removal_target(svc, user)
+    now = svc.clock()
+    verify_confirmation_token(
+        svc.settings, token, uid=uid, tool=REMOVE_TOOL, args=_bound_args(row.acct), now=now
+    )
+    paths = account_paths(svc.settings.data_dir, uid, row.acct)
+    deadline = time.monotonic() + REMOVE_LOCK_WAIT_S
+    while True:
+        # Not blocking: a long first sync would otherwise hold this thread for its duration.
+        with poll_lock(paths, blocking=False) as state:
+            if state == "held":
+                return _remove_locked(svc, uid, row, paths, token, now)
+            if state == "gone":
+                raise ToolError(
+                    ErrorCode.REFUSED,
+                    "This account's archive is not where it should be.",
+                    "Call account_status; if the account is still listed, ask the operator "
+                    "to check the server.",
+                )
+        if time.monotonic() >= deadline:
+            raise _busy()  # the token is not spent: it can be used again
+        time.sleep(_REMOVE_LOCK_STEP_S)
+
+
+def _remove_locked(
+    svc: Services, uid: str, row: AccountRow, paths: AccountPaths, token: str, now: datetime
+) -> dict[str, object]:
+    """Under the poll lock: no poll runs and none starts until the directory has moved."""
+    try:
+        destination = removal_destination(svc.settings.data_dir, uid, row.acct, at=now)
+    except RefusedError:
         raise ToolError(
             ErrorCode.REFUSED,
-            "Deleting the archive is not available in this release.",
-            "Disconnect with keep_archive=true; the archive stays on this server.",
+            "This account's archive cannot be moved aside on this server.",
+            "Nothing was changed. Ask the operator to check the server logs.",
+        ) from None
+    spend_confirmation_token(svc.store, token, now=now)
+    # Removed before the move, so nothing reopens the account (and recreates its directory)
+    # meanwhile; the token goes with it, as on any disconnect.
+    svc.store.mark_removed(uid, row.acct, at=now)
+    SecretBox(svc.settings, uid).forget(device_token_name(row.acct))
+    svc.evict_index(uid, row.acct)
+    try:
+        move_aside(paths, destination)
+    except OSError as exc:
+        svc.store.unmark_removed(uid, row.acct)
+        log_event(
+            logger,
+            "account_move_failed",
+            level=logging.ERROR,
+            acct=row.acct,
+            reason=type(exc).__name__,
         )
-    if args.confirmation_token is not None:
-        raise invalid_argument("A confirmation token is only used to delete the archive.")
-    payload = await asyncio.to_thread(_disconnect, services(ctx), ctx.user)
-    accounts = payload["disconnected"]
-    if isinstance(accounts, list) and len(accounts) == 1:
-        ctx.audit["acct"] = accounts[0]
+        raise ToolError(
+            ErrorCode.REFUSED,
+            "The account was disconnected, but its archive could not be moved.",
+            "It stays readable with list(account=...). Ask the operator to check the logs.",
+            extra={"reason": "move_failed"},
+        ) from None
+    log_event(logger, "account_moved", acct=row.acct)
+    return {
+        "removed": True,
+        "account": row.acct,
+        "archive_kept": False,
+        "message": (
+            "Polling stopped, the device token was deleted from this server and the archive "
+            "was moved out of Scriptorium's reach. Scriptorium cannot revoke the token at "
+            f'reMarkable: remove the device named "{DEVICE_DESCRIPTION}" at {DEVICES_URL}.'
+        ),
+    }
+
+
+async def disconnect_remarkable(ctx: ToolContext, args: DisconnectArgs) -> CallToolResult:
+    """Unlink your reMarkable account: stop polling and delete the device token from this
+    server. By default the archive is kept and stays readable. With keep_archive=false the
+    archive is also taken out of Scriptorium's reach, in two steps: a first call without a
+    confirmation_token is a dry run that changes nothing and returns how many documents,
+    pages, blobs and bytes would go, with a token; a second call with that token within 10
+    minutes does it (nothing is deleted from the server's disk; the operator can reclaim
+    the space). Scriptorium cannot revoke the token at reMarkable, so the reply tells you
+    where to remove the device yourself."""
+    svc = services(ctx)
+    if args.keep_archive:
+        if args.confirmation_token is not None:
+            raise invalid_argument("A confirmation token is only used with keep_archive=false.")
+        payload = await asyncio.to_thread(_disconnect, svc, ctx.user)
+        accounts = payload["disconnected"]
+        if isinstance(accounts, list) and len(accounts) == 1:
+            ctx.audit["acct"] = accounts[0]
+        return json_result(payload, cap=RESULT_CAP_BYTES)
+    if args.confirmation_token is None:
+        payload = await asyncio.to_thread(_removal_dry_run, svc, ctx.user)
+    else:
+        payload = await asyncio.to_thread(_remove, svc, ctx.user, args.confirmation_token)
+    ctx.audit["acct"] = payload["account"]
     return json_result(payload, cap=RESULT_CAP_BYTES)
 
 
@@ -590,11 +780,22 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
     }
 
 
+def _other_account(row: AccountRow) -> dict[str, object]:
+    item: dict[str, object] = {
+        "account": row.acct,
+        "active": row.active,
+        "linked_at": iso_utc(row.linked_at),
+    }
+    if row.removed_at is not None:
+        item["removed_at"] = iso_utc(row.removed_at)  # its archive is no longer served
+    return item
+
+
 def _account_status(svc: Services, user: User, acct: str | None) -> dict[str, object]:
     uid = svc.uid(user)
     rows = svc.store.accounts(uid)
-    if not rows:
-        return {
+    if acct is None and all(r.removed_at is not None for r in rows):
+        payload: dict[str, object] = {
             "user": uid,
             "linked": False,
             "status": "not_linked",
@@ -604,13 +805,12 @@ def _account_status(svc: Services, user: User, acct: str | None) -> dict[str, ob
             ),
             "ocr": account_ocr(svc, None, uid),
         }
+        if rows:
+            payload["other_accounts"] = [_other_account(r) for r in rows]
+        return payload
     account = open_account(svc, user, acct)
     payload = {"user": uid, **_status(svc, account)}
-    payload["other_accounts"] = [
-        {"account": r.acct, "active": r.active, "linked_at": iso_utc(r.linked_at)}
-        for r in rows
-        if r.acct != account.acct
-    ]
+    payload["other_accounts"] = [_other_account(r) for r in rows if r.acct != account.acct]
     return payload
 
 

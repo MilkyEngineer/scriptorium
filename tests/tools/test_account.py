@@ -198,8 +198,8 @@ async def test_another_users_account_is_not_found(fresh: Served) -> None:
 
 async def test_disconnect_keeps_the_archive_and_forgets_the_token(fresh: Served) -> None:
     linked = await fresh.ok("connect_remarkable", {"code": CODE})
-    refused = await fresh.error("disconnect_remarkable", {"keep_archive": False})
-    assert refused["code"] == "refused"
+    dry = await fresh.ok("disconnect_remarkable", {"keep_archive": False})
+    assert dry["dry_run"] is True  # without its token it changes nothing (test_account_m2)
     confirm = await fresh.error("disconnect_remarkable", {"confirmation_token": "x"})
     assert confirm["code"] == "invalid_argument"
     assert (await fresh.ok("account_status"))["linked"] is True

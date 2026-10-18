@@ -296,6 +296,10 @@ class ConfirmationLedger(Protocol):
         """Record ``digest``; False if it was recorded already (the token was used)."""
         ...
 
+    def confirmation_spent(self, digest: str) -> bool:
+        """Whether ``digest`` was recorded (and not yet pruned)."""
+        ...
+
 
 def _confirmation_key(settings: Settings) -> bytes:
     """HKDF-SHA256 of the newest master key, info ``confirmation`` (§11.0)."""
@@ -412,6 +416,15 @@ def confirmation_digest(token: str) -> str:
     issued_at, mac = decoded
     raw = issued_at.to_bytes(_ISSUED_BYTES, "big", signed=True) + mac
     return hashlib.sha256(raw).hexdigest()
+
+
+def refuse_spent_token(ledger: ConfirmationLedger, token: str) -> None:
+    """``refused`` (reason ``used``) for a token that was executed already, ``malformed`` for
+    one that is not a token. For a tool whose target can change once the token ran (the
+    account it removed is gone): checked first, a repeated call says ``used`` rather than
+    ``not_bound``."""
+    if ledger.confirmation_spent(confirmation_digest(token)):
+        raise _confirmation_refused("used")
 
 
 def spend_confirmation_token(ledger: ConfirmationLedger, token: str, *, now: datetime) -> None:

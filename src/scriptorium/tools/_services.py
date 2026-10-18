@@ -29,6 +29,7 @@ from scriptorium.auth.oidc import User
 from scriptorium.cloud.client import CloudClient
 from scriptorium.config import Settings
 from scriptorium.db.connect import utc_now
+from scriptorium.errors import NotFoundError
 from scriptorium.jobs.queue import JobQueue
 from scriptorium.library.index import Index
 from scriptorium.logging import log_event, uid_prefix
@@ -178,14 +179,29 @@ class Services:
         return lock
 
     def index(self, uid: str, acct: str) -> Index:
-        """The account's index, migrated and opened once per process."""
+        """The account's index, migrated and opened once per process.
+
+        ``not_found`` for an account that was removed (its directory moved to ``removed/``):
+        opening it would recreate an empty account directory in its place.
+        """
         key = (uid, acct)
         with self._lock:
             index = self._indexes.get(key)
             if index is None:
+                row = self.store.account(uid, acct)
+                if row is not None and row.removed_at is not None:
+                    raise NotFoundError("That account was removed from this server.")
                 paths = account_paths(self.settings.data_dir, uid, acct)
                 paths.root.mkdir(parents=True, exist_ok=True)
                 paths.inside(paths.index)
                 index = Index.open(paths.index, migrate=True, clock=self.clock)
                 self._indexes[key] = index
             return index
+
+    def evict_index(self, uid: str, acct: str) -> None:
+        """Close and forget the account's cached index (before its directory is moved); the
+        next :meth:`index` call opens it again, or refuses a removed account."""
+        with self._lock:
+            index = self._indexes.pop((uid, acct), None)
+        if index is not None:
+            index.close()
