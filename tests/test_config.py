@@ -391,3 +391,20 @@ def test_worker_settings_defaults_and_bounds(env: pytest.MonkeyPatch) -> None:
         with pytest.raises(ConfigError, match=name):
             load_settings()
         env.delenv(f"SCRIPTORIUM_{name}")
+
+
+def test_poll_budgets_and_watchdog(env: pytest.MonkeyPatch) -> None:
+    settings = load_settings()
+    assert (settings.sync_max_poll_bytes, settings.sync_max_poll_seconds) == (2 * 1024**3, 1200)
+    env.setenv("SCRIPTORIUM_SYNC_MAX_POLL_BYTES", str(64 * 1024**2))
+    env.setenv("SCRIPTORIUM_SYNC_MAX_POLL_SECONDS", "300")
+    settings = load_settings()
+    assert (settings.sync_max_poll_bytes, settings.sync_max_poll_seconds) == (64 * 1024**2, 300)
+    env.setenv("SCRIPTORIUM_SYNC_MAX_POLL_BYTES", "1000")
+    with pytest.raises(ConfigError, match="SYNC_MAX_POLL_BYTES"):
+        load_settings()
+    env.delenv("SCRIPTORIUM_SYNC_MAX_POLL_BYTES")
+    # The watchdog must outlast the time budget.
+    env.setenv("SCRIPTORIUM_POLL_TIMEOUT_SECONDS", "300")
+    with pytest.raises(ConfigError, match="POLL_TIMEOUT_SECONDS"):
+        load_settings()

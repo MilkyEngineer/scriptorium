@@ -195,13 +195,25 @@ class Settings(BaseSettings):
     tombstone_max_per_poll: int = Field(
         default=50, ge=0, description="Circuit breaker: most tombstones one poll may apply (§7)."
     )
+    sync_max_poll_bytes: int = Field(
+        default=2 * 1024**3,
+        ge=1024**2,
+        description="Blob bytes one poll may download before it stops early (§7 step 7).",
+    )
+    sync_max_poll_seconds: int = Field(
+        default=20 * 60,
+        ge=10,
+        le=24 * 3600,
+        description="How long one poll may keep starting downloads (§7 step 7).",
+    )
     poll_timeout_seconds: int = Field(
         default=1800,
         ge=60,
         le=24 * 3600,
         description=(
             "Watchdog on one poll: past this the worker closes the account's cloud client, "
-            "which ends the poll with a transport error, and backs off (§7 step 7)."
+            "which ends the poll with a transport error, and backs off (§7 step 7). Must "
+            "exceed SYNC_MAX_POLL_SECONDS, which only stops a poll from starting more work."
         ),
     )
     pending_wait_seconds: float = Field(
@@ -280,6 +292,16 @@ class Settings(BaseSettings):
     def _bind(cls, value: str) -> str:
         _parse_bind(value)
         return value
+
+    @model_validator(mode="after")
+    def _watchdog_after_budget(self) -> Settings:
+        if self.poll_timeout_seconds <= self.sync_max_poll_seconds:
+            raise ValueError(
+                f"{env_name('poll_timeout_seconds')} must be larger than "
+                f"{env_name('sync_max_poll_seconds')}: the budget stops a poll from starting "
+                "work, the watchdog ends one that is stuck."
+            )
+        return self
 
     @model_validator(mode="after")
     def _identity_claim(self) -> Settings:
