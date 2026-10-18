@@ -176,6 +176,44 @@ class Settings(BaseSettings):
     max_inline_kb: int = Field(default=256, ge=1, le=16 * 1024)
     spike_tools: bool = False
 
+    # ---- sync worker (§7) -----------------------------------------------------------------
+    poll_seconds: int = Field(
+        default=600,
+        ge=30,
+        le=24 * 3600,
+        description="Interval between polls of one account, jittered ±10 % (§7).",
+    )
+    sync_concurrency: int = Field(
+        default=2, ge=1, le=64, description="Accounts polled at the same time (§7)."
+    )
+    sync_workers: int = Field(
+        default=4, ge=1, le=64, description="Blob downloads in flight within one account (§7)."
+    )
+    render_workers: int = Field(
+        default=2, ge=1, le=32, description="Processes in the rendering pool (§7, §8.3)."
+    )
+    tombstone_max_per_poll: int = Field(
+        default=50, ge=0, description="Circuit breaker: most tombstones one poll may apply (§7)."
+    )
+    poll_timeout_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=24 * 3600,
+        description=(
+            "Watchdog on one poll: past this the worker closes the account's cloud client, "
+            "which ends the poll with a transport error, and backs off (§7 step 7)."
+        ),
+    )
+    pending_wait_seconds: float = Field(
+        default=20,
+        ge=0,
+        le=60,
+        description=(
+            "How long read_page and page_image wait for a render job before answering "
+            "`pending` with the job id (§11.0)."
+        ),
+    )
+
     @classmethod
     def settings_customise_sources(
         cls,

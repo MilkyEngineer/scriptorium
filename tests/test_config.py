@@ -361,3 +361,33 @@ def test_settings_class_direct_errors_hide_input(env: pytest.MonkeyPatch) -> Non
     with pytest.raises(ValueError) as info:
         Settings()
     assert "s3cret-not-a-key" not in str(info.value)
+
+
+def test_worker_settings_defaults_and_bounds(env: pytest.MonkeyPatch) -> None:
+    settings = load_settings()
+    assert (
+        settings.poll_seconds,
+        settings.sync_concurrency,
+        settings.sync_workers,
+        settings.render_workers,
+        settings.tombstone_max_per_poll,
+        settings.poll_timeout_seconds,
+        settings.pending_wait_seconds,
+    ) == (600, 2, 4, 2, 50, 1800, 20)
+    env.setenv("SCRIPTORIUM_POLL_SECONDS", "120")
+    env.setenv("SCRIPTORIUM_PENDING_WAIT_SECONDS", "2.5")
+    settings = load_settings()
+    assert (settings.poll_seconds, settings.pending_wait_seconds) == (120, 2.5)
+    for name, bad in (
+        ("POLL_SECONDS", "5"),
+        ("SYNC_CONCURRENCY", "0"),
+        ("SYNC_WORKERS", "65"),
+        ("RENDER_WORKERS", "0"),
+        ("TOMBSTONE_MAX_PER_POLL", "-1"),
+        ("POLL_TIMEOUT_SECONDS", "10"),
+        ("PENDING_WAIT_SECONDS", "61"),
+    ):
+        env.setenv(f"SCRIPTORIUM_{name}", bad)
+        with pytest.raises(ConfigError, match=name):
+            load_settings()
+        env.delenv(f"SCRIPTORIUM_{name}")
