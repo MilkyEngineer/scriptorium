@@ -379,6 +379,41 @@ async def _remove(svc: Services, user: User, token: str) -> dict[str, object]:
             await asyncio.sleep(_REMOVE_LOCK_STEP_S)
 
 
+def _after_failed_move(
+    svc: Services, removal: _Removal, destination: Path, exc: Exception
+) -> ToolError | None:
+    """What a failure during the removal left behind, read from the filesystem rather than
+    from the exception (a step can fail after the rename): None when the directory reached
+    ``removed/``, so the removal stands; otherwise the error to raise.
+
+    Only an account whose directory is still in place is put back (``removed_at`` cleared):
+    putting back one whose directory is elsewhere would let the next :meth:`Services.index`
+    create an empty account directory and index in its place.
+    """
+    uid, acct = removal.uid, removal.row.acct
+    reason = type(exc).__name__
+    if os.path.lexists(destination):
+        log_event(logger, "account_move_incomplete", level=logging.ERROR, acct=acct, reason=reason)
+        return None
+    log_event(logger, "account_move_failed", level=logging.ERROR, acct=acct, reason=reason)
+    if not os.path.lexists(removal.paths.root):
+        # Neither here nor there: it stays removed (and refused) until the operator looks.
+        return ToolError(
+            ErrorCode.REFUSED,
+            "The account was disconnected, but its archive is not where it should be.",
+            "Ask the operator to check the server logs.",
+            extra={"reason": "move_failed"},
+        )
+    svc.store.unmark_removed(uid, acct)
+    return ToolError(
+        ErrorCode.REFUSED,
+        "The account was disconnected, but its archive could not be moved.",
+        "It stays readable with list(account=...). Call disconnect_remarkable with "
+        "keep_archive=false again to retry, or ask the operator to check the logs.",
+        extra={"reason": "move_failed"},
+    )
+
+
 def _remove_locked(svc: Services, removal: _Removal) -> dict[str, object]:
     """Under the poll lock: no poll runs and none starts until the directory has moved."""
     uid, row, paths, now = removal.uid, removal.row, removal.paths, removal.now
@@ -392,29 +427,16 @@ def _remove_locked(svc: Services, removal: _Removal) -> dict[str, object]:
         ) from None
     spend_confirmation_token(svc.store, removal.token, now=now)
     # Removed before the move, so nothing reopens the account (and recreates its directory)
-    # meanwhile; the token goes with it, as on any disconnect. Any failure from here on
-    # puts the account back, so it is never left removed with its directory in place.
+    # meanwhile; the token goes with it, as on any disconnect.
     svc.store.mark_removed(uid, row.acct, at=now)
     try:
         SecretBox(svc.settings, uid).forget(device_token_name(row.acct))
         svc.evict_index(uid, row.acct)
         move_aside(paths, destination)
     except Exception as exc:
-        svc.store.unmark_removed(uid, row.acct)
-        log_event(
-            logger,
-            "account_move_failed",
-            level=logging.ERROR,
-            acct=row.acct,
-            reason=type(exc).__name__,
-        )
-        raise ToolError(
-            ErrorCode.REFUSED,
-            "The account was disconnected, but its archive could not be moved.",
-            "It stays readable with list(account=...). Call disconnect_remarkable with "
-            "keep_archive=false again to retry, or ask the operator to check the logs.",
-            extra={"reason": "move_failed"},
-        ) from None
+        failed = _after_failed_move(svc, removal, destination, exc)
+        if failed is not None:
+            raise failed from None
     log_event(logger, "account_moved", acct=row.acct)
     return {
         "removed": True,

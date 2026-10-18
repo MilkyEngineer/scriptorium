@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import logging
 import os
 import sys
 import threading
@@ -10,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from scriptorium import accounts
 from scriptorium.accounts import move_aside, poll_lock, removal_destination
 from scriptorium.errors import PathEscapeError, RefusedError
 from scriptorium.users.store import AccountPaths, account_paths, removed_account_path
@@ -88,6 +91,51 @@ def test_move_aside_renames_the_whole_directory(paths: AccountPaths, tmp_path: P
 
     assert not paths.root.exists()
     assert (destination / "blobs" / ("a" * 64)).read_bytes() == b"x"
+
+
+def test_a_failed_fsync_after_the_rename_still_counts_as_moved(
+    paths: AccountPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Probe P3: the directory has moved, so the caller must not be told that nothing did.
+    caplog.set_level(logging.INFO)
+    (paths.root / "blobs").mkdir()
+    destination = removal_destination(tmp_path, UID, ACCT, at=AT)
+
+    def fail(path: Path) -> None:
+        raise OSError(errno.EIO, f"synthetic failure at {path}")
+
+    monkeypatch.setattr(accounts, "_fsync_dir", fail)
+
+    move_aside(paths, destination)  # does not raise
+
+    assert not os.path.lexists(paths.root)
+    assert (destination / "blobs").is_dir()
+    logged = [
+        (r.getMessage(), getattr(r, "scriptorium_fields", {}))
+        for r in caplog.records
+        if r.name == "scriptorium.accounts"
+    ]
+    # Both parents were tried; only the class name is logged, never a path or message.
+    assert logged == [("account_move_fsync_failed", {"acct": ACCT, "reason": "OSError"})] * 2
+    assert str(tmp_path) not in repr(logged) and "synthetic" not in repr(logged)
+
+
+def test_a_failed_rename_moves_nothing(
+    paths: AccountPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = removal_destination(tmp_path, UID, ACCT, at=AT)
+
+    def fail(src: object, dst: object) -> None:
+        raise PermissionError("synthetic")
+
+    monkeypatch.setattr(os, "rename", fail)
+    with pytest.raises(PermissionError):
+        move_aside(paths, destination)
+    monkeypatch.undo()
+    assert paths.root.is_dir() and not os.path.lexists(destination)
 
 
 def test_removal_destination_refuses_what_a_rename_cannot_do(

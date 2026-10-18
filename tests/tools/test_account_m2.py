@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
+import os
 import re
 from collections.abc import AsyncIterator, Callable
 from datetime import timedelta
@@ -13,12 +15,14 @@ from typing import Any
 
 import pytest
 
+from scriptorium import accounts
 from scriptorium.accounts import device_token_name, poll_lock
 from scriptorium.auth.oidc import OIDCValidator
 from scriptorium.cloud.scope import SETTING_SYNC_SCOPE
 from scriptorium.errors import NotFoundError
 from scriptorium.tools import account as account_tools
 from scriptorium.users.secrets import SecretBox
+from scriptorium.users.store import AccountPaths
 from tests.cloud.fake_cloud import NOTEBOOK, PDF
 from tests.conftest import FakeIssuer, make_settings
 from tests.tools.helpers import Served, serve, text_of
@@ -310,6 +314,74 @@ async def test_a_failed_move_leaves_the_archive_readable(
     monkeypatch.undo()
     done = await _execute(library, (await _dry_run(library))["confirmation_token"])
     assert done["removed"] is True and not linked.paths.root.exists()
+
+
+async def _assert_stays_removed(library: Served, linked: Linked) -> None:
+    """The account is removed and refused, and nothing recreated its directory."""
+    row = linked.store.account(linked.uid, linked.acct)
+    assert row is not None and not row.active and row.removed_at is not None
+    assert (await library.error("list", {"account": linked.acct}))["code"] == "not_found"
+    with pytest.raises(NotFoundError):
+        library.services.index(linked.uid, linked.acct)
+    assert not linked.paths.root.exists() and not linked.paths.root.is_symlink()
+
+
+async def test_a_failed_fsync_after_the_rename_keeps_the_account_removed(
+    library: Served, linked: Linked, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Probe P3 through the tool: the rename happened, so the account must not be put back
+    # (the next index() would create an empty account where the archive was).
+    def fail(path: Path) -> None:
+        raise OSError(errno.EIO, "synthetic")
+
+    monkeypatch.setattr(accounts, "_fsync_dir", fail)
+    before = _files(linked.paths.root)
+
+    done = await _execute(library, (await _dry_run(library))["confirmation_token"])
+
+    assert done["removed"] is True
+    assert before <= _files(_moved_to(linked))
+    await _assert_stays_removed(library, linked)
+
+
+async def test_a_failure_after_the_rename_keeps_the_account_removed(
+    library: Served, linked: Linked, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Whatever raises after the rename, the filesystem decides: the archive is in removed/.
+    real = account_tools.move_aside
+
+    def moved_then_failed(paths: AccountPaths, destination: Path) -> None:
+        real(paths, destination)
+        raise OSError("synthetic")
+
+    monkeypatch.setattr(account_tools, "move_aside", moved_then_failed)
+
+    done = await _execute(library, (await _dry_run(library))["confirmation_token"])
+
+    assert done["removed"] is True
+    assert _moved_to(linked).is_dir()
+    await _assert_stays_removed(library, linked)
+
+
+async def test_an_archive_gone_from_both_places_stays_removed(
+    library: Served, linked: Linked, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Neither in accounts/ nor in removed/: putting the account back would let the next
+    # index() create an empty one, so it stays removed for the operator to look at.
+    elsewhere = tmp_path / "elsewhere"
+
+    def vanished(paths: AccountPaths, destination: Path) -> None:
+        os.rename(paths.root, elsewhere)
+        raise OSError("synthetic")
+
+    monkeypatch.setattr(account_tools, "move_aside", vanished)
+
+    failed = await _execute(library, (await _dry_run(library))["confirmation_token"])
+
+    assert (failed["code"], failed["reason"]) == ("refused", "move_failed")
+    assert "operator" in failed["hint"]
+    assert (elsewhere / "index.sqlite").is_file()
+    await _assert_stays_removed(library, linked)
 
 
 async def test_a_failure_before_the_move_puts_the_account_back(

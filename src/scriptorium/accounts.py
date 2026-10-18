@@ -14,6 +14,7 @@ against a directory that is being moved.
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 import sys
@@ -25,6 +26,7 @@ from typing import Final, Literal
 
 from scriptorium.errors import RefusedError
 from scriptorium.library.layout import resolve_inside
+from scriptorium.logging import log_event
 from scriptorium.users.store import (
     ACCT_RE,
     AccountPaths,
@@ -51,6 +53,8 @@ __all__ = [
     "poll_lock",
     "removal_destination",
 ]
+
+logger = logging.getLogger(__name__)
 
 PollLock = Literal["held", "busy", "gone"]
 
@@ -147,13 +151,27 @@ def move_aside(paths: AccountPaths, destination: Path) -> None:
     """Rename the account directory to ``destination`` (from :func:`removal_destination`),
     then fsync both parent directories. The only filesystem change Scriptorium makes to an
     account outside its archive paths: one rename on one filesystem, nothing deleted. The
-    caller holds :func:`poll_lock`. Raises :class:`OSError` if the rename fails, in which case
-    nothing moved."""
+    caller holds :func:`poll_lock`.
+
+    Raises :class:`OSError` only when the rename did not happen, so nothing moved. Once the
+    rename has returned the move is done: a failed fsync is logged
+    (``account_move_fsync_failed``, the exception's class name only) and not raised, because
+    the directory is no longer where a caller could put the account back from.
+    """
     if os.path.lexists(destination):
         raise FileExistsError("the destination already exists")
     os.rename(paths.root, destination)
     for parent in (paths.root.parent, destination.parent):
-        _fsync_dir(parent)
+        try:
+            _fsync_dir(parent)
+        except OSError as exc:
+            log_event(
+                logger,
+                "account_move_fsync_failed",
+                level=logging.ERROR,
+                acct=paths.root.name,
+                reason=type(exc).__name__,
+            )
 
 
 def _fsync_dir(path: Path) -> None:
