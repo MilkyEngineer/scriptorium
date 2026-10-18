@@ -543,3 +543,96 @@ def test_dead_renders_is_scoped_to_the_user_and_account(queue: JobQueue) -> None
     assert queue.dead_renders(UID, acct="01J0000000000000000000000B") == (0, 1)
     assert queue.dead_renders(OTHER) == (0, 1)
     assert queue.dead_renders("0000000000000000") == (0, 0)
+
+
+# ---- M2: per-user lease cap, final failures, families, lookups ---------------------------------
+
+
+def test_per_uid_cap_skips_a_user_at_the_cap(queue: JobQueue, clock: Clock) -> None:
+    """At most N leased jobs of a kind per user: the next user's job is claimed instead."""
+    for n in range(3):
+        put(queue, f"ocr:a{n}", kind="ocr")
+        clock.advance(1)
+    put(queue, "ocr:b0", kind="ocr", uid=OTHER)
+    clock.advance(1)
+    put(queue, "render:a", kind="render")
+    cap = {"ocr": 2}
+    leased = [queue.lease("w", per_uid=cap) for _ in range(4)]
+    assert [(j.uid, j.dedupe_key) for j in leased if j is not None] == [
+        (UID, "ocr:a0"),
+        (UID, "ocr:a1"),
+        (OTHER, "ocr:b0"),  # UID is at its cap of 2 leased ocr jobs
+        (UID, "render:a"),  # other kinds are not capped
+    ]
+    assert queue.lease("w", per_uid=cap) is None
+    first = leased[0]
+    assert first is not None
+    queue.complete(first.id, "w", {})
+    third = queue.lease("w", per_uid=cap)
+    assert third is not None and third.dedupe_key == "ocr:a2"
+    with pytest.raises(InvalidArgumentError):
+        queue.lease("w", per_uid={"ocr": 0})
+
+
+def test_fail_final_is_dead_at_once(queue: JobQueue) -> None:
+    put(queue, "ocr:x", kind="ocr")
+    job = queue.lease("w")
+    assert job is not None
+    dead = queue.fail(job.id, "w", "refused", final=True)
+    assert (dead.state, dead.error, dead.attempts) == ("dead", "refused", 1)
+
+
+def test_rerun_takes_a_new_payload(queue: JobQueue) -> None:
+    put(queue, "ocr:y", kind="ocr", payload={"force": False})
+    job = queue.lease("w")
+    assert job is not None
+    queue.complete(job.id, "w", {"state": "done"})
+    row = queue.get(job.id, UID)
+    assert row is not None
+    forced = queue.rerun(row, payload={"force": True})
+    assert forced is not None and forced.payload == {"force": True}
+    assert forced.dedupe_key == f"ocr:y:after:{job.id}"
+
+
+def test_family_lists_the_base_and_its_reruns_only(queue: JobQueue) -> None:
+    base = put(queue, "ocr:f")
+    put(queue, "ocr:fg")  # a longer key sharing the prefix is another family
+    put(queue, "ocr:f:after:x", uid=OTHER)  # another user's rows are never listed
+    row = queue.get(base, UID)
+    assert row is not None
+    child = queue.rerun(row)
+    assert child is not None
+    assert [j.id for j in queue.family(UID, "ocr:f")] == [base, child.id]
+    assert [j.id for j in queue.family(UID, child.dedupe_key)] == [base, child.id]
+    assert queue.family(UID, "ocr:none") == []
+
+
+def test_active_and_recent_errors(queue: JobQueue, clock: Clock) -> None:
+    acct_b = "01J0000000000000000000000B"
+    put(queue, "ocr_batch:1", kind="ocr_batch")
+    put(queue, "ocr_batch:2", kind="ocr_batch", acct=acct_b)
+    put(queue, "ocr:1", kind="ocr")
+    assert [j.dedupe_key for j in queue.active(UID, acct=None, kind="ocr_batch")] == [
+        "ocr_batch:1",
+        "ocr_batch:2",
+    ]
+    assert [j.dedupe_key for j in queue.active(UID, acct=acct_b, kind="ocr_batch")] == [
+        "ocr_batch:2"
+    ]
+    job = queue.lease("w", kinds=["ocr"])
+    assert job is not None
+    queue.fail(job.id, "w", "unavailable")
+    clock.advance(5)
+    put(queue, "ocr:2", kind="ocr")
+    clock.advance(3600)
+    job = queue.lease("w", kinds=["ocr"])
+    assert job is not None and job.dedupe_key == "ocr:1"
+    queue.fail(job.id, "w", "refused", final=True)
+    errors = queue.recent_errors(UID, acct=None, kinds=["ocr", "ocr_batch"])
+    assert [(kind, error) for kind, error, _at in errors] == [("ocr", "refused")]
+    assert queue.recent_errors(UID, acct=None, kinds=[]) == []
+    assert queue.recent_errors(OTHER, acct=None, kinds=["ocr"]) == []
+    done = queue.lease("w", kinds=["ocr_batch"])
+    assert done is not None
+    queue.complete(done.id, "w", {})
+    assert [j.dedupe_key for j in queue.active(UID, acct=None, kind="ocr_batch")] == ["ocr_batch:2"]

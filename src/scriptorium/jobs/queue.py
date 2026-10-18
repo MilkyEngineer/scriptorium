@@ -257,13 +257,21 @@ class JobQueue:
     # ---- worker side ----------------------------------------------------------------------
 
     def lease(
-        self, owner: str, *, kinds: Sequence[str] | None = None, ttl_s: int = 60
+        self,
+        owner: str,
+        *,
+        kinds: Sequence[str] | None = None,
+        ttl_s: int = 60,
+        per_uid: Mapping[str, int] | None = None,
     ) -> JobRow | None:
         """Claim the oldest runnable job (``queued``, or ``failed`` past its backoff).
 
         One ``BEGIN IMMEDIATE`` transaction around ``UPDATE … WHERE id = (SELECT … LIMIT 1)
         RETURNING *``: two workers can never claim the same job. Increments ``attempts``.
-        ``kinds`` restricts the claim to those kinds (``[]`` claims nothing).
+        ``kinds`` restricts the claim to those kinds (``[]`` claims nothing). ``per_uid``
+        maps a kind to the most jobs of that kind one user may hold leased at once
+        (``{"ocr": OCR_USER_CONCURRENCY}``, §6.2): a user at the cap is skipped, so the next
+        user's job is claimed instead and one backlog cannot starve the others.
         """
         if not owner:
             raise InvalidArgumentError("owner is required.")
@@ -271,18 +279,26 @@ class JobQueue:
             raise InvalidArgumentError("ttl_s must be positive.")
         if kinds is not None and not kinds:
             return None
+        if per_uid is not None and any(limit < 1 for limit in per_uid.values()):
+            raise InvalidArgumentError("per-user limits must be positive.")
         now = self._now()
-        kind_filter = ""
+        filters = ""
         stamp = to_db_time(now)
         params: list[Any] = [owner, to_db_time(now + timedelta(seconds=ttl_s)), stamp, stamp]
         if kinds is not None:
-            kind_filter = f" AND kind IN ({', '.join('?' * len(kinds))})"
+            filters += f" AND c.kind IN ({', '.join('?' * len(kinds))})"
             params.extend(kinds)
+        for kind, limit in sorted((per_uid or {}).items()):
+            filters += (
+                " AND NOT (c.kind = ? AND (SELECT count(*) FROM jobs AS l "
+                "WHERE l.uid = c.uid AND l.kind = ? AND l.state = 'leased') >= ?)"
+            )
+            params.extend((kind, kind, limit))
         sql = (
             "UPDATE jobs SET state = 'leased', lease_owner = ?, lease_expires_at = ?, "  # noqa: S608
             "attempts = attempts + 1, updated_at = ? "
-            "WHERE id = (SELECT id FROM jobs WHERE state IN ('queued', 'failed') "
-            f"AND next_run_at <= ?{kind_filter} ORDER BY created_at, id LIMIT 1) "
+            "WHERE id = (SELECT c.id FROM jobs AS c WHERE c.state IN ('queued', 'failed') "
+            f"AND c.next_run_at <= ?{filters} ORDER BY c.created_at, c.id LIMIT 1) "
             "RETURNING *"
         )
         with self._write() as conn:
@@ -316,12 +332,13 @@ class JobQueue:
             if cur.rowcount != 1:
                 raise LeaseLostError("The job lease is no longer held.")
 
-    def fail(self, job_id: int, owner: str, error: str) -> JobRow:
+    def fail(self, job_id: int, owner: str, error: str, *, final: bool = False) -> JobRow:
         """Record a failed attempt of ``owner``'s leased job.
 
-        With attempts left: ``failed``, runnable again after :func:`backoff_seconds`. Otherwise
-        ``dead``. ``error`` is a short machine-oriented reason (truncated to 1024 characters);
-        it must not carry note content or secrets.
+        With attempts left: ``failed``, runnable again after :func:`backoff_seconds`. Otherwise,
+        or when ``final`` (a verdict on the input that another attempt would repeat, such as
+        an image the OCR API refuses), ``dead``. ``error`` is a short machine-oriented reason
+        (truncated to 1024 characters); it must not carry note content or secrets.
         """
         now = self._now()
         with self._write() as conn:
@@ -333,7 +350,7 @@ class JobQueue:
             if row is None:
                 raise LeaseLostError("The job lease is no longer held.")
             attempts, max_attempts = int(row["attempts"]), int(row["max_attempts"])
-            if attempts >= max_attempts:
+            if final or attempts >= max_attempts:
                 state, next_run = "dead", now
             else:
                 state, next_run = "failed", now + timedelta(seconds=backoff_seconds(attempts))
@@ -365,16 +382,17 @@ class JobQueue:
             ).rowcount
         return dead + requeued
 
-    def rerun(self, job: JobRow) -> JobRow | None:
+    def rerun(self, job: JobRow, *, payload: Mapping[str, Any] | None = None) -> JobRow | None:
         """A fresh job re-running ``job`` under ``rerun_key``, or None when its family is capped.
 
-        The new job copies ``job``'s user, account, kind, payload and ``max_attempts``. If the
-        re-run already exists (another caller got there first) it is returned whatever its
-        state. Otherwise it is created only while the key's family has fewer than
+        The new job copies ``job``'s user, account, kind, payload (or takes ``payload``, e.g.
+        an ``ocr`` job re-run with ``force``) and ``max_attempts``. If the re-run already
+        exists (another caller got there first) it is returned whatever its state. Otherwise
+        it is created only while the key's family has fewer than
         :data:`~scriptorium.jobs.kinds.RERUN_CAP` ``:after:`` jobs, counted for all time.
         """
         key = rerun_key(job.dedupe_key, job.id)
-        body = _json(job.payload, MAX_PAYLOAD_BYTES, "payload")
+        body = _json(job.payload if payload is None else payload, MAX_PAYLOAD_BYTES, "payload")
         with self._write() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE dedupe_key = ?", (key,)).fetchone()
             if row is None:
@@ -461,6 +479,58 @@ class JobQueue:
                 continue
             out.append((row, _family_reruns(conn, rerun_family(row["dedupe_key"]))))
         return out
+
+    # ---- lookups ----------------------------------------------------------------------------
+
+    def family(self, uid: str, key: str) -> list[JobRow]:
+        """The jobs of ``uid`` in ``key``'s family (its base key and every ``:after:`` re-run),
+        oldest first; the last one is the current attempt at the work."""
+        base = rerun_family(key)
+        low = base + AFTER
+        high = low[:-1] + chr(ord(AFTER[-1]) + 1)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE uid = ? AND (dedupe_key = ? OR "
+                "(dedupe_key >= ? AND dedupe_key < ?)) ORDER BY id",
+                (uid, base, low, high),
+            ).fetchall()
+        return [_row(r) for r in rows]
+
+    def active(self, uid: str, *, acct: str | None, kind: str) -> list[JobRow]:
+        """``uid``'s jobs of ``kind`` that are not finished (queued, leased or failed)."""
+        sql = (
+            "SELECT * FROM jobs WHERE uid = ? AND kind = ? "
+            "AND state IN ('queued', 'leased', 'failed')"
+        )
+        params: list[Any] = [uid, kind]
+        if acct is not None:
+            sql += " AND acct = ?"
+            params.append(acct)
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY id", params).fetchall()
+        return [_row(r) for r in rows]
+
+    def recent_errors(
+        self, uid: str, *, acct: str | None, kinds: Sequence[str], limit: int = 10
+    ) -> list[tuple[str, str, datetime]]:
+        """``(kind, error, updated_at)`` of ``uid``'s latest ``failed`` and ``dead`` jobs of
+        ``kinds``, newest first. Errors are the reason codes the worker recorded."""
+        if not kinds or limit < 1:
+            return []
+        sql = (
+            "SELECT kind, error, updated_at FROM jobs WHERE uid = ? "  # noqa: S608
+            f"AND kind IN ({', '.join('?' * len(kinds))}) "
+            "AND state IN ('failed', 'dead') AND error IS NOT NULL"
+        )
+        params: list[Any] = [uid, *kinds]
+        if acct is not None:
+            sql += " AND acct = ?"
+            params.append(acct)
+        with self._lock:
+            rows = self._conn.execute(
+                sql + " ORDER BY updated_at DESC, id DESC LIMIT ?", (*params, limit)
+            ).fetchall()
+        return [(str(r["kind"]), str(r["error"]), from_db_time(r["updated_at"])) for r in rows]
 
     # ---- reporting --------------------------------------------------------------------------
 
