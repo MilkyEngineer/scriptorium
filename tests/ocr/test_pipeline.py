@@ -19,6 +19,7 @@ from scriptorium.ocr.ledger import Allowance, Degraded
 from scriptorium.ocr.modes import Resolution
 from scriptorium.ocr.pipeline import (
     AUTO_OCR_KEY,
+    AUTO_OCR_MAX_TAGS,
     KEY_REFUSED_HOLD,
     KEY_REFUSED_KEY,
     KEY_UNREADABLE,
@@ -90,6 +91,7 @@ def test_auto_ocr_round_trips_and_reads_garbage_as_disabled(index: Index) -> Non
     assert json.loads(index.get_setting(AUTO_OCR_KEY) or "") == {
         "enabled": True,
         "folders": [F1, F2],
+        "tags": [],
     }
     assert load_auto_ocr(index) == AutoOcr(True, (F1, F2))
     for raw in (
@@ -98,6 +100,7 @@ def test_auto_ocr_round_trips_and_reads_garbage_as_disabled(index: Index) -> Non
         '{"enabled": "yes", "folders": []}',
         '{"enabled": true, "folders": "x"}',
         '{"enabled": true}',
+        '{"enabled": true, "folders": [], "tags": "x"}',
     ):
         index.set_setting(AUTO_OCR_KEY, raw)
         assert load_auto_ocr(index) == AutoOcr(), raw
@@ -106,6 +109,32 @@ def test_auto_ocr_round_trips_and_reads_garbage_as_disabled(index: Index) -> Non
         AUTO_OCR_KEY, json.dumps({"enabled": True, "folders": [F2, "../etc", 7, F1, F2]})
     )
     assert load_auto_ocr(index) == AutoOcr(True, (F1, F2))
+
+
+def test_auto_ocr_tags_round_trip_and_old_values_load_without_them(index: Index) -> None:
+    setting = AutoOcr(True, (F1,), ("Meeting", "todo"))
+    index.set_setting(AUTO_OCR_KEY, dump_auto_ocr(setting))
+    assert json.loads(index.get_setting(AUTO_OCR_KEY) or "") == {
+        "enabled": True,
+        "folders": [F1],
+        "tags": ["Meeting", "todo"],
+    }
+    assert load_auto_ocr(index) == setting
+    assert setting.selects
+    # Tags alone select; nothing selected, or switched off, does not.
+    assert AutoOcr(True, (), ("todo",)).selects
+    assert not AutoOcr(True).selects and not AutoOcr(False, (F1,), ("todo",)).selects
+    # A value stored before tags existed reads as tags: [] (no migration).
+    index.set_setting(AUTO_OCR_KEY, json.dumps({"enabled": True, "folders": [F1]}))
+    assert load_auto_ocr(index) == AutoOcr(True, (F1,), ())
+    # A name that is not stored-normalised, or not a string, is dropped; the rest are
+    # deduplicated, sorted and bounded.
+    many = [f"t{n:03}" for n in range(AUTO_OCR_MAX_TAGS + 5)]
+    raw = {"enabled": True, "folders": [], "tags": ["b", " b", "", "a\x00", 7, "b", *many, "a"]}
+    index.set_setting(AUTO_OCR_KEY, json.dumps(raw))
+    loaded = load_auto_ocr(index)
+    assert loaded.tags == tuple(sorted(["a", "b", *many]))[:AUTO_OCR_MAX_TAGS]
+    assert len(loaded.tags) == AUTO_OCR_MAX_TAGS
 
 
 # ---- caps --------------------------------------------------------------------------------------

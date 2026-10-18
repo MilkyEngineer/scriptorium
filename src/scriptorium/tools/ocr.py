@@ -442,7 +442,7 @@ def _key_note(refusal: KeyRefusal) -> str:
 
 def _ocr_status(svc: Services, account: Account) -> dict[str, Any]:
     """F's ``ocr_summary`` (the same spend and cap numbers as ``account_status.ocr``) plus the
-    account's queue, auto-OCR folders, latest failure reasons and refused-key note."""
+    account's queue, auto-OCR folders and tags, latest failure reasons and refused-key note."""
     queue = ocr_queue(svc, account)
     errors = [
         {"kind": kind, "reason": _reason(error), "at": iso_utc(at)}
@@ -470,7 +470,11 @@ def _ocr_status(svc: Services, account: Account) -> dict[str, Any]:
     return {
         "account": account.acct,
         **summary,
-        "auto_ocr": {"enabled": auto.enabled, "folders": list(auto.folders)},
+        "auto_ocr": {
+            "enabled": auto.enabled,
+            "folders": list(auto.folders),
+            "tags": list(auto.tags),
+        },
         "queue": queue,
         "deferred_reasons": ocr_deferred_reasons(svc, account),
         "dead": sum(q["dead"] for q in queue.values()),
@@ -483,9 +487,9 @@ async def ocr_status(ctx: ToolContext, args: OcrStatusArgs) -> CallToolResult:
     """Show background transcription for your account: the OCR mode and why (your own API
     key, the server key, or lazy mode), this month's spend and what remains under each cap
     that applies (the same numbers as account_status), whether auto-OCR is on and for which
-    folders, the queue of transcription jobs by state (deferred jobs wait for a key, a cap's
-    monthly reset or a refused key's pause, with the reasons counted), the reasons of the
-    latest failures, and whether the Claude API refused the key in use."""
+    folders and tags, the queue of transcription jobs by state (deferred jobs wait for a key,
+    a cap's monthly reset or a refused key's pause, with the reasons counted), the reasons of
+    the latest failures, and whether the Claude API refused the key in use."""
     account = await use_account(ctx, args.account)
     payload = await asyncio.to_thread(_ocr_status, services(ctx), account)
     return json_result(payload, cap=RESULT_CAP_BYTES)

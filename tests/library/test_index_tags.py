@@ -657,3 +657,108 @@ def test_the_fake_index_agrees_on_tags(index: Index) -> None:
         assert fake.documents_tagged(names) == index.documents_tagged(names)
     with pytest.raises(InvalidArgumentError):
         fake.replace_tags(uid(1), tagset({" padded "}))
+
+
+# ---- the auto-OCR selection -----------------------------------------------------------------
+
+
+@pytest.fixture
+def shelves(index: Index) -> Index:
+    """Synthetic library for ``pages_without_transcript(tags=)``:
+
+    - Outer (folder, tagged "shelf") > Inner (folder) > Deep (2 pages): a folder tag two
+      levels up;
+    - Doc (2 pages, tagged "doc"), Paged (3 pages, page 1 tagged "page"), Plain (1 page) at
+      the root;
+    - tagged "doc" but not live: Trashed (in the trash), InBin (in a trashed folder), Gone
+      (tombstoned), Under (in a tombstoned folder), Out (excluded from the sync scope).
+    """
+    index.upsert_document(folder(1, "Outer"))
+    index.upsert_document(folder(2, "Inner", parent=uid(1)))
+    index.upsert_document(doc(3, "Deep", parent=uid(2)))
+    index.upsert_document(doc(4, "Doc"))
+    index.upsert_document(doc(5, "Paged"))
+    index.upsert_document(doc(6, "Plain"))
+    index.upsert_document(doc(7, "Trashed", parent="trash"))
+    index.upsert_document(folder(8, "Bin", parent="trash"))
+    index.upsert_document(doc(9, "InBin", parent=uid(8)))
+    index.upsert_document(doc(10, "Gone"))
+    index.upsert_document(folder(11, "Dead"))
+    index.upsert_document(doc(12, "Under", parent=uid(11)))
+    index.upsert_document(doc(13, "Out"))
+    for n, count in ((3, 2), (4, 2), (5, 3), (6, 1), (7, 1), (9, 1), (10, 1), (12, 1), (13, 1)):
+        pages_of(index, n, count)
+    index.replace_tags(uid(1), tagset({"shelf"}))
+    index.replace_tags(uid(4), tagset({"doc"}))
+    index.replace_tags(uid(5), tagset(pages={uid(501): {"page"}}))
+    for n in (7, 9, 10, 12, 13):
+        index.replace_tags(uid(n), tagset({"doc"}))
+    index.mark_deleted(uid(10), "user", T0)
+    index.mark_deleted(uid(11), "user", T0)
+    with index.transaction():
+        index._conn.execute("UPDATE documents SET excluded_at = ? WHERE uuid = ?", ("x", uid(13)))
+    return index
+
+
+def selected(ix: Index, folders: list[str], tags: list[str], limit: int = 50) -> list[str]:
+    return [r.page_id for r in ix.pages_without_transcript(folders=folders, tags=tags, limit=limit)]
+
+
+def test_auto_ocr_selects_by_document_folder_and_page_tags(shelves: Index) -> None:
+    # A document's tag selects all its pages; documents carrying it that are not live do not.
+    assert selected(shelves, [], ["doc"]) == [uid(400), uid(401)]
+    # A folder tag two levels up selects everything below it.
+    assert selected(shelves, [], ["shelf"]) == [uid(300), uid(301)]
+    # A page tag selects that page only.
+    assert selected(shelves, [], ["page"]) == [uid(501)]
+    # Any of the names, sorted by document and page index; nothing else (Plain).
+    everything = [uid(300), uid(301), uid(400), uid(401), uid(501)]
+    assert selected(shelves, [], ["page", "shelf", "doc"]) == everything
+    assert selected(shelves, [], ["nothing"]) == []
+    # Names are matched as stored: padding is trimmed, case is not folded.
+    assert selected(shelves, [], [" doc "]) == [uid(400), uid(401)]
+    assert selected(shelves, [], ["DOC"]) == []
+    with pytest.raises(InvalidArgumentError):
+        selected(shelves, [], ["bad\x00"])
+
+
+def test_auto_ocr_folders_and_tags_combine_without_repeats(shelves: Index) -> None:
+    # Deep is under the selected folder and under the tagged one: listed once.
+    assert selected(shelves, [uid(2)], ["shelf"]) == [uid(300), uid(301)]
+    everything = [uid(300), uid(301), uid(400), uid(401), uid(501)]
+    assert selected(shelves, [uid(1)], ["doc", "page"]) == everything
+    # The bound applies to the union, in the same order.
+    assert selected(shelves, [uid(1)], ["doc", "page"], limit=3) == everything[:3]
+    # A transcribed page drops out, as under a folder.
+    shelves.put_transcript(uid(4), uid(400), "h4-0", "t", "m", "server")
+    assert selected(shelves, [], ["doc"]) == [uid(401)]
+
+
+def test_auto_ocr_tags_survive_a_parent_cycle_and_stop_at_the_depth_limit(index: Index) -> None:
+    index.upsert_document(folder(1, "A", parent=uid(2)))
+    index.upsert_document(folder(2, "B", parent=uid(1)))
+    index.upsert_document(doc(3, "C", parent=uid(2)))
+    pages_of(index, 3, 1)
+    index.replace_tags(uid(1), tagset({"loop"}))
+    assert selected(index, [], ["loop"]) == [uid(300)]
+    # top (tagged) > f11 > … > f138, MAX_ANCESTOR_DEPTH folders: a document in f137 is
+    # MAX_ANCESTOR_DEPTH levels below the tag and inherits it; one in f138 does not, as in
+    # the list and search filters.
+    index.upsert_document(folder(10, "top"))
+    index.replace_tags(uid(10), tagset({"deep"}))
+    with index.transaction():
+        for n in range(11, 11 + MAX_ANCESTOR_DEPTH):
+            index.upsert_document(folder(n, f"f{n}", parent=uid(n - 1)))
+    index.upsert_document(doc(1000, "near", parent=uid(9 + MAX_ANCESTOR_DEPTH)))
+    index.upsert_document(doc(1001, "far", parent=uid(10 + MAX_ANCESTOR_DEPTH)))
+    pages_of(index, 1000, 1)
+    pages_of(index, 1001, 1)
+    assert selected(index, [], ["deep"]) == [uid(100000)]
+    names = listed(index, None, ["deep"], limit=1000)
+    assert "near" in names and "far" not in names
+
+
+def test_tags_in_use_counts_documents_folders_and_pages(shelves: Index) -> None:
+    names = ["doc", "shelf", "page", "nothing", " doc ", "bad\x00"]
+    assert shelves.tags_in_use(names) == {"doc", "shelf", "page"}
+    assert shelves.tags_in_use([]) == frozenset()

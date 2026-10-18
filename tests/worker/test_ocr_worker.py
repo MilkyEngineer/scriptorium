@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from scriptorium.cloud.scope import SETTING_SYNC_SCOPE, SyncScope, dump_scope
 from scriptorium.jobs.kinds import (
     KEY_ERROR_PREFIX,
     OCR_KINDS,
@@ -122,8 +123,9 @@ class Harness:
         self.resolver = resolver
         self.loop: AccountLoop | None = None
 
-    def enable(self, *folders: str) -> None:
-        self.linked.index().set_setting(AUTO_OCR_KEY, dump_auto_ocr(AutoOcr(True, folders)))
+    def enable(self, *folders: str, tags: tuple[str, ...] = ()) -> None:
+        setting = AutoOcr(True, folders, tags)
+        self.linked.index().set_setting(AUTO_OCR_KEY, dump_auto_ocr(setting))
 
     async def poll(self, times: int = 1) -> None:
         """Poll, then run every render job and every leasable OCR job."""
@@ -277,6 +279,132 @@ async def test_thirty_minutes_unchanged_is_stable_without_a_complete_poll(
     harness.linked.clock.now += timedelta(minutes=31)
     await harness.linked.worker.ocr_runner.scan(harness.linked.context(), complete=False)
     assert len(harness.jobs()) == len(PAGES)
+
+
+# ---- selection by tag -------------------------------------------------------------------------
+
+OCR_TAG = "Synthetic Transcribe"
+"""Tags the tests put on the fixture notebook and folders (no real tag names)."""
+PAGE_TAG = "Synthetic Page"
+SHELF_TAG = "Synthetic Shelf"
+PRIVATE_TAG = "Synthetic Private"
+OUTER = "00000000-0000-4000-8000-0000000000f9"
+
+
+def _tag_notebook(
+    linked: Linked, tags: tuple[str, ...] = (), pages: dict[str, str] | None = None
+) -> None:
+    files = linked.cloud.docs[NOTEBOOK]
+    content = json.loads(files[f"{NOTEBOOK}.content"])
+    content["tags"] = [{"name": t, "timestamp": 1} for t in tags]
+    content["pageTags"] = [
+        {"name": name, "pageId": page, "timestamp": 1} for page, name in (pages or {}).items()
+    ]
+    linked.cloud.set_file(NOTEBOOK, f"{NOTEBOOK}.content", json.dumps(content).encode())
+
+
+def _transcribed_pages(harness: Harness) -> set[str]:
+    return {str(j.payload["page"]) for j in harness.jobs()}
+
+
+async def test_a_document_tag_selects_its_stable_pages(harness: Harness) -> None:
+    _tag_notebook(harness.linked, (OCR_TAG,))
+    harness.enable(tags=(OCR_TAG,))  # no folders
+    await harness.poll()
+    assert harness.jobs() == []  # first sight: nothing is stable yet
+    await harness.poll()
+    assert set(harness.transcribed()) == set(PAGES)
+    assert harness.client.pages_sent() == len(PAGES)
+    index = harness.linked.index()
+    (pdf_page,) = index.pages(PDF)
+    assert index.transcript(PDF, pdf_page.page_id, pdf_page.content_hash) is None
+
+
+async def test_a_folder_tag_two_levels_up_selects_the_pages_below(harness: Harness) -> None:
+    # Outer (tagged) > Inbox (FOLDER) > the notebook.
+    harness.linked.cloud.put_documents(
+        {
+            OUTER: {
+                f"{OUTER}.metadata": _metadata("Outer", kind="CollectionType"),
+                f"{OUTER}.content": json.dumps({"tags": [{"name": SHELF_TAG}]}).encode(),
+            },
+            FOLDER: {
+                f"{FOLDER}.metadata": _metadata("Inbox", parent=OUTER, kind="CollectionType"),
+                f"{FOLDER}.content": b"{}",
+            },
+        }
+    )
+    harness.enable(tags=(SHELF_TAG,))
+    await harness.poll(2)
+    assert set(harness.transcribed()) == set(PAGES)
+    assert harness.client.pages_sent() == len(PAGES)
+
+
+async def test_a_page_tag_selects_only_that_page(harness: Harness) -> None:
+    _tag_notebook(harness.linked, pages={PAGES[2]: PAGE_TAG})
+    harness.enable(tags=(PAGE_TAG,))
+    await harness.poll(3)
+    assert set(harness.transcribed()) == {PAGES[2]}
+    assert _transcribed_pages(harness) == {PAGES[2]}
+    assert harness.client.pages_sent() == 1
+
+
+async def test_tag_selection_skips_an_excluded_document(harness: Harness) -> None:
+    _tag_notebook(harness.linked, (OCR_TAG, PRIVATE_TAG))
+    harness.enable(tags=(OCR_TAG,))
+    harness.resolver.mode = "lazy"  # index the pages first, without transcribing them
+    await harness.poll()
+    harness.resolver.mode = "server"
+    index = harness.linked.index()
+    deny = SyncScope("deny", frozenset({PRIVATE_TAG}))
+    index.set_setting(SETTING_SYNC_SCOPE, dump_scope(deny))
+    await harness.poll(3)
+    row = index.document(NOTEBOOK)
+    assert row is not None and row.excluded_at is not None
+    assert len(index.pages(NOTEBOOK)) == len(PAGES)  # still archived, still tagged
+    assert NOTEBOOK in index.documents_tagged([OCR_TAG])
+    assert harness.jobs() == [] and harness.client.pages_sent() == 0
+
+
+async def test_tag_selection_waits_for_a_page_that_keeps_changing(harness: Harness) -> None:
+    _tag_notebook(harness.linked, (OCR_TAG,))
+    harness.enable(tags=(OCR_TAG,))
+    docs = fixture_documents()[NOTEBOOK]
+    variants = [docs[f"{NOTEBOOK}/{PAGES[1]}.rm"], docs[f"{NOTEBOOK}/{PAGES[2]}.rm"]]
+    for i in range(4):
+        harness.linked.cloud.set_file(NOTEBOOK, PAGE_101, variants[i % 2])
+        await harness.poll()
+    assert set(harness.transcribed()) == set(PAGES[1:])
+    assert PAGES[0] not in _transcribed_pages(harness)
+
+
+async def test_a_page_selected_by_folder_and_by_tag_is_sent_once(harness: Harness) -> None:
+    _tag_notebook(harness.linked, (OCR_TAG,), {PAGES[0]: PAGE_TAG})
+    harness.enable(FOLDER, tags=(OCR_TAG, PAGE_TAG))
+    await harness.poll(4)
+    assert set(harness.transcribed()) == set(PAGES)
+    assert harness.client.pages_sent() == len(PAGES)
+    assert len(harness.jobs()) == len(PAGES)
+
+
+async def test_tag_selection_is_bounded_per_scan(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner_mod, "SCAN_LIMIT", 3)
+    _tag_notebook(harness.linked, (OCR_TAG,))
+    harness.enable(tags=(OCR_TAG,))
+    await harness.poll(2)
+    assert len(harness.jobs()) == 3  # one scan looks at SCAN_LIMIT pages, however many match
+    await harness.poll(3)
+    assert len(harness.jobs()) == len(PAGES)
+
+
+async def test_a_setting_stored_before_tags_still_selects_its_folders(harness: Harness) -> None:
+    harness.linked.index().set_setting(
+        AUTO_OCR_KEY, json.dumps({"enabled": True, "folders": [FOLDER]})
+    )
+    await harness.poll(2)
+    assert set(harness.transcribed()) == set(PAGES)
 
 
 # ---- the mode and the caps --------------------------------------------------------------------

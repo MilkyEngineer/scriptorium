@@ -7,8 +7,10 @@
   created is dropped after :data:`SUBMISSION_GRACE`, one that cannot be settled after
   :data:`SUBMISSION_GIVE_UP` (``ocr_batch_lost``). It then adopts any batch the API accepted
   whose ``ocr_batch`` job was never queued (``ocr_pending_batches``). With auto-OCR enabled
-  for some folders and a user or server key available (``resolve``), it lists the pages
-  under those folders that have no transcript of their current version, keeps those that
+  for some folders or tags and a user or server key available (``resolve``), it lists, in
+  one query of at most :data:`SCAN_LIMIT` rows, the pages under those folders or selected by
+  those tags (on the page, its document or a folder above it) that have no transcript of
+  their current version, keeps those that
   :func:`~scriptorium.ocr.debounce.is_stable`, drops pages already in a running, pending or
   unsettled batch or with an ``ocr`` job (a page version is queued once, ever,
   unless its last job died of a refused key), and bounds what is left by the cap's remaining
@@ -644,7 +646,7 @@ class OcrRunner:
     # ---- the scan --------------------------------------------------------------------------
 
     async def scan(self, ctx: AccountContext, *, complete: bool) -> int:
-        """Queue OCR for the stable, untranscribed pages under the auto-OCR folders.
+        """Queue OCR for the stable, untranscribed pages the auto-OCR folders and tags select.
 
         Returns the pages queued or submitted. ``complete`` (an ``ok`` poll) records this
         poll's time for the next scan's stability check, whatever happens here. An account
@@ -678,7 +680,7 @@ class OcrRunner:
         if adopted:
             log_event(logger, "ocr_batch_adopted", acct=ctx.acct, count=adopted)
         auto = await asyncio.to_thread(load_auto_ocr, index)
-        scanning = auto.enabled and bool(auto.folders)
+        scanning = auto.selects
         if not scanning and not await asyncio.to_thread(
             worker.queue.deferred_counts, ctx.uid, acct=ctx.acct, kinds=(OCR,)
         ):
@@ -884,7 +886,10 @@ class OcrRunner:
                 previous = from_db_time(raw)
             except ValueError:
                 previous = None
-        rows = index.pages_without_transcript(folders=auto.folders, limit=SCAN_LIMIT)
+        # One query bounded by SCAN_LIMIT, however many pages the folders and tags select.
+        rows = index.pages_without_transcript(
+            folders=auto.folders, tags=auto.tags, limit=SCAN_LIMIT
+        )
         stable = [r for r in rows if is_stable(r, now=now, previous_poll_at=previous)]
         running = queue.active(ctx.uid, acct=ctx.acct, kind=OCR_BATCH)
         in_batch: set[tuple[str, str, str]] = set()

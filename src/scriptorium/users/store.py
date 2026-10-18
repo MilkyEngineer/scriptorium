@@ -269,6 +269,8 @@ AUDIT_IDENTIFIER_KEYS: Final[Mapping[str, Callable[[object], bool]]] = {
     "job": _is_int,
     "bytes": _is_int,
     "count": _is_int,
+    # How many tag names a call set (set_auto_ocr); never the names, which are display data.
+    "tag_count": _is_int,
     "generation": _is_int,
     "host": _matches(_HOST_RE),
     "snapshot": _matches(_SNAPSHOT_RE),

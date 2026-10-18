@@ -304,6 +304,16 @@ def _tagged(document: str, page: str | None, count: int) -> str:
     return f"({clause} OR {document} IN (SELECT uuid FROM inherit))"  # noqa: S608 - fixed
 
 
+_DEAD_CTE: Final = (
+    "dead(uuid) AS (SELECT uuid FROM documents WHERE parent = 'trash' "
+    "OR (type = 'CollectionType' AND deleted_at IS NOT NULL) "
+    "UNION SELECT d.uuid FROM documents d JOIN dead ON d.parent = dead.uuid)"
+)
+"""``dead(uuid)``: every row in the trash or below a tombstoned folder, at any depth; what a
+walk down from a live folder never reaches. ``UNION`` visits a row once, so a parent cycle in
+cloud metadata ends the walk."""
+
+
 def _with(ctes: Sequence[str]) -> str:
     """``WITH RECURSIVE`` over the fixed table expressions ``ctes``; ``""`` for none."""
     return f"WITH RECURSIVE {', '.join(ctes)} " if ctes else ""
@@ -1136,47 +1146,91 @@ class Index:
         )
 
     def pages_without_transcript(
-        self, *, folders: Sequence[str], recursive: bool = True, limit: int
+        self,
+        *,
+        folders: Sequence[str],
+        tags: Sequence[str] = (),
+        recursive: bool = True,
+        limit: int,
     ) -> list[PageRow]:
-        """Current pages under ``folders`` with no transcript of their current version.
+        """Current pages under ``folders`` or selected by ``tags``, with no transcript of
+        their current version (the auto-OCR scan, §7 step 6).
 
         ``folders`` are folder (``CollectionType``) UUIDs; with ``recursive`` every document
-        below them counts, otherwise only their direct children. Only live documents: not
-        tombstoned, not in the trash, not excluded from the sync scope. A page copied into
+        below them counts, otherwise only their direct children. ``tags`` (exact names,
+        normalised as stored) select a page carrying one of them, every page of a document
+        carrying one, and every page below a folder carrying one, by the inheritance of the
+        ``list``/``search`` filters (:func:`_inherit_cte`, :data:`MAX_ANCESTOR_DEPTH` levels);
+        a page selected both ways is listed once. Only live documents: not tombstoned, not in
+        the trash, not excluded from the sync scope; for a tag, not below a trashed or
+        tombstoned folder either (which the folder walk never enters). A page copied into
         another document is listed under each document (transcripts are per document).
-        Sorted by document UUID and page index; at most ``limit`` rows. Parent links come
-        from cloud metadata, so the walk tolerates cycles (``UNION`` visits a folder once).
+        Sorted by document UUID and page index; at most ``limit`` rows, from one query.
+        Parent links come from cloud metadata, so the walks tolerate cycles.
         """
         _check_limit(limit)
         roots = sorted(set(folders))
-        if not roots:
+        names = _tag_filter(tags)
+        if not roots and names is None:
             return []
-        marks = ", ".join("?" * len(roots))
-        # A folder that is itself in the trash is not live; nor is anything below it.
-        start = (
-            f"SELECT uuid FROM documents WHERE uuid IN ({marks}) "  # noqa: S608 - placeholders
-            "AND type = 'CollectionType' AND deleted_at IS NULL AND parent IS NOT 'trash'"
-        )
-        if recursive:
-            tree = (
-                f"WITH RECURSIVE tree(uuid) AS ({start} "  # noqa: S608 - fixed clauses
-                "UNION SELECT d.uuid FROM documents d JOIN tree ON d.parent = tree.uuid "
-                "WHERE d.type = 'CollectionType' AND d.deleted_at IS NULL) "
+        ctes: list[str] = []
+        params: list[Any] = []
+        selected: list[str] = []
+        where_params: list[Any] = []
+        if roots:
+            # A folder that is itself in the trash is not live; nor is anything below it.
+            start = (
+                "SELECT uuid FROM documents WHERE "  # noqa: S608 - placeholders
+                f"uuid IN ({_marks(len(roots))}) "
+                "AND type = 'CollectionType' AND deleted_at IS NULL AND parent IS NOT 'trash'"
             )
-        else:
-            tree = f"WITH tree(uuid) AS ({start}) "
+            if recursive:
+                ctes.append(
+                    f"tree(uuid) AS ({start} "  # noqa: S608 - fixed clauses
+                    "UNION SELECT d.uuid FROM documents d JOIN tree ON d.parent = tree.uuid "
+                    "WHERE d.type = 'CollectionType' AND d.deleted_at IS NULL)"
+                )
+            else:
+                ctes.append(f"tree(uuid) AS ({start})")
+            params.extend(roots)
+            selected.append("d.parent IN (SELECT uuid FROM tree)")
+        if names is not None:
+            ctes.extend((_inherit_cte(len(names)), _DEAD_CTE))
+            params.extend(names)
+            tagged = _tagged("d.uuid", "g.page IN ('', p.uuid)", len(names))
+            selected.append(f"({tagged} AND d.uuid NOT IN (SELECT uuid FROM dead))")  # noqa: S608
+            where_params.extend(names)
+        prefix = _with(ctes)
         sql = (
-            tree  # noqa: S608 - fixed clauses, values bound
-            + "SELECT p.* FROM pages p JOIN documents d ON d.uuid = p.document "
-            "WHERE d.parent IN (SELECT uuid FROM tree) AND d.type = 'DocumentType' "
+            f"{prefix}SELECT p.* FROM pages p JOIN documents d ON d.uuid = p.document "  # noqa: S608
+            f"WHERE ({' OR '.join(selected)}) AND d.type = 'DocumentType' "  # fixed clauses
             "AND d.deleted_at IS NULL AND d.excluded_at IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.document = p.document "
             "AND t.page = p.uuid AND t.content_hash = p.content_hash) "
             "ORDER BY p.document, p.idx LIMIT ?"
         )
         with self._lock:
-            rows = self._conn.execute(sql, (*roots, limit)).fetchall()
+            rows = self._conn.execute(sql, (*params, *where_params, limit)).fetchall()
         return [_page(r) for r in rows]
+
+    def tags_in_use(self, names: Sequence[str]) -> frozenset[str]:
+        """Which of ``names`` some row of the index carries, on a document, a folder or a page
+        (any state). Names are normalised as stored and matched exactly; a name that could
+        never be stored matches nothing. For ``set_auto_ocr``'s ``unmatched_tags``."""
+        wanted = sorted({n for n in map(normalise_tag, names) if n is not None})
+        found: set[str] = set()
+        with self._lock:
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start : start + 500]
+                found.update(
+                    r["name"]
+                    for r in self._conn.execute(
+                        "SELECT DISTINCT name FROM tags "  # noqa: S608 - placeholders only
+                        f"WHERE name IN ({_marks(len(chunk))})",
+                        chunk,
+                    )
+                )
+        return frozenset(found)
 
     def search(
         self,

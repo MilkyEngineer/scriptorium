@@ -1,8 +1,10 @@
 """Steps shared by the OCR worker and the OCR tools (Architecture §8, Plan 05 §3.2).
 
 - **The auto-OCR setting** (``settings`` key ``auto_ocr``): ``{"enabled": bool, "folders":
-  [uuid, ...]}``, written by ``set_auto_ocr`` and read by the worker's scan. It is read
-  defensively: anything malformed reads as disabled.
+  [uuid, ...], "tags": [name, ...]}``, written by ``set_auto_ocr`` and read by the worker's
+  scan. A value stored before tags existed has no ``tags`` and reads as ``tags: []``. It is
+  read defensively: anything malformed reads as disabled; an entry that is not a UUID (a
+  folder) or a normalised tag name is dropped.
 - **The mode** a user's OCR runs in comes from F's ``resolve`` (§8.1), with a stored key that
   cannot be decrypted read as ``lazy`` / ``key_unreadable`` (never the server key); the
   allowance is asked for the mode that applies (``own`` for a user's key, ``global`` and
@@ -67,6 +69,7 @@ from scriptorium.jobs.kinds import (
 from scriptorium.jobs.queue import JobQueue, JobRow, is_deferred
 from scriptorium.library.index import Index
 from scriptorium.library.layout import is_uuid
+from scriptorium.library.tags import MAX_TAGS_PER_DOCUMENT, normalise_tag
 from scriptorium.ocr._ports import OcrPorts
 from scriptorium.ocr.errors import KEY_REASONS
 from scriptorium.ocr.ledger import Allowance
@@ -78,6 +81,7 @@ __all__ = [
     "ACTIVE_STATES",
     "AUTO_OCR_KEY",
     "AUTO_OCR_MAX_FOLDERS",
+    "AUTO_OCR_MAX_TAGS",
     "KEY_ERROR_PREFIX",
     "KEY_REFUSED_HOLD",
     "KEY_REFUSED_KEY",
@@ -118,6 +122,8 @@ __all__ = [
 
 AUTO_OCR_KEY: Final = "auto_ocr"
 AUTO_OCR_MAX_FOLDERS: Final = 100
+AUTO_OCR_MAX_TAGS: Final = MAX_TAGS_PER_DOCUMENT
+"""Tags auto-OCR selects by: as many as the index's ``tags`` filter takes."""
 TRANSCRIPT_MAX_BYTES: Final = 30 * 1024
 """Largest transcript stored: ``read_page`` must return it whole within the 32 KB result cap."""
 OCR_IMAGE_SIDE: Final = 2576
@@ -144,8 +150,18 @@ _MODEL_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,99}")
 
 @dataclass(frozen=True, slots=True)
 class AutoOcr:
+    """What the scan transcribes: pages of documents below ``folders`` (UUIDs) and pages
+    selected by ``tags`` (normalised names, on the page, its document or a folder above
+    it). Both sorted and deduplicated."""
+
     enabled: bool = False
     folders: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
+
+    @property
+    def selects(self) -> bool:
+        """Whether the scan has anything to look for."""
+        return self.enabled and bool(self.folders or self.tags)
 
 
 def load_auto_ocr(index: Index) -> AutoOcr:
@@ -161,15 +177,18 @@ def load_auto_ocr(index: Index) -> AutoOcr:
         return AutoOcr()
     enabled = value.get("enabled")
     folders = value.get("folders")
-    if type(enabled) is not bool or not isinstance(folders, list):
+    tags = value.get("tags", [])  # absent from a value stored before tags existed
+    if type(enabled) is not bool or not isinstance(folders, list) or not isinstance(tags, list):
         return AutoOcr()
     clean = sorted({f for f in folders if isinstance(f, str) and is_uuid(f)})
-    return AutoOcr(enabled, tuple(clean[:AUTO_OCR_MAX_FOLDERS]))
+    names = sorted({t for t in tags if isinstance(t, str) and normalise_tag(t) == t})
+    return AutoOcr(enabled, tuple(clean[:AUTO_OCR_MAX_FOLDERS]), tuple(names[:AUTO_OCR_MAX_TAGS]))
 
 
 def dump_auto_ocr(setting: AutoOcr) -> str:
     return json.dumps(
-        {"enabled": setting.enabled, "folders": list(setting.folders)}, separators=(",", ":")
+        {"enabled": setting.enabled, "folders": list(setting.folders), "tags": list(setting.tags)},
+        separators=(",", ":"),
     )
 
 

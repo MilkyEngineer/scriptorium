@@ -24,6 +24,7 @@ import logging
 import os
 import stat
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -56,6 +57,7 @@ from scriptorium.cloud.scope import (
     dump_scope,
     load_scope,
     make_scope,
+    normalise_tag,
     scope_fingerprint,
 )
 from scriptorium.cloud.sync import (
@@ -76,6 +78,7 @@ from scriptorium.ocr.modes import USER_KEY_SECRET
 from scriptorium.ocr.pipeline import (
     AUTO_OCR_KEY,
     AUTO_OCR_MAX_FOLDERS,
+    AUTO_OCR_MAX_TAGS,
     SERVER_MODES,
     AutoOcr,
     dump_auto_ocr,
@@ -949,13 +952,37 @@ class AutoOcrArgs(ToolArgs):
         max_length=AUTO_OCR_MAX_FOLDERS,
         description="Folder UUIDs or paths of names; their sub-folders are included.",
     )
-    enabled: bool = Field(description="true to transcribe new pages in these folders.")
+    tags: list[Annotated[str, Field(min_length=1, max_length=4 * MAX_TAG_LEN)]] = Field(
+        default_factory=list,
+        max_length=AUTO_OCR_MAX_TAGS,
+        description="reMarkable tag names, matched exactly after trimming: a tag on a folder "
+        "selects everything below it, on a document all its pages, on a page that page.",
+    )
+    enabled: bool = Field(
+        description="true to transcribe new pages in these folders or with these tags."
+    )
     account: str | None = Field(
         default=None, pattern=ACCT_PATTERN, description="Account id; the linked one by default."
     )
 
 
-def _set_auto_ocr(svc: Services, account: Account, args: AutoOcrArgs) -> dict[str, object]:
+def _auto_ocr_tags(tags: Sequence[str]) -> tuple[str, ...]:
+    """The tag arguments normalised as stored, deduplicated and sorted, as the scope's are."""
+    names: set[str] = set()
+    for tag in tags:
+        name = normalise_tag(tag)
+        if name is None:
+            raise invalid_argument(
+                "Those tags cannot be used: a tag is empty or has control characters.",
+                f"Pass 0 to {AUTO_OCR_MAX_TAGS} reMarkable tag names without control characters.",
+            )
+        names.add(name)
+    return tuple(sorted(names))
+
+
+def _set_auto_ocr(
+    svc: Services, account: Account, args: AutoOcrArgs, tags: tuple[str, ...]
+) -> dict[str, object]:
     index = account.index
     found: dict[str, str] = {}
     for ident in args.folders:
@@ -967,27 +994,40 @@ def _set_auto_ocr(svc: Services, account: Account, args: AutoOcrArgs) -> dict[st
                 "Pick a folder from list.",
             )
         found[folder.uuid] = display_name(folder.name)
-    if args.enabled and not found:
+    if args.enabled and not found and not tags:
         raise invalid_argument(
-            "Name at least one folder to turn auto-OCR on.",
-            'Pass folder UUIDs or paths from list, e.g. folders=["Notes"].',
+            "Name at least one folder or tag to turn auto-OCR on.",
+            'Pass folder UUIDs or paths from list, e.g. folders=["Notes"], or reMarkable tag '
+            'names, e.g. tags=["transcribe"].',
         )
-    setting = AutoOcr(args.enabled, tuple(sorted(found)))
+    setting = AutoOcr(args.enabled, tuple(sorted(found)), tags)
     index.set_setting(AUTO_OCR_KEY, dump_auto_ocr(setting))
+    in_use = index.tags_in_use(setting.tags)
+    unmatched = [tag for tag in setting.tags if tag not in in_use]
     mode, reason = ocr_mode(svc, account.uid)
     if not args.enabled:
         note = "Auto-OCR is off; transcribe and read_page still transcribe on request."
     elif mode in SERVER_MODES:
-        note = "New and changed pages in these folders are transcribed after each sync."
+        note = (
+            "New and changed pages in these folders or with these tags are transcribed after "
+            "each sync."
+        )
     else:
         note = (
             "Saved, but no API key is available for your pages, so nothing is transcribed "
             "in the background until one is (set_claude_api_key, or ask the operator)."
         )
+    if unmatched:
+        note += (
+            " Some of these tags are on no document, page or folder archived here (check the "
+            "spelling); they still apply to pages that carry them later."
+        )
     return {
         "account": account.acct,
         "enabled": setting.enabled,
         "folders": [{"uuid": u, "name": found[u]} for u in setting.folders],
+        "tags": list(setting.tags),
+        "unmatched_tags": unmatched,
         "mode": mode,
         "reason": reason,
         "note": note,
@@ -995,17 +1035,22 @@ def _set_auto_ocr(svc: Services, account: Account, args: AutoOcrArgs) -> dict[st
 
 
 async def set_auto_ocr(ctx: ToolContext, args: AutoOcrArgs) -> CallToolResult:
-    """Turn automatic transcription on or off for folders of your reMarkable library. When
-    on, the worker transcribes new and changed pages in the given folders and their
-    sub-folders after each sync, once a page has stopped changing, using your own Claude API
-    key or the server's within its monthly caps; ocr_status shows progress and spend. The
-    call replaces the previous folder list; enabled=false turns auto-OCR off."""
+    """Turn automatic transcription on or off for folders or reMarkable tags of your library.
+    When on, the worker transcribes new and changed pages in the given folders and their
+    sub-folders, and pages selected by the given tags, after each sync, once a page has
+    stopped changing, using your own Claude API key or the server's within its monthly caps;
+    ocr_status shows progress and spend. A tag on a folder covers everything below it, on a
+    document all its pages, on a single page just that page; tags are matched exactly after
+    trimming, and unmatched_tags lists those nothing carries yet. The call replaces the
+    previous folders and tags; enabled=false turns auto-OCR off."""
+    tags = _auto_ocr_tags(args.tags)
     account = await use_account(ctx, args.account)
-    payload = await asyncio.to_thread(_set_auto_ocr, services(ctx), account, args)
+    payload = await asyncio.to_thread(_set_auto_ocr, services(ctx), account, args, tags)
     folders = payload["folders"]
     if isinstance(folders, list):
         ctx.audit["uuids"] = [f["uuid"] for f in folders]
         ctx.audit["count"] = len(folders)
+    ctx.audit["tag_count"] = len(tags)  # never the names: tags are the user's display strings
     return json_result(payload, cap=RESULT_CAP_BYTES)
 
 

@@ -9,6 +9,7 @@ the server's ledger, so spend recorded by one is what the other reports.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -25,7 +26,7 @@ from scriptorium.ocr.errors import OcrRefused
 from scriptorium.ocr.ledger import cost_usd
 from scriptorium.ocr.pipeline import KEY_REFUSED_HOLD, KEY_REFUSED_KEY
 from scriptorium.tools.ocr import LAZY_INSTRUCTION
-from tests.cloud.fake_cloud import NOTEBOOK, PDF, fixture_documents
+from tests.cloud.fake_cloud import NOTEBOOK, PAGES, PDF, fixture_documents
 from tests.conftest import FakeIssuer
 from tests.fakes.ocr import FakeOcrClient, FakeOcrFactory, default_text
 from tests.tools.helpers import Served, meta_of, serve, text_of
@@ -379,10 +380,12 @@ async def test_set_auto_ocr_validates_and_stores_folders(ocr: Ocr) -> None:
     on = await ocr.served.ok("set_auto_ocr", {"folders": ["Inbox", FOLDER], "enabled": True})
     assert on["enabled"] is True
     assert on["folders"] == [{"uuid": FOLDER, "name": "Inbox"}]
+    assert on["tags"] == [] and on["unmatched_tags"] == []
     status = await ocr.served.ok("ocr_status")
-    assert status["auto_ocr"] == {"enabled": True, "folders": [FOLDER]}
+    assert status["auto_ocr"] == {"enabled": True, "folders": [FOLDER], "tags": []}
     stored = ocr.linked.index().get_setting("auto_ocr")
-    assert stored is not None and json.loads(stored) == {"enabled": True, "folders": [FOLDER]}
+    assert stored is not None
+    assert json.loads(stored) == {"enabled": True, "folders": [FOLDER], "tags": []}
     not_folder = await ocr.served.error("set_auto_ocr", {"folders": [NOTEBOOK], "enabled": True})
     assert not_folder["code"] == "invalid_argument"
     unknown = await ocr.served.error(
@@ -394,6 +397,83 @@ async def test_set_auto_ocr_validates_and_stores_folders(ocr: Ocr) -> None:
     off = await ocr.served.ok("set_auto_ocr", {"folders": [], "enabled": False})
     assert off["enabled"] is False and off["folders"] == []
     assert (await ocr.served.ok("ocr_status"))["auto_ocr"]["enabled"] is False
+
+
+DOC_TAG = "Synthetic OCR"
+"""Tags the tests put on the fixture notebook (no real tag names)."""
+PAGE_TAG = "Synthetic Page"
+MISSING_TAG = "Synthetic Missing"
+
+
+def _tag_notebook(linked: Linked) -> None:
+    files = linked.cloud.docs[NOTEBOOK]
+    content = json.loads(files[f"{NOTEBOOK}.content"])
+    content["tags"] = [{"name": DOC_TAG, "timestamp": 1}]
+    content["pageTags"] = [{"name": PAGE_TAG, "pageId": PAGES[2], "timestamp": 1}]
+    linked.cloud.set_file(NOTEBOOK, f"{NOTEBOOK}.content", json.dumps(content).encode())
+
+
+async def test_set_auto_ocr_stores_tags_and_names_the_unmatched_ones(
+    ocr: Ocr, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    _tag_notebook(ocr.linked)
+    await ocr.linked.sync()
+    on = await ocr.served.ok(
+        "set_auto_ocr",
+        {"tags": [f"  {PAGE_TAG} ", MISSING_TAG, DOC_TAG, PAGE_TAG], "enabled": True},
+    )
+    # Normalised, deduplicated and sorted; a page tag counts as carried.
+    assert on["enabled"] is True and on["folders"] == []
+    assert on["tags"] == sorted([DOC_TAG, MISSING_TAG, PAGE_TAG])
+    assert on["unmatched_tags"] == [MISSING_TAG]
+    assert "spelling" in on["note"]
+    assert {"account", "mode", "reason"} <= set(on)
+    status = await ocr.served.ok("ocr_status")
+    assert status["auto_ocr"] == {"enabled": True, "folders": [], "tags": on["tags"]}
+    stored = ocr.linked.index().get_setting("auto_ocr")
+    assert stored is not None
+    assert json.loads(stored) == {"enabled": True, "folders": [], "tags": on["tags"]}
+
+    matched = await ocr.served.ok("set_auto_ocr", {"tags": [DOC_TAG], "enabled": True})
+    assert matched["unmatched_tags"] == [] and "spelling" not in matched["note"]
+    # Tags may be given with auto-OCR off too; the call replaces the whole selection.
+    off = await ocr.served.ok("set_auto_ocr", {"tags": [PAGE_TAG], "enabled": False})
+    assert off["enabled"] is False and off["tags"] == [PAGE_TAG]
+
+    # Tag names are the user's: returned to them, never logged or audited; only counted.
+    server_side = "\n".join(
+        f"{r.getMessage()} {getattr(r, 'scriptorium_fields', '')}"
+        for r in caplog.records
+        if not r.name.startswith("mcp.client")
+    )
+    for name in (DOC_TAG, PAGE_TAG, MISSING_TAG):
+        assert name not in server_side
+    audit = [row for row in ocr.served.audit_rows() if "set_auto_ocr" in repr(row)]
+    assert len(audit) == 3
+    for name in (DOC_TAG, PAGE_TAG, MISSING_TAG):
+        assert all(name not in repr(row) for row in audit)
+    assert '"tag_count":3' in repr(audit[0]).replace(" ", "")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"enabled": True},
+        {"folders": [], "tags": [], "enabled": True},
+        {"tags": ["   "], "enabled": True},
+        {"tags": ["bell\x07"], "enabled": True},
+        {"tags": [""], "enabled": True},
+        {"tags": [f"t{n}" for n in range(101)], "enabled": True},
+        {"tags": ["x" * 257], "enabled": True},
+        {"tags": "bell", "enabled": True},
+    ],
+)
+async def test_set_auto_ocr_refuses_bad_tags(ocr: Ocr, args: dict[str, object]) -> None:
+    error = await ocr.served.error("set_auto_ocr", args)
+    assert error["code"] == "invalid_argument"
+    assert "bell" not in json.dumps(error)
+    assert ocr.linked.index().get_setting("auto_ocr") is None
 
 
 async def test_no_transcript_reaches_the_audit_or_the_jobs(ocr: Ocr) -> None:
