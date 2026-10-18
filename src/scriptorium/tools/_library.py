@@ -27,7 +27,7 @@ from typing import Final
 
 from scriptorium.auth.oidc import User
 from scriptorium.errors import InvalidArgumentError
-from scriptorium.jobs.kinds import RenderSpec, rerun_key
+from scriptorium.jobs.kinds import RenderSpec, is_render_verdict, rerun_key
 from scriptorium.library import pages as pg
 from scriptorium.library import render
 from scriptorium.library.index import DocumentRow, Index
@@ -307,6 +307,9 @@ async def page_png(
 
     A missing PNG becomes a worker job (the server never parses ``.rm`` or PDF data); the
     call waits up to ``PENDING_WAIT_SECONDS`` for it, then answers ``pending`` with the job.
+    A dead job whose error is the renderer's verdict on the page is ``refused``; a job that
+    finished without leaving the PNG, or died for any other reason (a broken pool, expired
+    leases), is re-run under a new key, at most ``RERUNS`` times per call.
     """
     svc = services(ctx)
     rel = pg.png_relpath(source.page_id, source.content_hash, max_side=max_side)
@@ -317,7 +320,7 @@ async def page_png(
     spec = RenderSpec(source.document, source.page_id, source.content_hash, generation, max_side)
     key = spec.key(account.acct)
 
-    def enqueue(dedupe_key: str) -> tuple[int, str]:
+    def enqueue(dedupe_key: str) -> tuple[int, str, str | None]:
         job = svc.queue.enqueue(
             uid=account.uid,
             acct=account.acct,
@@ -325,9 +328,9 @@ async def page_png(
             dedupe_key=dedupe_key,
             payload=spec.payload(),
         )
-        return job.id, job.state
+        return job.id, job.state, job.error
 
-    job_id, state = await asyncio.to_thread(enqueue, key)
+    job_id, state, error = await asyncio.to_thread(enqueue, key)
     ctx.audit["job"] = job_id
     deadline = time.monotonic() + svc.settings.pending_wait_seconds
     reruns = 0
@@ -335,14 +338,14 @@ async def page_png(
         data = await asyncio.to_thread(_read_png, path)
         if data is not None:
             return data
-        if state == "dead":
+        if state == "dead" and is_render_verdict(error):
             raise ToolError(
                 ErrorCode.REFUSED,
                 "This page could not be rendered.",
                 "The page may be damaged or in a format the renderer does not support.",
                 extra={"job": job_id},
             )
-        if state in ("done", "cancelled"):
+        if state in ("done", "cancelled", "dead"):
             if reruns >= RERUNS:
                 raise ToolError(
                     ErrorCode.NOT_FOUND,
@@ -350,7 +353,7 @@ async def page_png(
                     "Try again after the next sync.",
                 )
             reruns += 1
-            job_id, state = await asyncio.to_thread(enqueue, rerun_key(key, job_id))
+            job_id, state, error = await asyncio.to_thread(enqueue, rerun_key(key, job_id))
             ctx.audit["job"] = job_id
             continue
         if time.monotonic() >= deadline:
@@ -363,7 +366,7 @@ async def page_png(
         await svc.sleep(svc.poll_interval_s)
         job = await asyncio.to_thread(svc.queue.get, job_id, account.uid)
         if job is not None:
-            state = job.state
+            state, error = job.state, job.error
 
 
 def fit_png(data: bytes, max_side: int) -> bytes:

@@ -420,3 +420,83 @@ def test_counts_group_by_kind_and_state(queue: JobQueue) -> None:
     assert queue.counts(UID) == {"render": {"queued": 3}, "page_image": {"done": 1}}
     assert queue.counts(UID, acct="01J0000000000000000000000B") == {"render": {"queued": 1}}
     assert queue.counts("0000000000000000") == {}
+
+
+# ---- dead render jobs -----------------------------------------------------------------------
+
+
+def kill(q: JobQueue, key: str, error: str, **kw: Any) -> int:
+    """Enqueue ``key`` with one attempt and fail it: dead with ``error``."""
+    job_id = put(q, key, max_attempts=1, **kw)
+    job = q.lease("w", kinds=[kw.get("kind", "render")])
+    assert job is not None and job.id == job_id
+    assert q.fail(job_id, "w", error).state == "dead"
+    return job_id
+
+
+def test_revive_dead_renders_only_touches_run_failures(queue: JobQueue, clock: Clock) -> None:
+    runs = {
+        kill(queue, "render-internal", "internal"),
+        kill(queue, "render-lease", LEASE_EXPIRED_ERROR),
+        kill(queue, "image-io", "local_io", kind="page_image"),
+    }
+    verdicts = {
+        kill(queue, "render-invalid", "invalid_argument"),
+        kill(queue, "image-refused", "refused", kind="page_image"),
+    }
+    other = kill(queue, "ocr-internal", "internal", kind="ocr")
+    done = put(queue, "render-done")
+    job = queue.lease("w", kinds=["render"])
+    assert job is not None and job.id == done
+    queue.complete(done, "w", {})
+    assert queue.dead_renders(UID) == (2, 3)
+    clock.advance(10)
+
+    assert queue.revive_dead_renders() == 3
+
+    for job_id in runs:
+        row = queue.get(job_id, UID)
+        assert row is not None
+        assert (row.state, row.attempts, row.error) == ("queued", 0, None)
+        assert row.next_run_at == clock.now and row.lease_owner is None
+    for job_id in verdicts:
+        row = queue.get(job_id, UID)
+        assert (
+            row is not None
+            and row.state == "dead"
+            and row.error
+            in {
+                "invalid_argument",
+                "refused",
+            }
+        )
+    ocr = queue.get(other, UID)
+    assert ocr is not None and (ocr.state, ocr.error) == ("dead", "internal")
+    finished = queue.get(done, UID)
+    assert finished is not None and finished.state == "done"
+    assert queue.dead_renders(UID) == (2, 0)
+    assert queue.revive_dead_renders() == 0  # nothing left to revive
+
+
+def test_a_revived_job_runs_again_with_fresh_attempts(queue: JobQueue, clock: Clock) -> None:
+    job_id = put(queue, "render-x", max_attempts=2)
+    for _ in range(2):
+        job = queue.lease("w")
+        assert job is not None
+        queue.fail(job_id, "w", "internal")
+        clock.advance(3600)
+    row = queue.get(job_id, UID)
+    assert row is not None and row.state == "dead"
+    assert queue.revive_dead_renders() == 1
+    again = queue.lease("w")
+    assert again is not None and again.id == job_id and again.attempts == 1
+
+
+def test_dead_renders_is_scoped_to_the_user_and_account(queue: JobQueue) -> None:
+    kill(queue, "a", "invalid_argument")
+    kill(queue, "b", "internal", acct="01J0000000000000000000000B")
+    kill(queue, "c", "internal", uid=OTHER)
+    assert queue.dead_renders(UID) == (1, 1)
+    assert queue.dead_renders(UID, acct="01J0000000000000000000000B") == (0, 1)
+    assert queue.dead_renders(OTHER) == (0, 1)
+    assert queue.dead_renders("0000000000000000") == (0, 0)

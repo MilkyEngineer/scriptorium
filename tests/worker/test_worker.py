@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -446,6 +447,27 @@ async def test_run_syncs_renders_beats_and_stops(linked: Linked) -> None:
     finally:
         stop.set()
         await asyncio.wait_for(task, 10)
+
+
+async def test_start_revives_render_jobs_that_died_of_their_run(linked: Linked) -> None:
+    await linked.loop().poll_once(linked.context())
+    jobs = [linked.queue.get(n, linked.uid) for n in range(1, 4)]
+    assert all(j is not None for j in jobs)
+    run_dead, verdict_dead, _ = (j.id for j in jobs if j is not None)
+    for job_id, error in ((run_dead, "lease expired"), (verdict_dead, "invalid_argument")):
+        with sqlite3.connect(global_db_path(linked.settings.data_dir)) as conn:
+            conn.execute(
+                "UPDATE jobs SET state = 'dead', attempts = 5, error = ? WHERE id = ?",
+                (error, job_id),
+            )
+        conn.close()
+    stop = asyncio.Event()
+    stop.set()
+    await linked.worker.run(stop)  # start-up housekeeping only
+    revived = linked.queue.get(run_dead, linked.uid)
+    assert revived is not None and (revived.state, revived.attempts) == ("queued", 0)
+    kept = linked.queue.get(verdict_dead, linked.uid)
+    assert kept is not None and (kept.state, kept.error) == ("dead", "invalid_argument")
 
 
 async def test_the_worker_waits_for_the_server_to_migrate(tmp_path: Path) -> None:

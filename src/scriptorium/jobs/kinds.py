@@ -8,6 +8,12 @@ finished) appends ``:after:<previous job id>``.
 
 Payloads hold identifiers only: the document and page UUIDs, the content hash, the
 generation whose files to render, and the size. The worker re-checks every field.
+
+A ``dead`` render job means one of two things. Its ``error`` is a **verdict** on the page
+(:data:`RENDER_VERDICTS`: the renderer refused or could not parse it), and re-running it
+would fail the same way; or the *run* failed (``internal``, ``lease expired``, ``local_io``,
+a broken render pool, …), and the page itself may be fine. Only the first stays dead:
+``page_png`` re-runs the second under a new key and the worker revives such jobs at start.
 """
 
 from __future__ import annotations
@@ -23,7 +29,9 @@ __all__ = [
     "PAGE_IMAGE",
     "RENDER",
     "RENDER_KINDS",
+    "RENDER_VERDICTS",
     "RenderSpec",
+    "is_render_verdict",
     "page_image_key",
     "parse_render_payload",
     "render_key",
@@ -33,6 +41,8 @@ __all__ = [
 RENDER: Final = "render"
 PAGE_IMAGE: Final = "page_image"
 RENDER_KINDS: Final = (RENDER, PAGE_IMAGE)
+RENDER_VERDICTS: Final = frozenset({"invalid_argument", "refused"})
+"""Job errors that say the page is at fault, not the run: such a dead job stays dead."""
 MAX_SIDE_PX: Final = 8192
 """Largest ``page_image`` longest side a job may ask for."""
 _MAX_GENERATION: Final = 2**62
@@ -85,6 +95,11 @@ def render_key(acct: str, page: str, content_hash: str) -> str:
 
 def page_image_key(acct: str, page: str, content_hash: str, max_side: int) -> str:
     return f"{PAGE_IMAGE}:{acct}:{page}:{content_hash}:{max_side}"
+
+
+def is_render_verdict(error: str | None) -> bool:
+    """True when a render job's ``error`` is the renderer's verdict on the page."""
+    return error in RENDER_VERDICTS
 
 
 def rerun_key(key: str, previous_job: int) -> str:

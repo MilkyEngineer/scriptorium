@@ -24,7 +24,9 @@ One process, one asyncio loop, four kinds of task:
   ``ProcessPoolExecutor`` is broken for good once a child exits abruptly, so a job that
   finds the pool broken (at submit or while waiting) shuts it down, drops it so the next
   job gets a fresh one (``render_pool_rebuilt``), and fails normally to be retried.
-- **Housekeeping.** ``requeue_expired`` at start and every minute; the liveness file
+- **Housekeeping.** ``requeue_expired`` at start and every minute; at start, dead render
+  jobs that died of their run rather than their page are revived once
+  (``JobQueue.revive_dead_renders``); the liveness file
   ``<data>/worker.heartbeat`` (read by ``scriptorium healthcheck --worker``, which looks
   only at its mtime; its body is a small JSON object with the time and the number of render
   pool rebuilds since start, which ``account_status`` reports).
@@ -371,7 +373,8 @@ class Worker:
     async def run(self, stop: asyncio.Event) -> None:
         """Run every task until ``stop`` is set, then wind down."""
         await asyncio.to_thread(self.requeue_expired)
-        log_event(logger, "worker_start")
+        revived = await asyncio.to_thread(self.queue.revive_dead_renders)
+        log_event(logger, "worker_start", count=revived)
         tasks = [
             asyncio.create_task(self._housekeeping(stop), name="housekeeping"),
             asyncio.create_task(self._supervise(stop), name="supervisor"),

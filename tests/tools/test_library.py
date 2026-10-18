@@ -263,7 +263,7 @@ async def test_read_page_polls_until_the_worker_renders(
         linked.close()
 
 
-async def test_dead_render_is_refused_and_done_without_png_is_rerun(
+async def test_dead_renders_are_refused_only_for_a_verdict_and_otherwise_rerun(
     tmp_path: Any, issuer: FakeIssuer, make_validator: Any
 ) -> None:
     from tests.worker.helpers import link
@@ -272,33 +272,45 @@ async def test_dead_render_is_refused_and_done_without_png_is_rerun(
     try:
         await linked.loop().poll_once(linked.context())  # archived and queued, not rendered
         sources = _sources(linked, NOTEBOOK)
-        dead_key = render_key(linked.acct, PAGES[1], sources[1].content_hash)
+        verdict_key = render_key(linked.acct, PAGES[1], sources[1].content_hash)
         gone_key = render_key(linked.acct, PAGES[2], sources[2].content_hash)
+        broken_key = render_key(linked.acct, PAGES[3], sources[3].content_hash)
         conn = sqlite3.connect(global_db_path(linked.settings.data_dir))
         try:
             with conn:
                 conn.execute(
                     "UPDATE jobs SET state = 'dead', error = 'invalid_argument' "
                     "WHERE dedupe_key = ?",
-                    (dead_key,),
+                    (verdict_key,),
                 )
                 conn.execute(
                     "UPDATE jobs SET state = 'done', result = ? WHERE dedupe_key = ?",
                     ('{"state":"gone"}', gone_key),
                 )
-            (gone_id,) = conn.execute(
-                "SELECT id FROM jobs WHERE dedupe_key = ?", (gone_key,)
-            ).fetchone()
+                # Died of its run (a broken render pool), not of its page.
+                conn.execute(
+                    "UPDATE jobs SET state = 'dead', error = 'internal' WHERE dedupe_key = ?",
+                    (broken_key,),
+                )
+            ids = {
+                key: conn.execute("SELECT id FROM jobs WHERE dedupe_key = ?", (key,)).fetchone()[0]
+                for key in (gone_key, broken_key)
+            }
         finally:
             conn.close()
         async with serve(linked.settings, issuer, make_validator, clock=linked.clock) as library:
             dead = await library.error("read_page", {"document": NOTEBOOK, "page": 2})
             assert dead["code"] == "refused"
-            rerun = await library.error("read_page", {"document": NOTEBOOK, "page": 3})
-            assert rerun["code"] == "pending"
-            assert rerun["job"] != gone_id
-            job = library.services.queue.get(rerun["job"], linked.uid)
-            assert job is not None and job.dedupe_key == f"{gone_key}:after:{gone_id}"
+            for page, key in ((3, gone_key), (4, broken_key)):
+                rerun = await library.error("read_page", {"document": NOTEBOOK, "page": page})
+                assert rerun["code"] == "pending"
+                assert rerun["job"] != ids[key]
+                job = library.services.queue.get(rerun["job"], linked.uid)
+                assert job is not None and job.dedupe_key == f"{key}:after:{ids[key]}"
+            await linked.worker.drain_jobs()
+            image_of(await library.call("read_page", {"document": NOTEBOOK, "page": 4}))
+            again = await library.error("read_page", {"document": NOTEBOOK, "page": 2})
+            assert again["code"] == "refused"  # a verdict is not re-run
     finally:
         linked.close()
 

@@ -43,6 +43,7 @@ from scriptorium.db.migrations import SchemaMismatch, Step, check_version
 from scriptorium.db.migrations import migrate as run_migrations
 from scriptorium.db.schema_global import SCRIPTORIUM_STEPS
 from scriptorium.errors import InvalidArgumentError, RefusedError
+from scriptorium.jobs.kinds import RENDER_KINDS, RENDER_VERDICTS
 
 STATES: Final = frozenset({"queued", "leased", "done", "failed", "dead", "cancelled"})
 BACKOFF_BASE_S: Final = 30
@@ -357,6 +358,27 @@ class JobQueue:
             ).rowcount
         return dead + requeued
 
+    def revive_dead_renders(self) -> int:
+        """Re-queue ``dead`` render jobs whose run failed, not their page; returns how many.
+
+        Only ``render`` and ``page_image`` jobs, and only those whose ``error`` is not a
+        renderer verdict (:data:`~scriptorium.jobs.kinds.RENDER_VERDICTS`): a job that died
+        of a broken pool, expired leases or a local I/O error gets a fresh set of attempts
+        (``queued``, ``attempts`` 0, no error, runnable now). Every other job is untouched.
+        The worker calls this once at start.
+        """
+        now = to_db_time(self._now())
+        kinds = ", ".join("?" * len(RENDER_KINDS))
+        verdicts = ", ".join("?" * len(RENDER_VERDICTS))
+        sql = (
+            "UPDATE jobs SET state = 'queued', attempts = 0, error = NULL, next_run_at = ?, "  # noqa: S608
+            "lease_owner = NULL, lease_expires_at = NULL, updated_at = ? "
+            f"WHERE state = 'dead' AND kind IN ({kinds}) "
+            f"AND (error IS NULL OR error NOT IN ({verdicts}))"
+        )
+        with self._write() as conn:
+            return conn.execute(sql, (now, now, *RENDER_KINDS, *sorted(RENDER_VERDICTS))).rowcount
+
     # ---- reporting --------------------------------------------------------------------------
 
     def counts(self, uid: str, *, acct: str | None = None) -> dict[str, dict[str, int]]:
@@ -372,3 +394,20 @@ class JobQueue:
         for row in rows:
             out.setdefault(str(row["kind"]), {})[str(row["state"])] = int(row["n"])
         return out
+
+    def dead_renders(self, uid: str, *, acct: str | None = None) -> tuple[int, int]:
+        """``(verdicts, rerunnable)``: dead render jobs of ``uid`` split by their error."""
+        kinds = ", ".join("?" * len(RENDER_KINDS))
+        verdicts = ", ".join("?" * len(RENDER_VERDICTS))
+        sql = (
+            f"SELECT coalesce(error IN ({verdicts}), 0) AS verdict, count(*) AS n "  # noqa: S608
+            f"FROM jobs WHERE uid = ? AND state = 'dead' AND kind IN ({kinds})"
+        )
+        params: list[Any] = [*sorted(RENDER_VERDICTS), uid, *RENDER_KINDS]
+        if acct is not None:
+            sql += " AND acct = ?"
+            params.append(acct)
+        with self._lock:
+            rows = self._conn.execute(sql + " GROUP BY verdict", params).fetchall()
+        split = {int(row["verdict"]): int(row["n"]) for row in rows}
+        return split.get(1, 0), split.get(0, 0)
