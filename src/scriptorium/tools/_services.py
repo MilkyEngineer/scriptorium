@@ -32,10 +32,10 @@ from scriptorium.db.connect import utc_now
 from scriptorium.jobs.queue import JobQueue
 from scriptorium.library.index import Index
 from scriptorium.logging import log_event, uid_prefix
+from scriptorium.ocr._ports import OcrPorts
 from scriptorium.ocr.client import OcrClient, client_for
 from scriptorium.ocr.ledger import SpendLedger
 from scriptorium.ocr.modes import listed_email_digest
-from scriptorium.ocr._ports import OcrPorts
 from scriptorium.users.store import GlobalStore, account_paths, global_db_path
 
 __all__ = ["IMAGE_SLOTS", "KEY_CHECKS_PER_WINDOW", "KEY_CHECK_WINDOW_S", "Services", "identity_of"]

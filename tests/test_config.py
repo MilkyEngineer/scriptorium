@@ -548,6 +548,13 @@ def test_ocr_bounds(env: pytest.MonkeyPatch) -> None:
         ("OCR_PRICE_OUT_PER_MTOK", "-3"),
         ("OCR_MAX_TOKENS", "100"),
         ("OCR_MAX_TOKENS", "64000"),
+    ):
+        env.setenv(f"SCRIPTORIUM_{name}", bad)
+        with pytest.raises(ConfigError, match=name):
+            load_settings()
+        env.delenv(f"SCRIPTORIUM_{name}")
+
+
 def test_ocr_pipeline_settings_defaults_and_bounds(env: pytest.MonkeyPatch) -> None:
     settings = load_settings()
     assert (settings.ocr_batch_min, settings.ocr_user_concurrency) == (10, 2)

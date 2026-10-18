@@ -41,7 +41,8 @@ from scriptorium.db.connect import from_db_time
 from scriptorium.errors import RefusedError, ScriptoriumError
 from scriptorium.ocr.errors import OcrRefused, OcrUnavailable
 from scriptorium.ocr.ledger import month_bounds
-from scriptorium.ocr.modes import USER_KEY_SECRET, read_user_key, resolve, server_key_permitted
+from scriptorium.ocr.modes import USER_KEY_SECRET, read_user_key, server_key_permitted
+from scriptorium.ocr.modes import resolve as resolve_mode
 from scriptorium.ocr.pipeline import (
     AUTO_OCR_KEY,
     AUTO_OCR_MAX_FOLDERS,
@@ -77,7 +78,7 @@ from scriptorium.tools._library import (
     use_account,
 )
 from scriptorium.tools._services import KEY_CHECK_WINDOW_S, Services
-from scriptorium.tools.ocr import ocr_queue
+from scriptorium.tools.ocr import ocr_mode, ocr_queue
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import worker_heartbeat_path
 from scriptorium.worker import HEARTBEAT_STALE_SECONDS, heartbeat_age, read_heartbeat
@@ -286,13 +287,13 @@ def ocr_summary(svc: Services, uid: str) -> dict[str, object]:
     box = SecretBox(settings, uid)
     try:
         has_key = read_user_key(box) is not None  # presence only; the key is dropped here
-        resolution = resolve(settings, store, box, ledger, uid, now)
+        resolution = resolve_mode(settings, store, box, ledger, uid, now)
         mode, reason = resolution.mode, str(resolution.reason)
         del resolution
     except ScriptoriumError as exc:
         if exc.code != "internal":
             raise
-        # resolve() fails closed rather than spend the server key for this user (§8.1).
+        # resolve_mode() fails closed rather than spend the server key for this user (§8.1).
         mode, reason, has_key = "lazy", "key_unreadable", True
     own = ledger.month(uid=uid, mode="user", at=now)
     server = ledger.month(uid=uid, mode="server", at=now)

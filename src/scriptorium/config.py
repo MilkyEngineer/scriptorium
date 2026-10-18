@@ -296,6 +296,7 @@ class Settings(BaseSettings):
     )
     ocr_max_tokens: int = Field(
         default=4096, ge=256, le=32_000, description="Output budget of one page (§8.2)."
+    )
     # ---- OCR pipeline (§7 step 6, §6.2) ----------------------------------------------------
     ocr_batch_min: int = Field(
         default=10,
