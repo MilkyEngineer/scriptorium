@@ -11,7 +11,7 @@ their owners so the cloud package names one seam.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
@@ -22,35 +22,6 @@ from scriptorium.library.layout import is_safe_name
 from scriptorium.library.tombstones import Listing, TombstonePlan, plan
 
 # ---- structural seams ---------------------------------------------------------------------
-
-
-class DocumentView(Protocol):
-    """The fields of ``Index.document()``'s row that sync reads."""
-
-    @property
-    def hash_root(self) -> str | None: ...
-    @property
-    def last_opened(self) -> datetime | None: ...
-    @property
-    def deleted_at(self) -> datetime | None: ...
-
-
-class ChangeView(Protocol):
-    """The fields of an ``Index.recent()`` row that sync reads."""
-
-    @property
-    def uuid(self) -> str: ...
-    @property
-    def deleted_at(self) -> datetime | None: ...
-
-
-class ChangePage(Protocol):
-    """One page of ``Index.recent()``."""
-
-    @property
-    def items(self) -> Sequence[ChangeView]: ...
-    @property
-    def next_cursor(self) -> str | None: ...
 
 
 class ArchivePort(Protocol):
@@ -64,22 +35,19 @@ class ArchivePort(Protocol):
     def tombstone(self, uuid: str) -> None: ...
     def untombstone(self, uuid: str) -> None: ...
     def blob_path(self, sha256: str) -> Path: ...
+    def current_files(self, uuid: str) -> Mapping[str, Path]: ...
+    def take_damaged(self) -> frozenset[str]: ...
 
 
 class IndexPort(Protocol):
-    """The subset of ``library/index.py:Index`` (plan §3.4) that sync calls.
-
-    The planner needs the sets of live and tombstoned documents and §3.4 has no method that
-    lists them, so sync pages through ``recent`` from the beginning of time, which includes
-    tombstoned rows (see ``SyncOnce._library_sets``).
-    """
+    """The subset of ``library/index.py:Index`` (plan §3.4, plan 05 §3.4) that sync calls."""
 
     def transaction(self) -> AbstractContextManager[None]: ...
     def upsert_document(self, doc: DocumentRow) -> None: ...
     def mark_deleted(self, uuid: str, cause: str, at: datetime) -> None: ...
     def unmark_deleted(self, uuid: str) -> None: ...
-    def document(self, uuid: str) -> DocumentView | None: ...
-    def recent(self, since: datetime, cursor: str | None, limit: int) -> ChangePage: ...
+    def document(self, uuid: str) -> DocumentRow | None: ...
+    def document_uuids(self, *, deleted: bool, excluded: bool | None = None) -> frozenset[str]: ...
     def append_history(
         self,
         uuid: str,
@@ -91,6 +59,7 @@ class IndexPort(Protocol):
     ) -> None: ...
     def get_state(self, key: str) -> str | None: ...
     def set_state(self, key: str, value: str | None) -> None: ...
+    def get_setting(self, key: str) -> str | None: ...
 
 
 class Planner(Protocol):
@@ -116,10 +85,7 @@ def default_planner() -> Planner:
 
 __all__ = [
     "ArchivePort",
-    "ChangePage",
-    "ChangeView",
     "DocumentRow",
-    "DocumentView",
     "IndexPort",
     "Listing",
     "Planner",

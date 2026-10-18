@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -531,28 +532,30 @@ def test_the_index_blob_is_kept_with_each_version(tmp_path: Path) -> None:
         assert h.index.history(uuid)[0].index_sha256 == stored.name
 
 
-def test_the_library_is_enumerated_page_by_page(
+def test_the_planner_sets_come_from_document_uuids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync_module, "_LIST_PAGE", 2)
+    """``Index.document_uuids`` (not ``recent`` from year 1, which a row dated before the
+    epoch could escape) gives the planner its library and tombstoned sets."""
     cloud = FakeCloud()
     nine(cloud)
     h = harness(httpx.MockTransport(cloud.handler), tmp_path)
     h.poll()
-    calls: list[str | None] = []
-    real_recent = h.index.recent
+    old = h.index.document(PAGES[1])
+    assert old is not None
+    h.index.upsert_document(
+        dataclasses.replace(old, last_modified=datetime(1960, 1, 1, tzinfo=UTC))
+    )
 
-    def counting(since: datetime, cursor: str | None, limit: int) -> Any:
-        calls.append(cursor)
-        return real_recent(since, cursor, limit)
+    def no_recent(*_args: object) -> Any:
+        raise AssertionError("sync must not page through recent()")
 
-    monkeypatch.setattr(h.index, "recent", counting)
-    cloud.remove_document(PAGES[0])
+    monkeypatch.setattr(h.index, "recent", no_recent)
+    cloud.remove_document(PAGES[1])
     h.poll()
     report = h.poll()
 
-    assert report.tombstoned == (PAGES[0],)
-    assert len(calls) == 2 * 5  # nine rows, two per page, per poll
+    assert report.tombstoned == (PAGES[1],)
 
 
 def test_uppercase_hashes_from_the_cloud_are_stored_lowercase(tmp_path: Path) -> None:
@@ -1239,3 +1242,28 @@ def test_clock_is_injected(tmp_path: Path) -> None:
     h, _player, (report,) = replay("full_listing", tmp_path)
     assert isinstance(h.clock, Clock)
     assert report.started_at < report.finished_at
+
+
+def test_the_breaker_stores_its_candidates_and_logs_only_a_count(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    cloud, h = _tripped(tmp_path)
+
+    assert json.loads(h.state("anomaly_candidates") or "null") == sorted(PAGES[:6])
+    anomalies = [
+        getattr(r, "scriptorium_fields", {})
+        for r in caplog.records
+        if r.getMessage() == "sync.anomaly"
+    ]
+    assert anomalies[-1]["reason"] == "mass_delete" and anomalies[-1]["count"] == 6
+    text = repr(
+        [(r.getMessage(), r.args, getattr(r, "scriptorium_fields", {})) for r in caplog.records]
+    )
+    assert not any(uuid in text for uuid in PAGES)
+
+    # Any other anomaly replaces them: an approval is only built from the latest trip.
+    clear_anomaly(h)
+    cloud.publish(generation=1)
+    assert h.poll().anomaly == "generation_regressed"
+    assert h.state("anomaly_candidates") is None

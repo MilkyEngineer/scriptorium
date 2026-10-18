@@ -9,6 +9,21 @@
    ``hash_root`` has its index fetched; an unchanged hash is an unchanged document
    (indexes are content-addressed), so it needs no fetch. A document whose index fails
    is left alone, the others proceed, and the listing is marked incomplete.
+   **Scope** (M2, §11.1, ``cloud/scope.py``). Unless the account's scope is ``all``, every
+   fetched document then has its ``.metadata`` and ``.content`` read (into memory, budget
+   counted) for its type, parent and tags, and is decided against the scope with the tags
+   of the folders above it. A document outside the scope is not downloaded: its row is
+   upserted from ``.metadata`` with ``excluded_at`` set, and ``sync_state.scope_excluded``
+   remembers its root entry hash and tags so an unchanged excluded document is not fetched
+   again. A document already archived that leaves the scope keeps its files and
+   ``hash_root``; only ``excluded_at`` is set. One that enters the scope is committed like a
+   new document (or just unmarked if its archived version is current). Folders are always
+   mirrored. Every listed document is decided again when the scope changed since the last
+   fully processed poll (``sync_state.scope_applied``), when a folder changed, or when a
+   document was un-tombstoned; otherwise only the fetched ones are. Nothing here tombstones
+   or removes anything. An unreadable stored scope ends the poll with ``backoff`` and
+   reason ``scope_malformed`` before any cloud request: guessing ``all`` would download
+   what the user excluded.
 3. **Commit.** Per changed document: stage, download the blobs not yet in ``blobs/``
    (each streamed through SHA-256 verification and its declared size cap) and store the
    document index itself as a blob, then, in one
@@ -29,7 +44,9 @@
    run again with ``allow_mass_delete=True``. Any poll whose planner ran spends the
    approval, used or not (an expired, uncovered, unparseable or unneeded one is logged as
    ``sync.allow_mass_delete_rejected`` with a reason code and a count); a poll stopped
-   before planning (during the listing, or by an early anomaly) leaves it in place.
+   before planning (during the listing, or by an early anomaly) leaves it in place. When
+   the breaker trips, its candidates are stored as ``sync_state.anomaly_candidates`` (a
+   JSON list of UUIDs, logged only as a count) for ``admin_clear_anomaly`` to approve.
 7. **Failure classes.** 401/403 from the token endpoint is ``token_rejected``; 429, a
    network failure or three transient failures in a row end the poll with ``backoff``;
    an unparseable root (a ``CloudProtocolError`` or a hash mismatch) is
@@ -58,13 +75,21 @@ the next complete listing clears both. ``account_status`` warns while they are s
 
 A root identical to the last fully processed one (same hash) is a complete listing of the
 same documents, so the planner still runs on it: that is what lets a deletion on a quiet
-account reach its second consecutive listing.
+account reach its second consecutive listing. The shortcut is not taken when the scope
+changed since that poll.
+
+**Archive repair.** When the archive rolls an interrupted change forward and a file it was
+placing has vanished (``archive_journal_source_missing``), ``library/`` may lack part of the
+version ``hash_root`` names. Such documents (``Archive.take_damaged``) get ``hash_root``
+nulled, at the start and at the end of each poll, so the next poll commits them again from
+``blobs/``.
 
 Rendering (step 5) and OCR (step 6) belong to the worker.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -77,7 +102,8 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Literal
+from pathlib import Path
+from typing import Any, Final, Literal, NamedTuple
 
 from scriptorium.cloud.client import CloudClient
 from scriptorium.cloud.errors import (
@@ -104,7 +130,19 @@ from scriptorium.cloud.protocol import (
     DocumentIndex,
     RootEntry,
     RootInfo,
+    is_sha256,
     is_uuid,
+)
+from scriptorium.cloud.scope import (
+    ALL,
+    ScopeError,
+    SyncScope,
+    ancestor_tags,
+    document_tags,
+    in_scope,
+    load_scope,
+    normalise_tag,
+    scope_fingerprint,
 )
 from scriptorium.db.connect import to_db_time
 from scriptorium.errors import PathEscapeError, ScriptoriumError
@@ -125,6 +163,14 @@ STATE_TOMBSTONING_SUSPENDED_SINCE: Final = "tombstoning_suspended_since"
 """When the run of polls whose listing failed on some documents began (cleared when complete)."""
 STATE_TOMBSTONING_SUSPENDED_FAILED: Final = "tombstoning_suspended_failed"
 """How many document indexes the latest such poll could not fetch."""
+STATE_ANOMALY_CANDIDATES: Final = "anomaly_candidates"
+"""With ``anomaly="mass_delete"``: JSON list of the UUIDs that tripped the breaker. Never
+logged; ``admin_clear_anomaly`` turns it into an approval."""
+STATE_SCOPE_APPLIED: Final = "scope_applied"
+"""Fingerprint of the scope the last fully processed poll applied (absent means ``all``)."""
+STATE_SCOPE_EXCLUDED: Final = "scope_excluded"
+"""JSON ``{uuid: [entry_hash, [tag, ...]]}`` for excluded documents: their root entry hash and
+document tags when last looked at, so an unchanged one is not fetched on every poll."""
 
 ANOMALY_GENERATION_REGRESSED: Final = "generation_regressed"
 ANOMALY_EMPTY_ROOT: Final = "empty_root"
@@ -136,9 +182,10 @@ MAX_JSON_BYTES: Final = 8 * 1024 * 1024
 """Largest ``.metadata``/``.content`` parsed for the documents row; larger is left unparsed."""
 MAX_NAME_CHARS: Final = 1024
 MAX_PAGES: Final = 100_000
+MAX_SEEN_CHARS: Final = 64 * 1024 * 1024
+"""Largest ``scope_excluded`` value read back; a larger one is ignored (and rebuilt)."""
 _DOCUMENT_TYPES: Final = frozenset({"DocumentType", "CollectionType"})
-_BEGINNING: Final = datetime(1, 1, 1, tzinfo=UTC)
-_LIST_PAGE: Final = 1000
+_ALL_FINGERPRINT: Final = scope_fingerprint(ALL)
 _FILE_TYPES: Final = frozenset({"notebook", "pdf", "epub"})
 _BIDI_CONTROLS: Final = frozenset(
     "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
@@ -206,6 +253,8 @@ class SyncReport:
     mass_delete_approved: bool = False
     """This poll's plan used an administrator's ``allow_mass_delete`` approval to pass the
     breaker (the approval covered every tripped candidate and had not expired)."""
+    excluded: int = 0
+    """Listed documents outside the sync scope after this poll (rows with ``excluded_at``)."""
 
 
 class _BudgetSpentError(Exception):
@@ -255,6 +304,31 @@ class _Run:
     anomaly: str | None = None
     anomaly_reason: str | None = None
     mass_delete_approved: bool = False
+    excluded: int = 0
+
+
+class _Seen(NamedTuple):
+    """An excluded document as last looked at: its root entry hash and document tags."""
+
+    hash: str
+    tags: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _Facts:
+    """What the scope needs from a fetched document's ``.metadata`` and ``.content``."""
+
+    metadata: Mapping[str, Any]
+    metadata_ok: bool
+    tags: frozenset[str]
+
+    @property
+    def folder(self) -> bool:
+        return self.metadata.get("type") == "CollectionType"
+
+    @property
+    def parent(self) -> str | None:
+        return _parent(self.metadata.get("parent"))
 
 
 class _Streak:
@@ -298,11 +372,20 @@ class SyncOnce:
 
     def run(self) -> SyncReport:
         run = _Run(started_at=self._clock(), started_mono=self._monotonic())
+        self._repair_damaged()  # local only: recovery at worker start may have left damage
         anomaly = self._index.get_state(STATE_ANOMALY)
         if anomaly:
             run.anomaly = anomaly
             run.anomaly_reason = self._index.get_state(STATE_ANOMALY_REASON)
             return self._finish(run, "anomaly", reason=anomaly)
+        try:
+            scope = load_scope(self._index)
+        except ScopeError:
+            log_event(logger, "sync.scope_malformed", level=logging.ERROR, acct=self._settings.acct)
+            return self._finish(run, "backoff", reason="scope_malformed")
+        fingerprint = scope_fingerprint(scope)
+        applied = self._index.get_state(STATE_SCOPE_APPLIED) or _ALL_FINGERPRINT
+        scope_changed = fingerprint != applied
 
         # Step 1: the root.
         try:
@@ -349,12 +432,13 @@ class SyncOnce:
         # Step 2: the listing.
         stop: _Stop | None = None
         indexes: dict[str, DocumentIndex] = {}
-        if root.hash == self._index.get_state(STATE_LAST_ROOT_HASH):
+        marks = _load_seen(self._index.get_state(STATE_SCOPE_EXCLUDED))
+        if root.hash == self._index.get_state(STATE_LAST_ROOT_HASH) and not scope_changed:
             run.root_unchanged = True
             run.documents_unchanged = len(uuids)
             complete = True
         else:
-            stop = self._list(root, indexes, run)
+            stop = self._list(root, indexes, run, scope, marks)
             complete = stop is None and not run.failed
         run.listing_complete = complete
         current = Listing(uuids=uuids, complete=complete, generation=root.generation)
@@ -400,23 +484,32 @@ class SyncOnce:
                     run,
                     plan.anomaly,
                     f"{missing} of {len(library)} documents missing from the root",
+                    candidates=plan.tripped if plan.anomaly == ANOMALY_MASS_DELETE else None,
                 )
             else:
-                # Step 4a, un-tombstone first; then step 3; then step 4b.
+                # Step 4a, un-tombstone first; then the scope; then step 3; then step 4b.
                 blocked = self._untombstone(plan.to_untombstone, run)
                 entries = {entry.uuid: entry for entry in root.entries}
-                stop = self._commit_all(root, entries, indexes, blocked, run)
+                stop = self._apply_scope(
+                    scope, scope_changed, marks, entries, indexes, blocked, run
+                )
+                if stop is None:
+                    stop = self._commit_all(root, entries, indexes, blocked, run)
                 if plan.to_tombstone and stop is None:
                     self._tombstone(plan.to_tombstone, run)
 
         fully_done = complete and stop is None and not run.failed and run.anomaly is None
+        run.excluded = len(self._index.document_uuids(deleted=False, excluded=True) & uuids)
         self._save_listing(
             current,
             root_hash=root.hash if fully_done else None,
             listing_failures=listing_failures,
             started_at=run.started_at,
             consume_approval=spent,
+            scope_applied=fingerprint if fully_done else None,
         )
+        # After the listing is saved, so a repair also clears the root hash just stored.
+        self._repair_damaged(skip=frozenset(run.committed))
 
         if run.anomaly is not None:
             return self._finish(run, "anomaly", reason=run.anomaly)
@@ -427,21 +520,13 @@ class SyncOnce:
         return self._finish(run, "ok")
 
     def _library_sets(self) -> tuple[frozenset[str], frozenset[str]]:
-        """``(library, tombstoned)``: every document row, split on ``deleted_at``.
-
-        Pages through ``Index.recent`` from the beginning of time, which lists tombstoned
-        rows too; §3.4 has no other way to enumerate the documents.
-        """
-        live: set[str] = set()
-        dead: set[str] = set()
-        cursor: str | None = None
-        while True:
-            page = self._index.recent(_BEGINNING, cursor, _LIST_PAGE)
-            for row in page.items:
-                (live if row.deleted_at is None else dead).add(row.uuid)
-            cursor = page.next_cursor
-            if cursor is None:
-                return frozenset(live), frozenset(dead)
+        """``(library, tombstoned)``: every document row, split on ``deleted_at``. Excluded
+        rows are in ``library``: a document deleted in the cloud is tombstoned whether or not
+        it was in scope (its row, and any version archived before it left, are kept)."""
+        return (
+            self._index.document_uuids(deleted=False),
+            self._index.document_uuids(deleted=True),
+        )
 
     def _save_listing(
         self,
@@ -451,6 +536,7 @@ class SyncOnce:
         listing_failures: int = 0,
         started_at: datetime | None = None,
         consume_approval: bool = False,
+        scope_applied: str | None = None,
     ) -> None:
         """Record this poll's listing for the next one; consume the approval if told to.
 
@@ -478,18 +564,46 @@ class SyncOnce:
             ok = "true" if listing.complete else "false"
             self._index.set_state(STATE_LAST_FULL_LISTING_OK, ok)
             self._index.set_state(STATE_LAST_ROOT_HASH, root_hash)
+            if scope_applied is not None:
+                self._index.set_state(STATE_SCOPE_APPLIED, scope_applied)
             if consume_approval:
                 self._index.set_state(STATE_ALLOW_MASS_DELETE, None)
 
     # ---- step 2 --------------------------------------------------------------------------
 
-    def _list(self, root: RootInfo, indexes: dict[str, DocumentIndex], run: _Run) -> _Stop | None:
-        transient = _Streak()
+    def _list(
+        self,
+        root: RootInfo,
+        indexes: dict[str, DocumentIndex],
+        run: _Run,
+        scope: SyncScope,
+        seen: Mapping[str, _Seen],
+    ) -> _Stop | None:
+        wanted: list[RootEntry] = []
         for entry in sorted(root.entries, key=lambda e: e.uuid):
             row = self._index.document(entry.uuid)
             if row is not None and row.hash_root == entry.hash:
                 run.documents_unchanged += 1
                 continue
+            mark = seen.get(entry.uuid)
+            if (
+                scope.mode != "all"
+                and row is not None
+                and row.excluded_at is not None
+                and mark is not None
+                and mark.hash == entry.hash
+            ):
+                # Outside the scope and unchanged since it was last looked at.
+                run.documents_unchanged += 1
+                continue
+            wanted.append(entry)
+        return self._fetch_indexes(wanted, indexes, run)
+
+    def _fetch_indexes(
+        self, wanted: list[RootEntry], indexes: dict[str, DocumentIndex], run: _Run
+    ) -> _Stop | None:
+        transient = _Streak()
+        for entry in wanted:
             try:
                 self._check_budget(run)
             except _BudgetSpentError as exc:
@@ -511,6 +625,234 @@ class SyncOnce:
             indexes[entry.uuid] = doc_index
             run.skipped_files += doc_index.skipped
         return None
+
+    # ---- step 2, the scope -----------------------------------------------------------------
+
+    def _apply_scope(
+        self,
+        scope: SyncScope,
+        scope_changed: bool,
+        seen: dict[str, _Seen],
+        entries: Mapping[str, RootEntry],
+        indexes: dict[str, DocumentIndex],
+        blocked: set[str],
+        run: _Run,
+    ) -> _Stop | None:
+        """Mark what is outside the scope and bring back what entered it (§11.1).
+
+        A fetched document outside the scope leaves ``indexes``, so step 3 downloads nothing
+        of it. An archived one that leaves keeps its files and ``hash_root``. An excluded one
+        that enters is unmarked when its archived version is current, else its index is
+        fetched so step 3 commits it. Nothing is tombstoned or removed.
+        """
+        facts: dict[str, _Facts] = {}
+        try:
+            if scope.mode != "all":
+                stop = self._fetch_facts(indexes, blocked, facts, run)
+                if stop is not None:
+                    return stop
+            listed = frozenset(entries)
+            if scope.mode == "all":
+                candidates = self._index.document_uuids(deleted=False, excluded=True) & listed
+            elif scope_changed or run.untombstoned or any(f.folder for f in facts.values()):
+                candidates = listed  # a folder's tags or the scope reach every document below
+            else:
+                candidates = frozenset(facts)
+            skip = blocked | set(run.failed)
+            late = self._decide(
+                scope, sorted(candidates - skip), facts, seen, entries, indexes, run
+            )
+            return self._fetch_indexes([entries[uuid] for uuid in late], indexes, run)
+        finally:
+            self._save_seen(seen, frozenset(entries))
+
+    def _decide(
+        self,
+        scope: SyncScope,
+        candidates: list[str],
+        facts: Mapping[str, _Facts],
+        seen: dict[str, _Seen],
+        entries: Mapping[str, RootEntry],
+        indexes: dict[str, DocumentIndex],
+        run: _Run,
+    ) -> list[str]:
+        """Apply the scope to ``candidates``; returns the excluded documents that entered the
+        scope with a version newer than the one archived (their index is still to fetch)."""
+        rows: dict[str, DocumentRow | None] = {}
+        tag_cache: dict[str, frozenset[str]] = {}
+
+        def row_of(uuid: str) -> DocumentRow | None:
+            if uuid not in rows:
+                rows[uuid] = self._index.document(uuid)
+            return rows[uuid]
+
+        def parent_of(uuid: str) -> str | None:
+            fact = facts.get(uuid)
+            if fact is not None:
+                return fact.parent
+            row = row_of(uuid)
+            return row.parent if row is not None else None
+
+        def tags_of(uuid: str) -> frozenset[str]:
+            if uuid not in tag_cache:
+                fact, mark = facts.get(uuid), seen.get(uuid)
+                if fact is not None:
+                    tag_cache[uuid] = fact.tags
+                elif mark is not None:
+                    tag_cache[uuid] = mark.tags
+                else:
+                    tag_cache[uuid] = self._archived_tags(uuid)
+            return tag_cache[uuid]
+
+        now = self._clock()
+        late: list[str] = []
+        for uuid in candidates:
+            row, fact, entry = row_of(uuid), facts.get(uuid), entries[uuid]
+            if row is not None and row.deleted_at is not None:
+                continue  # blocked from returning: left as it is
+            if fact is not None:
+                folder = fact.folder
+            else:
+                folder = row is not None and row.type == "CollectionType"
+            own = tags_of(uuid)
+            inside = folder or in_scope(
+                scope, own, ancestor_tags(parent_of(uuid), parent_of, tags_of)
+            )
+            try:
+                if inside:
+                    seen.pop(uuid, None)
+                    if uuid in indexes or row is None or row.excluded_at is None:
+                        continue  # step 3 commits it, or it is archived and stays so
+                    if row.hash_root == entry.hash:
+                        self._put(dataclasses.replace(row, excluded_at=None))
+                    else:
+                        late.append(uuid)
+                elif fact is not None:
+                    indexes.pop(uuid, None)  # before the upsert: never commit it on a failure
+                    self._put(self._excluded_row(entry, fact, row, now, run))
+                    seen[uuid] = _Seen(entry.hash, own)
+                elif row is not None:
+                    if row.excluded_at is None:
+                        self._put(dataclasses.replace(row, excluded_at=now))
+                    seen[uuid] = _Seen(entry.hash, own)
+            except (ScriptoriumError, OSError) as exc:
+                code = exc.code if isinstance(exc, ScriptoriumError) else "local_io"
+                self._fail(run, uuid, code)
+        return late
+
+    def _put(self, row: DocumentRow) -> None:
+        with self._index.transaction():
+            self._index.upsert_document(row)
+
+    def _fetch_facts(
+        self,
+        indexes: dict[str, DocumentIndex],
+        blocked: set[str],
+        facts: dict[str, _Facts],
+        run: _Run,
+    ) -> _Stop | None:
+        """Read each fetched document's ``.metadata`` and ``.content`` into ``facts``.
+
+        The bytes are held in memory only, so a document found outside the scope leaves
+        nothing in ``blobs/``; one inside downloads them again with the rest in step 3. A
+        document whose files cannot be fetched leaves ``indexes`` and fails.
+        """
+        transient = _Streak()
+        for uuid in sorted(indexes):
+            if uuid in blocked:
+                continue
+            files = indexes[uuid].files
+            try:
+                self._check_budget(run)
+                meta = self._fetch_small(files.get(f"{uuid}.metadata"), f"{uuid}.metadata", run)
+                content = self._fetch_small(files.get(f"{uuid}.content"), f"{uuid}.content", run)
+            except _BudgetSpentError as exc:
+                return _Stop("partial", exc.reason)
+            except (TokenRejectedError, RateLimitedError) as exc:
+                indexes.pop(uuid)
+                self._fail(run, uuid, exc.reason)
+                return _Stop.from_error(exc)
+            except TransientCloudError as exc:
+                indexes.pop(uuid)
+                self._fail(run, uuid, exc.reason)
+                if transient.hit():
+                    return _Stop.from_error(exc)
+                continue
+            except CloudError as exc:
+                indexes.pop(uuid)
+                self._fail(run, uuid, exc.reason)
+                transient.reset()
+                continue
+            transient.reset()
+            metadata = _parse_json(meta)
+            parsed = _parse_json(content)
+            facts[uuid] = _Facts(
+                metadata=metadata or {},
+                metadata_ok=metadata is not None,
+                tags=document_tags(parsed) if parsed is not None else frozenset(),
+            )
+        return None
+
+    def _fetch_small(self, ref: BlobRef | None, name: str, run: _Run) -> bytes | None:
+        """One small JSON file of a document, verified, into memory; None if absent or too
+        large to parse (the caller treats that as unusable)."""
+        if ref is None or ref.size > MAX_JSON_BYTES:
+            return None
+        self._check_budget(run)
+        with self._client.open_blob(ref.sha256, max_bytes=ref.size, filename=name) as stream:
+            data = stream.read()
+        with self._lock:
+            run.bytes_downloaded += len(data)
+        return data
+
+    def _archived_tags(self, uuid: str) -> frozenset[str]:
+        """Document tags of the version in ``library/`` (empty if none or unreadable)."""
+        try:
+            path = self._archive.current_files(uuid).get(f"{uuid}.content")
+        except (ScriptoriumError, OSError):
+            return frozenset()
+        content = _read_json_file(path) if path is not None else None
+        return document_tags(content) if content is not None else frozenset()
+
+    def _excluded_row(
+        self,
+        entry: RootEntry,
+        fact: _Facts,
+        row: DocumentRow | None,
+        now: datetime,
+        run: _Run,
+    ) -> DocumentRow:
+        """The row of a fetched document outside the scope: names and dates from its
+        ``.metadata``; what describes an archived version (``hash_root``, ``generation``,
+        ``source_kind``, ``page_count``) kept from the row, as that version stays."""
+        excluded_at = row.excluded_at if row is not None and row.excluded_at else now
+        if not fact.metadata_ok:
+            run.metadata_errors += 1
+            if row is not None:
+                return dataclasses.replace(row, excluded_at=excluded_at)
+        metadata = fact.metadata
+        return DocumentRow(
+            uuid=entry.uuid,
+            type="DocumentType",
+            parent=fact.parent,
+            name=_display_name(metadata.get("visibleName"), fallback=entry.uuid),
+            last_modified=_epoch_ms(metadata.get("lastModified")) or now,
+            last_opened=_epoch_ms(metadata.get("lastOpened")),
+            deleted_at=None,
+            deletion_cause=None,
+            source_kind=row.source_kind if row is not None else None,
+            page_count=row.page_count if row is not None else 0,
+            hash_root=row.hash_root if row is not None else None,
+            generation=row.generation if row is not None else None,
+            excluded_at=excluded_at,
+        )
+
+    def _save_seen(self, seen: dict[str, _Seen], listed: frozenset[str]) -> None:
+        """Store ``scope_excluded``, keeping only listed documents that are still excluded."""
+        excluded = self._index.document_uuids(deleted=False, excluded=True)
+        keep = {u: seen[u] for u in sorted(seen) if u in listed and u in excluded}
+        with self._index.transaction():
+            self._index.set_state(STATE_SCOPE_EXCLUDED, _dump_seen(keep) if keep else None)
 
     # ---- step 3 --------------------------------------------------------------------------
 
@@ -681,16 +1023,8 @@ class SyncOnce:
             if required:
                 run.metadata_errors += 1
             return {}
-        try:
-            with self._archive.blob_path(ref.sha256).open("rb") as fh:
-                raw = fh.read(MAX_JSON_BYTES + 1)
-            if len(raw) > MAX_JSON_BYTES:
-                raise ValueError("too large")
-            data = json.loads(raw)
-        except (OSError, ValueError, RecursionError):
-            run.metadata_errors += 1
-            return {}
-        if not isinstance(data, dict):
+        data = _read_json_file(self._archive.blob_path(ref.sha256))
+        if data is None:
             run.metadata_errors += 1
             return {}
         return data
@@ -738,13 +1072,59 @@ class SyncOnce:
 
     # ---- anomalies, failures, the report ---------------------------------------------------
 
-    def _set_anomaly(self, run: _Run, kind: str, reason: str) -> None:
+    def _set_anomaly(
+        self, run: _Run, kind: str, reason: str, *, candidates: frozenset[str] | None = None
+    ) -> None:
+        """Enter safe mode. ``candidates`` (a tripped breaker's) replace any stored ones;
+        any other anomaly clears them, so an approval is only ever built from the latest
+        trip."""
+        stored = json.dumps(sorted(candidates), separators=(",", ":")) if candidates else None
         with self._index.transaction():
             self._index.set_state(STATE_ANOMALY, kind)
             self._index.set_state(STATE_ANOMALY_REASON, reason)
+            self._index.set_state(STATE_ANOMALY_CANDIDATES, stored)
         run.anomaly, run.anomaly_reason = kind, reason
         log_event(
-            logger, "sync.anomaly", level=logging.WARNING, acct=self._settings.acct, reason=kind
+            logger,
+            "sync.anomaly",
+            level=logging.WARNING,
+            acct=self._settings.acct,
+            reason=kind,
+            count=len(candidates) if candidates else None,
+        )
+
+    def _repair_damaged(self, *, skip: frozenset[str] = frozenset()) -> None:
+        """Null ``hash_root`` of documents the archive reports damaged (module docstring),
+        except those this poll has just committed whole again, and forget the root hash so
+        the next poll lists every document instead of taking the unchanged-root shortcut."""
+        damaged = self._archive.take_damaged() - skip
+        if not damaged:
+            return
+        repaired = 0
+        try:
+            with self._index.transaction():
+                for uuid in sorted(damaged):
+                    row = self._index.document(uuid)
+                    if row is not None and row.hash_root is not None:
+                        self._index.upsert_document(dataclasses.replace(row, hash_root=None))
+                        repaired += 1
+                self._index.set_state(STATE_LAST_ROOT_HASH, None)
+        except Exception as exc:
+            log_event(
+                logger,
+                "sync.archive_repair_failed",
+                level=logging.ERROR,
+                acct=self._settings.acct,
+                reason=type(exc).__name__,
+                count=len(damaged),
+            )
+            return
+        log_event(
+            logger,
+            "sync.archive_repaired",
+            level=logging.WARNING,
+            acct=self._settings.acct,
+            count=repaired,
         )
 
     def _raise_anomaly(self, run: _Run, kind: str, reason: str) -> SyncReport:
@@ -793,6 +1173,7 @@ class SyncOnce:
             anomaly=run.anomaly,
             anomaly_reason=run.anomaly_reason,
             mass_delete_approved=run.mass_delete_approved,
+            excluded=run.excluded,
         )
         log_event(
             logger,
@@ -830,6 +1211,59 @@ def _parse_int(raw: str | None) -> int | None:
     if raw is None or not raw.isascii() or not raw.isdigit():
         return None
     return int(raw)
+
+
+def _parse_json(raw: bytes | None) -> dict[str, Any] | None:
+    """A JSON object from bytes; None if absent, too large or not an object."""
+    if raw is None or len(raw) > MAX_JSON_BYTES:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    """A JSON object from a local file, read with the same bound; None if unusable."""
+    try:
+        with path.open("rb") as fh:
+            raw = fh.read(MAX_JSON_BYTES + 1)
+    except OSError:
+        return None
+    return _parse_json(raw)
+
+
+def _load_seen(raw: str | None) -> dict[str, _Seen]:
+    """``scope_excluded`` as stored; malformed entries (or a malformed whole) are dropped,
+    which only costs a fetch of those documents' small files."""
+    if raw is None or len(raw) > MAX_SEEN_CHARS:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, _Seen] = {}
+    for uuid, value in data.items():
+        if not (isinstance(uuid, str) and is_uuid(uuid)) or not isinstance(value, list):
+            continue
+        if len(value) != 2 or not isinstance(value[0], str) or not is_sha256(value[0]):
+            continue
+        if not isinstance(value[1], list):
+            continue
+        tags = frozenset(t for t in value[1] if isinstance(t, str) and normalise_tag(t) == t)
+        out[uuid] = _Seen(value[0], tags)
+    return out
+
+
+def _dump_seen(seen: Mapping[str, _Seen]) -> str:
+    return json.dumps(
+        {uuid: [mark.hash, sorted(mark.tags)] for uuid, mark in sorted(seen.items())},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _dump_listing(listing: Listing) -> str:

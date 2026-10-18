@@ -51,6 +51,7 @@ class FakeIndex:
     index_blobs: dict[tuple[str, int], str | None] = field(default_factory=dict)
     state: dict[str, str] = field(default_factory=dict)
     tags: dict[str, TagSet] = field(default_factory=dict)
+    settings: dict[str, str] = field(default_factory=dict)
     depth: int = 0
     rollbacks: int = 0
     writes_outside_transaction: int = 0
@@ -108,6 +109,14 @@ class FakeIndex:
         row = self._row(uuid)
         self.documents[uuid] = dataclasses.replace(row, deleted_at=None, deletion_cause=None)
 
+    def document_uuids(self, *, deleted: bool, excluded: bool | None = None) -> frozenset[str]:
+        return frozenset(
+            uuid
+            for uuid, row in self.documents.items()
+            if (row.deleted_at is not None) == deleted
+            and (excluded is None or (row.excluded_at is not None) == excluded)
+        )
+
     def document(self, uuid: str) -> DocumentRow | None:
         return self.documents.get(uuid)
 
@@ -150,6 +159,9 @@ class FakeIndex:
 
     def get_state(self, key: str) -> str | None:
         return self.state.get(key)
+
+    def get_setting(self, key: str) -> str | None:
+        return self.settings.get(key)
 
     def set_state(self, key: str, value: str | None) -> None:
         self._write()
