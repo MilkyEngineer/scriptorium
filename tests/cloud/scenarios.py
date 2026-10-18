@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import time
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -280,9 +281,18 @@ class Harness:
     clock: Clock
     settings: SyncSettings
     seen_blobs: set[str] = field(default_factory=set)
+    monotonic: Callable[[], float] = field(default_factory=lambda: time.monotonic)
+    """What the poll's time budget is measured with; a test may move it."""
 
     def sync(self) -> SyncOnce:
-        return SyncOnce(self.client, self.archive, self.index, self.settings, self.clock)
+        return SyncOnce(
+            self.client,
+            self.archive,
+            self.index,
+            self.settings,
+            self.clock,
+            monotonic=self.monotonic,
+        )
 
     def poll(self) -> SyncReport:
         try:

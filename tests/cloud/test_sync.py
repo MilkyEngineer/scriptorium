@@ -6,6 +6,8 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,7 +29,17 @@ from tests.cloud.fake_cloud import (
     fixture_documents,
     sha256,
 )
-from tests.cloud.scenarios import PAGE_101, PDF_PAGE, SCENARIOS, Clock, Harness, both, harness, nine
+from tests.cloud.scenarios import (
+    PAGE_101,
+    PDF_PAGE,
+    SCENARIOS,
+    Clock,
+    Harness,
+    both,
+    copy_of_pdf,
+    harness,
+    nine,
+)
 from tests.fakes.archive import FakeArchive, SimulatedCrash
 from tests.fakes.index import FakeIndex
 from tests.fakes.tombstones import plan as fake_plan
@@ -540,6 +552,184 @@ def test_rate_limit_mid_listing_stops_all_requests(tmp_path: Path) -> None:
     assert h.blob_names() == set()
 
 
+# ---- per-poll budgets --------------------------------------------------------------------
+
+EXTRA = PAGES[0]
+"""A third document, removed from the cloud by :func:`_deletion_due`."""
+NOTEBOOK_EDITS = (
+    (PAGE_101, b"synthetic page bytes: first edit"),
+    (f"{NOTEBOOK}/{PAGES[1]}.rm", b"synthetic page bytes: second edit"),
+)
+PDF_EDIT = (PDF_PAGE, b"synthetic page bytes: third edit")
+SECOND_EDIT = sha256(NOTEBOOK_EDITS[1][1])
+"""The notebook's last new blob: the one its commit waits for."""
+
+
+@dataclass
+class Monotonic:
+    now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _deletion_due(
+    tmp_path: Path, on_request: Callable[[str], None] | None = None
+) -> tuple[Harness, FakeCloud]:
+    """Three documents synced, then the third removed and seen gone in one complete listing,
+    so the next poll that runs to the end tombstones it. Then three new blobs in the cloud:
+    two for the notebook and one for the PDF."""
+    cloud = FakeCloud()
+    cloud.put_documents({**fixture_documents(), EXTRA: copy_of_pdf(EXTRA)})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if on_request is not None:
+            on_request(str(request.url))
+        return cloud.handler(request)
+
+    h = harness(httpx.MockTransport(handler), tmp_path)
+    assert h.poll().outcome == "ok"
+    cloud.remove_document(EXTRA)
+    gone_once = h.poll()
+    assert (gone_once.outcome, gone_once.tombstoned) == ("ok", ())
+    for name, data in (*NOTEBOOK_EDITS, PDF_EDIT):
+        cloud.set_file(NOTEBOOK if name.startswith(NOTEBOOK) else PDF, name, data)
+    return h, cloud
+
+
+def assert_edits_landed(h: Harness, *, pdf: bool) -> None:
+    for name, data in NOTEBOOK_EDITS:
+        assert h.library_files(NOTEBOOK)[name] == sha256(data)
+    pdf_page = h.library_files(PDF)[PDF_EDIT[0]]
+    assert (pdf_page == sha256(PDF_EDIT[1])) is pdf
+
+
+def test_byte_budget_stops_downloading_and_defers_tombstones(tmp_path: Path) -> None:
+    h, _cloud = _deletion_due(tmp_path)
+    h.settings = SyncSettings(sync_workers=1, sync_max_poll_bytes=1)
+
+    first = h.poll()
+
+    # One blob, then nothing new: the notebook is not complete, so nothing commits.
+    assert (first.outcome, first.reason) == ("partial", "byte_budget")
+    assert first.listing_complete and first.failed == {}
+    assert (first.blobs_downloaded, first.committed) == (1, ())
+    assert first.bytes_downloaded == len(NOTEBOOK_EDITS[0][1])
+    assert first.tombstoned == () and EXTRA in h.library_uuids()
+    assert h.state("last_root_hash") is None
+    assert sha256(NOTEBOOK_EDITS[0][1]) in h.blob_names()
+
+    second = h.poll()
+
+    # The notebook's other blob completes it; the PDF waits for the next poll.
+    assert (second.outcome, second.reason) == ("partial", "byte_budget")
+    assert (second.blobs_downloaded, second.committed) == (1, (NOTEBOOK,))
+    assert second.tombstoned == () and h.tombstoned_uuids() == set()
+    assert_edits_landed(h, pdf=False)
+
+    third = h.poll()
+
+    assert (third.outcome, third.committed, third.tombstoned) == ("ok", (PDF,), (EXTRA,))
+    assert_edits_landed(h, pdf=True)
+    assert h.tombstoned_uuids() == {EXTRA}
+    assert h.state("last_root_hash") is not None
+    assert_safe(h)
+
+
+def test_time_budget_commits_what_is_complete_and_defers_tombstones(tmp_path: Path) -> None:
+    clock = Monotonic()
+
+    def on_request(url: str) -> None:
+        if url.endswith(f"/{SECOND_EDIT}"):
+            clock.now += 21 * 60  # the download that took too long
+
+    h, _cloud = _deletion_due(tmp_path, on_request)
+    h.monotonic = clock
+
+    first = h.poll()
+
+    assert (first.outcome, first.reason) == ("partial", "time_budget")
+    assert first.committed == (NOTEBOOK,) and first.failed == {}
+    assert_edits_landed(h, pdf=False)
+    assert first.tombstoned == () and EXTRA in h.library_uuids()
+    assert h.state("last_root_hash") is None
+
+    second = h.poll()
+
+    assert (second.outcome, second.committed, second.tombstoned) == ("ok", (PDF,), (EXTRA,))
+    assert_edits_landed(h, pdf=True)
+    assert_safe(h)
+
+
+def test_time_budget_spent_while_listing_downloads_nothing(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    clock = Monotonic()
+    slow = {cloud.doc_hash(NOTEBOOK)}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).rsplit("/", 1)[-1] in slow:
+            slow.clear()
+            clock.now += 21 * 60
+        return cloud.handler(request)
+
+    h = harness(httpx.MockTransport(handler), tmp_path)
+    h.monotonic = clock
+
+    report = h.poll()
+
+    assert (report.outcome, report.reason) == ("partial", "time_budget")
+    assert not report.listing_complete and report.failed == {}
+    assert cloud.doc_hash(PDF) not in cloud.targets()
+    assert (report.blobs_downloaded, report.committed) == (0, ())
+    assert h.blob_names() == set()
+    assert h.state("last_full_listing_ok") == "false"
+
+    again = h.poll()
+
+    assert again.outcome == "ok" and sorted(again.committed) == [NOTEBOOK, PDF]
+    assert_safe(h)
+
+
+def test_byte_budget_with_parallel_downloads_still_converges(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    nine(cloud)
+    settings = SyncSettings(sync_workers=4, sync_max_poll_bytes=1)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path, settings=settings)
+
+    reports = [h.poll()]
+    while reports[-1].outcome != "ok" and len(reports) < 60:
+        reports.append(h.poll())
+
+    assert reports[-1].outcome == "ok"
+    for report in reports[:-1]:
+        assert (report.outcome, report.reason) == ("partial", "byte_budget")
+        assert report.blobs_downloaded >= 1  # every poll makes progress
+        assert report.tombstoned == ()
+    assert h.library_uuids() == {NOTEBOOK, PDF, *PAGES}
+    for uuid in (NOTEBOOK, PDF):
+        assert h.library_files(uuid) == expected_files(uuid)
+    assert_safe(h)
+
+
+def test_a_backoff_mid_commit_defers_tombstones_too(tmp_path: Path) -> None:
+    h, cloud = _deletion_due(tmp_path)
+    cloud.status[SECOND_EDIT] = 429
+
+    stopped = h.poll()
+
+    assert (stopped.outcome, stopped.reason) == ("backoff", "rate_limited")
+    assert stopped.listing_complete and stopped.tombstoned == ()
+    assert EXTRA in h.library_uuids()
+
+    del cloud.status[SECOND_EDIT]
+    resumed = h.poll()
+
+    assert resumed.outcome == "ok" and resumed.tombstoned == (EXTRA,)
+    assert_edits_landed(h, pdf=True)
+    assert_safe(h)
+
+
 # ---- crash safety ------------------------------------------------------------------------
 
 
@@ -816,6 +1006,16 @@ def test_settings_are_bounded() -> None:
         SyncSettings(sync_workers=0)
     with pytest.raises(ValueError):
         SyncSettings(tombstone_max_per_poll=-1)
+    with pytest.raises(ValueError):
+        SyncSettings(sync_max_poll_bytes=0)
+    with pytest.raises(ValueError):
+        SyncSettings(sync_max_poll_seconds=0)
+
+
+def test_poll_budgets_default_to_two_gib_and_twenty_minutes() -> None:
+    settings = SyncSettings()
+    assert settings.sync_max_poll_bytes == 2 * 1024**3
+    assert settings.sync_max_poll_seconds == 20 * 60
 
 
 def test_clock_is_injected(tmp_path: Path) -> None:
