@@ -8,18 +8,31 @@ worker records its view of the account in the account index's ``sync_state`` und
 :func:`poll_lock` is the one lock the worker and the server share about an account: the
 worker holds it for a whole poll (and for its start-up sweep), and
 ``disconnect_remarkable(keep_archive=false)`` holds it while it moves the account directory
-to ``removed/``, so a poll never runs against a directory that is being moved.
+to ``removed/`` (:func:`removal_destination`, :func:`move_aside`), so a poll never runs
+against a directory that is being moved.
 """
 
 from __future__ import annotations
 
 import os
+import stat
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import Final, Literal
 
-from scriptorium.users.store import ACCT_RE, AccountPaths
+from scriptorium.errors import RefusedError
+from scriptorium.library.layout import resolve_inside
+from scriptorium.users.store import (
+    ACCT_RE,
+    AccountPaths,
+    account_paths,
+    removed_account_path,
+    removed_dir,
+    user_dir,
+)
 
 if sys.platform != "win32":
     import fcntl
@@ -34,7 +47,9 @@ __all__ = [
     "STATE_TOKEN_REJECTIONS",
     "PollLock",
     "device_token_name",
+    "move_aside",
     "poll_lock",
+    "removal_destination",
 ]
 
 PollLock = Literal["held", "busy", "gone"]
@@ -92,5 +107,60 @@ def poll_lock(paths: AccountPaths, *, blocking: bool = True) -> Iterator[PollLoc
         except (FileNotFoundError, NotADirectoryError):
             same = False
         yield "held" if same else "gone"
+    finally:
+        os.close(fd)
+
+
+# ---- moving an account aside (disconnect_remarkable(keep_archive=false)) --------------------
+
+
+def removal_destination(data_dir: Path, uid: str, acct: str, *, at: datetime) -> Path:
+    """Where :func:`move_aside` puts the account: ``users/<uid>/removed/<acct>-<ts>``.
+
+    Creates ``removed/`` if needed and refuses (:class:`RefusedError`) unless the move can be
+    one rename: the account directory is a real directory (not a symlink) inside the user's
+    directory, the destination is inside ``removed/`` and does not exist yet, and both are
+    on the same filesystem (a rename across filesystems would copy, and is refused by the
+    kernel anyway). Nothing is moved or deleted here.
+    """
+    paths = account_paths(data_dir, uid, acct)
+    user = user_dir(data_dir, uid)
+    try:
+        info = os.lstat(paths.root)
+    except FileNotFoundError:
+        raise RefusedError("the account directory is not there") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise RefusedError("the account directory is not a directory")
+    resolve_inside(user, paths.root)
+    base = removed_dir(data_dir, uid)
+    base.mkdir(mode=0o700, exist_ok=True)
+    base = removed_dir(data_dir, uid)  # again: refuses a symlink planted meanwhile
+    destination = removed_account_path(data_dir, uid, acct, at)
+    if os.path.lexists(destination):
+        raise RefusedError("the destination already exists")
+    if os.lstat(base).st_dev != info.st_dev:
+        raise RefusedError("removed/ is on another filesystem")
+    return destination
+
+
+def move_aside(paths: AccountPaths, destination: Path) -> None:
+    """Rename the account directory to ``destination`` (from :func:`removal_destination`),
+    then fsync both parent directories. The only filesystem change Scriptorium makes to an
+    account outside its archive paths: one rename on one filesystem, nothing deleted. The
+    caller holds :func:`poll_lock`. Raises :class:`OSError` if the rename fails, in which case
+    nothing moved."""
+    if os.path.lexists(destination):
+        raise FileExistsError("the destination already exists")
+    os.rename(paths.root, destination)
+    for parent in (paths.root.parent, destination.parent):
+        _fsync_dir(parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    if sys.platform == "win32":  # directories cannot be opened for fsync there
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
     finally:
         os.close(fd)
