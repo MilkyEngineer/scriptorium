@@ -74,8 +74,8 @@ def test_open_without_migrate_checks_the_version(path: Path, clock: Clock) -> No
         JobQueue.open(path, migrate=False, clock=clock)
     JobQueue.open(path, migrate=True, clock=clock).close()
     JobQueue.open(path, migrate=False, clock=clock).close()
-    with pytest.raises(SchemaMismatch):
-        JobQueue.open(path, migrate=False, clock=clock, steps=(*JOBS_STEPS, *JOBS_STEPS))
+    with pytest.raises(SchemaMismatch):  # a sequence of another length is another schema
+        JobQueue.open(path, migrate=False, clock=clock, steps=JOBS_STEPS)
 
 
 # ---- enqueue and dedupe ---------------------------------------------------------------------

@@ -41,7 +41,7 @@ from typing import Any, Final, Self
 from scriptorium.db.connect import from_db_time, open_sqlite, opt_from_db_time, to_db_time, utc_now
 from scriptorium.db.migrations import SchemaMismatch, Step, check_version
 from scriptorium.db.migrations import migrate as run_migrations
-from scriptorium.db.schema_jobs import JOBS_STEPS
+from scriptorium.db.schema_global import SCRIPTORIUM_STEPS
 from scriptorium.errors import InvalidArgumentError, RefusedError
 
 STATES: Final = frozenset({"queued", "leased", "done", "failed", "dead", "cancelled"})
@@ -132,14 +132,14 @@ class JobQueue:
         *,
         migrate: bool,
         clock: Callable[[], datetime] = utc_now,
-        steps: Sequence[Step] = JOBS_STEPS,
+        steps: Sequence[Step] = SCRIPTORIUM_STEPS,
     ) -> JobQueue:
         """Open ``path`` (normally ``/data/scriptorium.sqlite``).
 
-        ``steps`` is the schema sequence of the whole file. ``scriptorium.sqlite`` also holds
-        users, accounts and audit, so the server passes the composed sequence for that file;
-        the default (jobs only) suits a database that holds nothing else, as in tests.
-        ``migrate=False`` raises :class:`SchemaMismatch` unless the version matches.
+        ``steps`` is the schema sequence of the whole file, by default the composed
+        ``scriptorium.sqlite`` sequence (users, accounts, audit and jobs: §6.2), so the file
+        is at the same version whichever store opens it first. ``migrate=False`` raises
+        :class:`SchemaMismatch` unless the version matches.
         """
         if not migrate and not path.is_file():
             raise SchemaMismatch(0, len(steps))

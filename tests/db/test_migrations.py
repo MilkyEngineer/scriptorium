@@ -17,6 +17,7 @@ from scriptorium.db.migrations import (
     split_statements,
 )
 from scriptorium.db.schema_account import ACCOUNT_STEPS
+from scriptorium.db.schema_global import GLOBAL_STEPS, SCRIPTORIUM_STEPS
 from scriptorium.db.schema_jobs import JOBS_STEPS
 from scriptorium.errors import ScriptoriumError
 from tests.db.sqlite_support import requires_fts5
@@ -216,6 +217,18 @@ def test_jobs_schema_from_each_prior_version(tmp_path: Path, start: int) -> None
     finally:
         fresh.close()
         stepped.close()
+
+
+def test_scriptorium_steps_create_every_global_table(conn: sqlite3.Connection) -> None:
+    """The composed sequence is what every opener of scriptorium.sqlite uses (§6.2)."""
+    assert SCRIPTORIUM_STEPS[: len(GLOBAL_STEPS)] == GLOBAL_STEPS
+    assert SCRIPTORIUM_STEPS[len(GLOBAL_STEPS) :] == JOBS_STEPS
+    assert migrate(conn, SCRIPTORIUM_STEPS) == len(SCRIPTORIUM_STEPS)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert {"users", "accounts", "audit", "jobs"} <= tables
+    check_version(conn, SCRIPTORIUM_STEPS)
+    with pytest.raises(SchemaMismatch):
+        check_version(conn, JOBS_STEPS)  # a part of the sequence is never a valid target
 
 
 def test_jobs_steps_compose_after_other_steps(conn: sqlite3.Connection) -> None:
