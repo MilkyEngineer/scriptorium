@@ -15,7 +15,7 @@ from scriptorium.db.connect import open_sqlite
 from scriptorium.db.migrations import SchemaMismatch, migrate
 from scriptorium.db.schema_account import ACCOUNT_STEPS
 from scriptorium.errors import InvalidArgumentError, NotFoundError
-from scriptorium.library.index import DocumentRow, Index, PageRow
+from scriptorium.library.index import DocumentHit, DocumentRow, Index, PageRow, SearchHit
 from tests.db.sqlite_support import requires_fts5
 
 pytestmark = requires_fts5
@@ -648,3 +648,75 @@ def test_threads_share_one_index(index: Index) -> None:
         t.join()
     assert errors == []
     assert len(all_children(index, None, 100)) == 60
+
+
+# ---- document_uuids and the name fallback of search ----------------------------------------
+
+
+def test_document_uuids_splits_on_tombstones(index: Index) -> None:
+    assert index.document_uuids(deleted=False) == frozenset()
+    index.upsert_document(folder(1, "F"))
+    index.upsert_document(doc(2, "A", parent=uid(1)))
+    index.upsert_document(doc(3, "Trashed", parent="trash"))
+    index.upsert_document(doc(4, "Gone"))
+    index.mark_deleted(uid(4), "unknown", T0)
+    assert index.document_uuids(deleted=False) == {uid(1), uid(2), uid(3)}
+    assert index.document_uuids(deleted=True) == {uid(4)}
+    index.unmark_deleted(uid(4))
+    assert index.document_uuids(deleted=True) == frozenset()
+
+
+def test_search_falls_back_to_names_of_untranscribed_documents(index: Index) -> None:
+    index.upsert_document(folder(1, "Budget folder"))
+    index.upsert_document(doc(2, "Transcribed budget", parent=uid(1)))
+    index.upsert_document(doc(3, "Budget 2026", parent=uid(1)))
+    index.upsert_document(doc(4, "Über BUDGET plans"))
+    index.upsert_document(doc(5, "Unrelated"))
+    index.upsert_document(doc(6, "Old budget"))
+    index.mark_deleted(uid(6), "unknown", T0)
+    index.replace_pages(uid(2), [PageRow(uid(200), uid(2), 0, "h")])
+    index.put_transcript(uid(200), "h", "the budget review", "m", "lazy")
+
+    items = index.search("budget", cursor=None, limit=10).items
+    # Page hits first, then name hits sorted by name; folders, transcribed and tombstoned
+    # documents never come back as name hits.
+    assert isinstance(items[0], SearchHit) and items[0].page_id == uid(200)
+    names = [i for i in items[1:] if isinstance(i, DocumentHit)]
+    assert len(names) == len(items) - 1
+    assert [(h.document, h.doc_name, h.doc_path) for h in names] == [
+        (uid(3), "Budget 2026", "Budget folder"),
+        (uid(4), "Über BUDGET plans", ""),
+    ]
+    # Case-insensitive beyond ASCII, and every term must be in the name.
+    (hit,) = index.search("über plans", cursor=None, limit=10).items
+    assert isinstance(hit, DocumentHit) and hit.document == uid(4)
+    assert index.search("budget unrelated", cursor=None, limit=10).items == []
+
+
+def test_search_name_hits_paginate_after_page_hits(index: Index) -> None:
+    index.upsert_document(doc(1, "A"))
+    index.replace_pages(uid(1), [pr(n, n, f"h{n}") for n in range(3)])
+    for n in range(3):
+        index.put_transcript(uid(100 + n), f"h{n}", "common " + "word " * n, "m", "lazy")
+    for n in range(10, 15):
+        index.upsert_document(doc(n, f"common {n}"))
+    for limit in (1, 2, 3, 4, 8):
+        seen: list[str] = []
+        cursor = None
+        while True:
+            page = index.search("common", cursor=cursor, limit=limit)
+            assert len(page.items) <= limit
+            for item in page.items:
+                seen.append(item.page_id if isinstance(item, SearchHit) else item.document)
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+        assert set(seen[:3]) == {uid(100 + n) for n in range(3)}
+        assert seen[3:] == [uid(n) for n in range(10, 15)], limit
+
+
+def test_search_refuses_bad_cursors_and_too_many_terms(index: Index) -> None:
+    with pytest.raises(InvalidArgumentError):
+        index.search("x", cursor="garbage", limit=5)
+    with pytest.raises(InvalidArgumentError):
+        index.search(" ".join(["w"] * 65), cursor=None, limit=5)

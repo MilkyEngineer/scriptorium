@@ -54,6 +54,8 @@ DELETION_CAUSES: Final = frozenset({"user", "aged", "unknown"})
 TRANSCRIPT_MODES: Final = frozenset({"user", "server", "lazy"})
 TRASH: Final = "trash"
 MAX_LIMIT: Final = 1000
+MAX_SEARCH_TERMS: Final = 64
+"""Whitespace-separated terms a search may have (each is one clause of the name fallback)."""
 MAX_PATH_DEPTH: Final = 128
 """Parent chains come from cloud metadata; walks stop here (and on cycles)."""
 _RESOLVE_ANY: Final = (
@@ -151,6 +153,19 @@ class SearchHit:
 
 
 @dataclass(frozen=True, slots=True)
+class DocumentHit:
+    """A document with no transcript whose name contains every search term (§11.2).
+
+    Name hits follow the transcript hits: only transcribed pages are in the full-text index,
+    so this is how an untranscribed document is found at all.
+    """
+
+    document: str
+    doc_name: str
+    doc_path: str
+
+
+@dataclass(frozen=True, slots=True)
 class Page[T]:
     items: list[T]
     next_cursor: str | None
@@ -189,12 +204,26 @@ def _check_limit(limit: int) -> None:
         raise InvalidArgumentError(f"limit must be between 1 and {MAX_LIMIT}.")
 
 
-def _fts_query(query: str) -> str:
-    """Every whitespace-separated term as a quoted FTS5 string: no operators, no syntax errors."""
+def _search_terms(query: str) -> list[str]:
     terms = query.split()
     if not terms:
         raise InvalidArgumentError("The search query is empty.")
+    if len(terms) > MAX_SEARCH_TERMS:
+        raise InvalidArgumentError(f"A search takes at most {MAX_SEARCH_TERMS} words.")
+    return terms
+
+
+def _fts_query(terms: Sequence[str]) -> str:
+    """Every term as a quoted FTS5 string: no operators, no syntax errors."""
     return " ".join('"' + term.replace('"', '""') + '"' for term in terms)
+
+
+def _fold(value: object) -> str | None:
+    """Case-insensitive form for the name fallback (``str.casefold``: Unicode, not just ASCII).
+
+    Registered on the connection as the SQL function ``scriptorium_fold``.
+    """
+    return value.casefold() if isinstance(value, str) else None
 
 
 def _norm_parent(parent: str | None) -> str | None:
@@ -243,6 +272,7 @@ class Index:
     def __init__(self, conn: sqlite3.Connection, *, clock: Callable[[], datetime] = utc_now):
         self._conn = conn
         self._clock = clock
+        conn.create_function("scriptorium_fold", 1, _fold, deterministic=True)
         self._lock = threading.RLock()
         self._depth = 0
 
@@ -389,6 +419,18 @@ class Index:
         with self._lock:
             row = self._conn.execute("SELECT * FROM documents WHERE uuid = ?", (uuid,)).fetchone()
         return None if row is None else _document(row)
+
+    def document_uuids(self, *, deleted: bool) -> frozenset[str]:
+        """Every document and folder UUID: tombstoned ones with ``deleted=True``, the rest
+        (the trash included) with ``deleted=False``. These are the tombstone planner's
+        ``library`` and ``tombstoned`` sets (§7 step 4)."""
+        sql = (
+            "SELECT uuid FROM documents WHERE deleted_at IS NOT NULL"
+            if deleted
+            else "SELECT uuid FROM documents WHERE deleted_at IS NULL"
+        )
+        with self._lock:
+            return frozenset(row["uuid"] for row in self._conn.execute(sql))
 
     def children(
         self,
@@ -702,48 +744,93 @@ class Index:
             cost_usd=r["cost_usd"],
         )
 
-    def search(self, query: str, *, cursor: str | None, limit: int) -> Page[SearchHit]:
-        """Full-text search over transcripts, document names and folder paths.
+    def search(
+        self, query: str, *, cursor: str | None, limit: int
+    ) -> Page[SearchHit | DocumentHit]:
+        """Full-text search over transcripts, document names and folder paths, then names.
 
-        Every whitespace-separated term must match (FTS5 operators are not interpreted). Sorted
-        by bm25 rank, then transcript id; the cursor carries the last ``(rank, id)``, so a page
-        boundary is exact for an unchanged index (ranks shift when transcripts are added).
+        Every whitespace-separated term must match (FTS5 operators are not interpreted). The
+        transcript hits come first, sorted by bm25 rank, then transcript id; the cursor carries
+        the last ``(rank, id)``, so a page boundary is exact for an unchanged index (ranks
+        shift when transcripts are added). After them come :class:`DocumentHit` rows: live
+        documents with no transcript at all whose name contains every term, compared
+        case-insensitively (§11.2), sorted by name and UUID.
         """
         _check_limit(limit)
-        where = "transcripts_fts MATCH ?"
-        params: list[Any] = [_fts_query(query)]
+        terms = _search_terms(query)
+        name_key: list[Any] | None = None
+        fts_key: list[Any] | None = None
         if cursor is not None:
-            rank, last_id = _decode_cursor(cursor, "search", (float, int))
+            try:
+                fts_key = _decode_cursor(cursor, "search", (float, int))
+            except InvalidArgumentError:
+                name_key = _decode_cursor(cursor, "search-name", (str, str))
+        items: list[SearchHit | DocumentHit] = []
+        if name_key is None:
+            rows = self._search_fts(terms, fts_key, limit + 1)
+            items.extend(_search_hit(r) for r in rows[:limit])
+            if len(rows) > limit:
+                last = rows[limit - 1]
+                key = (float(last["rank"]), int(last["id"]))
+                return Page(items, _encode_cursor("search", key))
+        room = limit - len(items)
+        names = self._search_names(terms, name_key, room + 1)
+        hits = names[:room]
+        with self._lock:
+            for uuid, name in hits:
+                _, path = self._name_and_path(uuid)
+                items.append(DocumentHit(document=uuid, doc_name=name, doc_path=path))
+        next_cursor = None
+        if len(names) > room:
+            # The name phase's sort key is (name, uuid); "" sorts before every name.
+            after = (hits[-1][1], hits[-1][0]) if hits else ("", "")
+            next_cursor = _encode_cursor("search-name", after)
+        return Page(items, next_cursor)
+
+    def _search_fts(
+        self, terms: Sequence[str], after: Sequence[Any] | None, limit: int
+    ) -> list[sqlite3.Row]:
+        where = "transcripts_fts MATCH ?"
+        params: list[Any] = [_fts_query(terms)]
+        if after is not None:
+            rank, last_id = after
             where += " AND (transcripts_fts.rank > ? OR (transcripts_fts.rank = ? AND t.id > ?))"
             params.extend((rank, rank, last_id))
         with self._lock:
-            rows = self._conn.execute(
+            rows: list[sqlite3.Row] = self._conn.execute(
                 "SELECT t.id, t.page, t.content_hash, t.document, t.doc_name, t.doc_path, "  # noqa: S608
                 "p.idx AS idx, p.content_hash AS current_hash, transcripts_fts.rank AS rank, "
                 "snippet(transcripts_fts, 0, '', '', '…', 16) AS snippet "
                 "FROM transcripts_fts JOIN transcripts t ON t.id = transcripts_fts.rowid "
                 "LEFT JOIN pages p ON p.uuid = t.page "
                 f"WHERE {where} ORDER BY transcripts_fts.rank, t.id LIMIT ?",  # fixed clauses
-                (*params, limit + 1),
+                (*params, limit),
             ).fetchall()
-        items = [
-            SearchHit(
-                page_id=r["page"],
-                document=r["document"],
-                idx=r["idx"],
-                content_hash=r["content_hash"],
-                current=r["current_hash"] == r["content_hash"],
-                doc_name=r["doc_name"],
-                doc_path=r["doc_path"],
-                snippet=r["snippet"],
-            )
-            for r in rows[:limit]
+        return rows
+
+    def _search_names(
+        self, terms: Sequence[str], after: Sequence[Any] | None, limit: int
+    ) -> list[tuple[str, str]]:
+        """``(uuid, name)`` of untranscribed live documents whose name holds every term."""
+        where = [
+            "d.type = 'DocumentType'",
+            "d.deleted_at IS NULL",
+            "NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.document = d.uuid)",
         ]
-        next_cursor = None
-        if len(rows) > limit:
-            last = rows[limit - 1]
-            next_cursor = _encode_cursor("search", (float(last["rank"]), int(last["id"])))
-        return Page(items, next_cursor)
+        params: list[Any] = []
+        for term in terms:
+            where.append("instr(scriptorium_fold(d.name), ?) > 0")
+            params.append(_fold(term))
+        if after is not None:
+            where.append("(d.name COLLATE NOCASE, d.uuid) > (?, ?)")
+            params.extend(after)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT d.uuid, d.name FROM documents d WHERE {' AND '.join(where)} "  # noqa: S608
+                "ORDER BY d.name COLLATE NOCASE, d.uuid LIMIT ?",  # fixed clauses, values bound
+                (*params, limit),
+            ).fetchall()
+        return [(r["uuid"], r["name"]) for r in rows]
 
     # ---- sync state -----------------------------------------------------------------------
 
@@ -809,6 +896,19 @@ class Index:
                 "WHERE document = ? AND (doc_name != ? OR doc_path != ?)",
                 (name, path, row["document"], name, path),
             )
+
+
+def _search_hit(r: sqlite3.Row) -> SearchHit:
+    return SearchHit(
+        page_id=r["page"],
+        document=r["document"],
+        idx=r["idx"],
+        content_hash=r["content_hash"],
+        current=r["current_hash"] == r["content_hash"],
+        doc_name=r["doc_name"],
+        doc_path=r["doc_path"],
+        snippet=r["snippet"],
+    )
 
 
 def _migrate_account(conn: sqlite3.Connection) -> None:
