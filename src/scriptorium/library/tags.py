@@ -7,8 +7,12 @@ before anything else sees them:
 
 - a name must be a string; it is NFC-normalised and stripped of surrounding whitespace;
 - a name holding a control character (Unicode ``Cc``), a surrogate, a line or paragraph
-  separator, or a bidirectional embedding, override or isolate is rejected, as is a name
-  that is empty after stripping;
+  separator, or a bidirectional embedding, override or isolate is rejected;
+- every other invisible format character (Unicode ``Cf``: zero-width space, byte order mark,
+  direction marks, soft hyphen, word joiner, tag characters…) is removed, so it cannot make
+  a phantom tag that looks like a real one, except the zero-width joiner and non-joiner and
+  the variation selectors U+FE00 to U+FE0F that emoji sequences and some scripts need; the name
+  is then NFC-normalised and stripped again, and a name left empty is rejected;
 - a name longer than :data:`MAX_TAG_LEN` characters is truncated to it (and stripped again);
 - a page tag whose ``pageId`` is not a page of the document (a UUID listed in ``cPages`` and
   not deleted, or in the format 1 ``pages`` list) is dropped;
@@ -45,6 +49,9 @@ _MAX_SCAN: Final = 100_000
 """Entries of ``tags``/``pageTags``/``cPages`` looked at; the JSON itself is size-capped."""
 _REJECTED_CATEGORIES: Final = frozenset({"Cc", "Cs", "Zl", "Zp"})
 _BIDI_CONTROLS: Final = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+_KEPT_FORMAT: Final = frozenset("\u200c\u200d") | frozenset(map(chr, range(0xFE00, 0xFE10)))
+"""Format characters kept in a name: ZWNJ and ZWJ, and the variation selectors (the last
+are ``Mn``, not ``Cf``, in current Unicode; listed so a change of category keeps them)."""
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,11 @@ class TagSet:
         return len(self.document) + sum(len(names) for names in self.pages.values())
 
 
+def _invisible(ch: str) -> bool:
+    """A format character (``Cf``) that is removed from a name: all but :data:`_KEPT_FORMAT`."""
+    return unicodedata.category(ch) == "Cf" and ch not in _KEPT_FORMAT
+
+
 def normalise_tag(value: object) -> str | None:
     """``value`` as a stored tag name (see the module docstring), or ``None`` if rejected."""
     if not isinstance(value, str):
@@ -81,6 +93,10 @@ def normalise_tag(value: object) -> str | None:
     name = unicodedata.normalize("NFC", value).strip()
     if any(unicodedata.category(ch) in _REJECTED_CATEGORIES or ch in _BIDI_CONTROLS for ch in name):
         return None
+    if any(_invisible(ch) for ch in name):
+        # Removing one can bring a base and its combining mark together: normalise again.
+        kept = "".join(ch for ch in name if not _invisible(ch))
+        name = unicodedata.normalize("NFC", kept).strip()
     if len(name) > MAX_TAG_LEN:
         name = name[:MAX_TAG_LEN].rstrip()
     return name or None

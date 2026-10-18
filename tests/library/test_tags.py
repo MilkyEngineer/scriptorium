@@ -6,6 +6,7 @@ Tag names here are synthetic; the S3 fixture notebook supplies the page ids and 
 from __future__ import annotations
 
 import json
+import random
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,62 @@ def test_emoji_sequences_and_other_scripts_are_kept() -> None:
     family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"  # joined with ZWJ (category Cf)
     tags = parse_tags({"tags": [{"name": family}, {"name": "\u4e2d\u6587"}, {"name": "x-y_z"}]})
     assert tags.document == {family, "\u4e2d\u6587", "x-y_z"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "stored"),
+    [
+        ("work\u200b", "work"),  # zero-width space
+        ("\ufeffwork", "work"),  # byte order mark
+        ("wo\u200erk\u200f", "work"),  # left-to-right and right-to-left marks
+        ("\u061cwork", "work"),  # Arabic letter mark
+        ("wo\u00adrk", "work"),  # soft hyphen
+        ("wo\u2060rk", "work"),  # word joiner
+        ("work\U000e0041\U000e007f", "work"),  # tag characters
+        ("\u200b work \u200b", "work"),  # stripped again once the invisibles are gone
+        ("e\u00ad\u0301", "\u00e9"),  # recomposed once the soft hyphen is gone
+        ("\U0001f3f3\ufe0f\u200d\U0001f308", "\U0001f3f3\ufe0f\u200d\U0001f308"),  # VS16, ZWJ
+        ("\u0645\u200c\u06cc", "\u0645\u200c\u06cc"),  # ZWNJ in Persian
+    ],
+)
+def test_invisible_format_characters_are_removed(raw: str, stored: str) -> None:
+    assert normalise_tag(raw) == stored
+    assert parse_tags({"tags": [{"name": raw}]}).document == {stored}
+
+
+@pytest.mark.parametrize("raw", ["\u200b", "\ufeff\u2060", " \u200b\u00ad ", "\U000e0041"])
+def test_a_name_of_invisible_characters_only_is_rejected(raw: str) -> None:
+    assert normalise_tag(raw) is None
+    assert parse_tags({"tags": [{"name": raw}]}).skipped == 1
+
+
+def test_invisible_variants_do_not_push_real_tags_out() -> None:
+    """A hundred zero-width variants of one name are one tag, not a hundred."""
+    phantoms = [{"name": "work" + "\u200b" * n} for n in range(100)]
+    page = [{"name": "harbour", "pageId": P[0]}]
+    tags = parse_tags({"tags": phantoms, "pageTags": page, "cPages": {"pages": [{"id": P[0]}]}})
+    assert tags.document == {"work"}
+    assert tags.pages == {P[0]: {"harbour"}}
+
+
+def test_normalise_tag_is_idempotent() -> None:
+    """Over the characters that interact: combining marks, Hangul jamo, joiners, invisibles,
+    spaces, and names cut at the length bound mid-sequence."""
+    parts = [
+        "a", "e", "\u0301", "\u0327", "\u0323", "\u0308", "\u1100", "\u1161", "\u11a8",
+        "\u0e01", "\u0e31", "\u200d", "\u200c", "\ufe0f", "\U0001f468", " ", "\u00a0",
+        "\u3000", "\u0f71", "\u0f72", "\u0344", "\u1e0a", "\u05d0", "\u05b8", "\u05bc",
+        "\u0915", "\u093c", "\U0001d157", "\U0001d165", "\u212b", "\u2126", "\u0130",
+        "\u200b", "\u00ad", "\ufeff", "\u2060", "\u200e", "\U000e0041",
+    ]  # fmt: skip
+    rng = random.Random(7)
+    samples = ["x" * 63 + "a\u0301\u0327", "x" * 63 + "\u00ad\u0301", "x" * 62 + "\u200b" * 5]
+    samples += ["".join(rng.choices(parts, k=rng.randint(1, 80))) for _ in range(5000)]
+    for raw in samples:
+        once = normalise_tag(raw)
+        if once is not None:
+            assert normalise_tag(once) == once, ascii(raw)
+            assert unicodedata.normalize("NFC", once) == once
 
 
 def test_long_names_are_truncated_not_dropped() -> None:
