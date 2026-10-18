@@ -14,8 +14,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from scriptorium.cloud.scope import dump_scope, make_scope, scope_fingerprint
-from scriptorium.cloud.sync import SyncSettings
+from scriptorium.cloud.scope import (
+    MAX_TAGS_PER_DOCUMENT,
+    dump_scope,
+    make_scope,
+    scope_fingerprint,
+)
+from scriptorium.cloud.sync import SyncSettings, _load_seen
 from tests.cloud.fake_cloud import NOTEBOOK, PAGES, PDF, FakeCloud, fixture_documents, sha256
 from tests.cloud.scenarios import Harness, both, copy_of_pdf, harness
 
@@ -286,7 +291,7 @@ def test_a_budget_stop_in_the_scope_pass_applies_nothing(tmp_path: Path) -> None
 
     assert (report.outcome, report.reason) == ("partial", "byte_budget")
     assert report.committed == ()
-    assert h.state("scope_applied") is None
+    assert h.state("scope_applied") == "pending"
     assert h.state("last_root_hash") is None
 
 
@@ -332,3 +337,168 @@ def test_a_damaged_document_is_committed_again(
     assert second.committed == (PDF,)
     pdf = h.index.document(PDF)
     assert pdf is not None and pdf.hash_root == cloud.doc_hash(PDF)
+
+
+# ---- failing closed: never inside the scope on missing information ----------------------------
+
+
+@pytest.mark.parametrize("mode", ["deny", "allow"])
+@pytest.mark.parametrize(
+    "content",
+    [b"{not json", b"[]", b'{"tags": "private"}', b'{"tags": ["private"]}', b'{"tags": [{}]}'],
+    ids=["unparseable", "not-an-object", "not-a-list", "bare-entry", "no-name"],
+)
+def test_unreadable_tags_leave_a_document_undecided(
+    tmp_path: Path, mode: str, content: bytes
+) -> None:
+    cloud, h = setup(tmp_path, {A: doc(A), B: doc(B, "work")})
+    cloud.set_file(A, f"{A}.content", content)
+    set_scope(h, mode, "private" if mode == "deny" else "work")
+
+    report = h.poll()
+
+    assert report.outcome == "partial"
+    assert report.failed == {A: "scope_tags_unknown"}
+    assert report.committed == (B,)
+    assert h.index.document(A) is None  # no row: nothing was decided about it
+    assert sha256(cloud.docs[A][f"{A}/{A}.rm"]) not in cloud.targets()
+    assert h.state("last_root_hash") is None  # the next poll looks again
+
+
+def test_an_archived_document_whose_new_tags_are_unreadable_is_left_as_it_was(
+    tmp_path: Path,
+) -> None:
+    cloud, h = setup(tmp_path, {A: doc(A), B: doc(B)})
+    set_scope(h, "deny", "private")
+    h.poll()
+    before = h.index.document(A)
+    files_before = h.library_files(A)
+    cloud.set_file(A, f"{A}.content", b"{not json")
+    cloud.set_file(A, f"{A}/{A}.rm", UNUSED_PAGE)
+
+    report = h.poll()
+
+    assert report.failed == {A: "scope_tags_unknown"} and report.committed == ()
+    assert h.index.document(A) == before
+    assert h.library_files(A) == files_before
+    assert sha256(UNUSED_PAGE) not in cloud.targets()
+
+
+def test_a_denied_tag_beyond_the_display_cut_still_excludes(tmp_path: Path) -> None:
+    # The index keeps the first 100 tags in sort order for display; the scope reads them all.
+    many = [f"a{i:03}" for i in range(150)]
+    cloud, h = setup(tmp_path, {A: doc(A, *many, "zz-private"), B: doc(B)})
+    set_scope(h, "deny", "zz-private")
+
+    report = h.poll()
+
+    assert report.outcome == "ok" and report.committed == (B,)
+    assert excluded_at(h, A) is not None
+    assert sha256(cloud.docs[A][f"{A}/{A}.rm"]) not in cloud.targets()
+    # Too many tags to remember: looked at again on the next poll rather than trusted.
+    assert A not in json.loads(h.state("scope_excluded") or "{}")
+
+
+def test_a_folder_with_unreadable_tags_keeps_what_is_below_it_undecided(tmp_path: Path) -> None:
+    cloud, h = setup(
+        tmp_path,
+        {
+            F: folder(F),
+            C: doc(C, parent=F),
+            E: doc(E, "private", parent=F),  # its own tag settles it
+            D: doc(D),
+        },
+    )
+    cloud.set_file(F, f"{F}.content", b"{not json")
+    set_scope(h, "deny", "private")
+
+    first = h.poll()
+
+    assert first.failed == {C: "scope_ancestor_unknown"}
+    assert sorted(first.committed) == sorted([F, D])  # the folder itself is still mirrored
+    assert h.index.document(C) is None
+    assert excluded_at(h, E) is not None
+    for uuid in (C, E):
+        assert sha256(cloud.docs[uuid][f"{uuid}/{uuid}.rm"]) not in cloud.targets()
+
+    # The archived folder has the same unreadable .content: still undecided.
+    again = h.poll()
+    assert again.failed == {C: "scope_ancestor_unknown"} and again.committed == ()
+
+    cloud.set_file(F, f"{F}.content", json.dumps({"tags": []}).encode())
+    fixed = h.poll()
+    assert fixed.outcome == "ok"
+    assert sorted(fixed.committed) == sorted([F, C])
+
+
+@pytest.mark.parametrize("broken", ["index", "content"])
+def test_a_changed_folder_not_read_this_poll_is_unknown(tmp_path: Path, broken: str) -> None:
+    cloud, h = setup(tmp_path, {F: folder(F), C: doc(C, parent=F)})
+    set_scope(h, "deny", "private")
+    h.poll()
+    before = h.index.document(C)
+    assert before is not None and before.excluded_at is None
+
+    # On the tablet the folder is tagged and the document below it changes; the folder's
+    # new version cannot be read this poll. Its archived (untagged) version must not count.
+    tagged = json.dumps({"tags": [{"name": "private", "timestamp": 2}]}).encode()
+    cloud.set_file(F, f"{F}.content", tagged)
+    cloud.set_file(C, f"{C}/{C}.rm", UNUSED_PAGE)
+    target = cloud.doc_hash(F) if broken == "index" else sha256(tagged)
+    cloud.status[target] = 404
+
+    report = h.poll()
+
+    assert F in report.failed
+    assert report.failed[C] == "scope_ancestor_unknown"
+    assert report.committed == ()
+    assert sha256(UNUSED_PAGE) not in cloud.targets()
+    assert h.index.document(C) == before
+
+    del cloud.status[target]
+    later = h.poll()
+
+    assert later.committed == (F,)
+    assert excluded_at(h, C) is not None
+    assert sha256(UNUSED_PAGE) not in cloud.targets()
+
+
+def test_a_remembered_entry_with_a_bad_tag_is_dropped_whole() -> None:
+    good = "a" * 64
+    stored = {
+        A: [good, ["x", "y"]],
+        B: [good, ["x", " not normalised"]],  # dropping only the bad tag could let B in
+        C: [good, [f"t{i:03}" for i in range(MAX_TAGS_PER_DOCUMENT + 1)]],
+        D: [good, ["x", 3]],
+    }
+    assert set(_load_seen(json.dumps(stored))) == {A}
+
+
+def test_an_interrupted_scope_change_is_redone_whole(tmp_path: Path) -> None:
+    cloud, h = setup(tmp_path, {A: doc(A, "y"), B: doc(B, "x"), C: doc(C)})
+    set_scope(h, "deny", "x")
+    h.poll()
+    applied = h.state("scope_applied")
+    assert applied == scope_fingerprint(make_scope("deny", ["x"]))
+    assert excluded_at(h, A) is None and excluded_at(h, B) is not None
+
+    # A change of scope that a poll applies only in part (C cannot be decided).
+    set_scope(h, "deny", "y")
+    cloud.set_file(C, f"{C}.content", b"{not json")
+    partial = h.poll()
+    assert partial.outcome == "partial" and partial.failed == {C: "scope_tags_unknown"}
+    assert excluded_at(h, A) is not None and excluded_at(h, B) is None
+    assert h.state("scope_applied") == "pending"
+
+    # Back to the scope the last full poll applied: every document is decided again, not
+    # only the changed ones, so A does not stay out on the interrupted poll's decision.
+    set_scope(h, "deny", "x")
+    back = h.poll()
+    assert excluded_at(h, A) is None and excluded_at(h, B) is not None
+    assert back.failed == {C: "scope_tags_unknown"}
+    assert h.state("scope_applied") == "pending"
+
+    cloud.set_file(C, f"{C}.content", json.dumps({"tags": []}).encode())
+    done = h.poll()
+    assert done.outcome == "ok" and done.committed == (C,)
+    assert h.state("scope_applied") == applied

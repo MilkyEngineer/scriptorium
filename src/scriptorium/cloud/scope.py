@@ -7,10 +7,17 @@ its ``.metadata``; nothing else of it is downloaded. Folders are always mirrored
 metadata only and hold the tree together); their tags apply to everything below them.
 
 Tag names come from the cloud (a document's ``.content``) and from the user (the tool's
-arguments). Both pass :func:`normalise_tag` (NFC, stripped, control characters refused,
-truncated to :data:`MAX_TAG_LEN`) and are then compared exactly. They are display strings:
-they are stored in the account index and returned by tools, and never logged or joined into
-a path.
+arguments). Both pass :func:`scriptorium.library.tags.normalise_tag`, the normalisation the
+tag index uses (NFC, stripped, control characters refused, truncated to :data:`MAX_TAG_LEN`),
+and are then compared exactly. They are display strings: they are stored in the account index
+and returned by tools, and never logged or joined into a path.
+
+The decision fails closed: a document is never found inside a scope on missing information.
+:func:`scope_tags` reads every entry of a document's tag list (no cut at
+:data:`MAX_TAGS_PER_DOCUMENT`, which the index applies for display) and answers None when the
+list cannot be read whole; :func:`ancestor_tags` reports whether every folder above was known;
+:func:`decide` answers None when the known tags do not settle the question. The caller then
+leaves the document as it was for this poll.
 
 The scope is stored as JSON in the account's ``settings`` table under ``sync_scope``:
 ``{"mode": "allow", "tags": ["a", "b"]}`` (tags sorted). Only ``set_sync_scope`` writes it.
@@ -20,24 +27,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Literal, Protocol, cast, get_args
 
+from scriptorium.library.tags import MAX_TAG_LEN, MAX_TAGS_PER_DOCUMENT, normalise_tag
+
 SETTING_SYNC_SCOPE: Final = "sync_scope"
-MAX_TAG_LEN: Final = 64
-MAX_TAGS_PER_DOCUMENT: Final = 100
 MAX_SCOPE_TAGS: Final = 100
+MAX_TAG_SCAN: Final = 100_000
+"""Entries of a ``tags`` list read for the scope; a longer list makes the tags unknown."""
 MAX_ANCESTOR_DEPTH: Final = 128
-"""Folders walked above a document; deeper (or a cycle in the cloud's parents) stops there."""
+"""Folders walked above a document; a deeper chain makes its folder tags unknown."""
 MAX_SETTING_CHARS: Final = 64 * 1024
 TRASH: Final = "trash"
 
 ScopeMode = Literal["all", "allow", "deny"]
 MODES: Final[tuple[str, ...]] = get_args(ScopeMode)
-
-_BIDI_CONTROLS: Final = frozenset("‎‏‪‫‬‭‮⁦⁧⁨⁩")
 
 
 class ScopeError(ValueError):
@@ -73,39 +79,29 @@ class SyncScope:
 ALL: Final = SyncScope("all", frozenset())
 
 
-def normalise_tag(raw: object) -> str | None:
-    """A tag name as it is stored and compared, or None if it is not one.
+def scope_tags(content: Mapping[str, Any] | None) -> frozenset[str] | None:
+    """Every document-level tag name in a parsed ``.content``, or None if they are unknown.
 
-    NFC, then stripped; a name with a control character (C0/C1, a lone surrogate, a
-    bidirectional override or isolate) or nothing left is refused; a longer one is cut to
-    :data:`MAX_TAG_LEN` characters (and stripped again).
+    ``content`` is None when the file was listed but could not be read (fetch failed, too
+    large, not a JSON object): unknown. A ``.content`` without a ``tags`` key has no tags.
+    ``tags`` that is not a list, or longer than :data:`MAX_TAG_SCAN`, or with an entry that
+    is not an object with a string ``name``, is unknown. A string name that normalises to
+    nothing is ignored: no scope tag can equal it. Page tags (``pageTags``) do not decide
+    the scope.
     """
-    if not isinstance(raw, str):
+    if content is None:
         return None
-    name = unicodedata.normalize("NFC", raw).strip()
-    if not name or any(
-        unicodedata.category(ch) in ("Cc", "Cs") or ch in _BIDI_CONTROLS for ch in name
-    ):
+    raw = content.get("tags", [])
+    if not isinstance(raw, list) or len(raw) > MAX_TAG_SCAN:
         return None
-    name = name[:MAX_TAG_LEN].rstrip()
-    return name or None
-
-
-def document_tags(content: Mapping[str, Any]) -> frozenset[str]:
-    """The document-level tag names in a parsed ``.content`` (``"tags": [{"name": …}]``).
-
-    Page tags (``pageTags``) do not decide the scope. Unusable entries are skipped; beyond
-    :data:`MAX_TAGS_PER_DOCUMENT` names, the first ones in sort order are kept.
-    """
-    raw = content.get("tags")
-    if not isinstance(raw, list):
-        return frozenset()
     names: set[str] = set()
-    for item in raw[: MAX_TAGS_PER_DOCUMENT * 10]:
-        name = normalise_tag(item.get("name")) if isinstance(item, dict) else None
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            return None
+        name = normalise_tag(item["name"])
         if name is not None:
             names.add(name)
-    return frozenset(sorted(names)[:MAX_TAGS_PER_DOCUMENT])
+    return frozenset(names)
 
 
 def make_scope(mode: str, tags: Iterable[object]) -> SyncScope:
@@ -162,53 +158,96 @@ def scope_fingerprint(scope: SyncScope) -> str:
     return hashlib.sha256(dump_scope(scope).encode()).hexdigest()
 
 
-def in_scope(scope: SyncScope, doc_tags: frozenset[str], ancestor_tags: frozenset[str]) -> bool:
-    """Whether a document with these tags, below folders with ``ancestor_tags``, is mirrored."""
-    if scope.mode == "all":
-        return True
-    hit = not scope.tags.isdisjoint(doc_tags) or not scope.tags.isdisjoint(ancestor_tags)
-    return hit if scope.mode == "allow" else not hit
+@dataclass(frozen=True)
+class Known:
+    """What one poll knows of a folder above a document: its tags (None if unknown) and its
+    parent (``parent_known`` False if its ``.metadata`` could not be read)."""
+
+    tags: frozenset[str] | None
+    parent: str | None
+    parent_known: bool = True
+
+
+NOT_A_FOLDER: Final = Known(frozenset(), None)
+"""A parent the cloud does not list: no tags, and nothing above it."""
 
 
 def ancestor_tags(
-    parent: str | None,
-    parent_of: Callable[[str], str | None],
-    tags_of: Callable[[str], frozenset[str]],
-) -> frozenset[str]:
-    """The union of the tags of ``parent`` and every folder above it.
+    parent: str | None, lookup: Callable[[str], Known | None]
+) -> tuple[frozenset[str], bool]:
+    """``(tags, complete)``: the union of the known tags of ``parent`` and every folder above
+    it, and whether every one of them was known (``lookup`` answers None for a folder whose
+    current version this poll has not read).
 
     Stops at the root (None), the trash, a folder already visited (the cloud's parents are
-    untrusted and may form a cycle) or after :data:`MAX_ANCESTOR_DEPTH` folders.
+    untrusted and may form a cycle) or a folder whose parent is unknown. A chain longer than
+    :data:`MAX_ANCESTOR_DEPTH` is incomplete.
     """
     found: set[str] = set()
     visited: set[str] = set()
+    complete = True
     current = parent
     while current is not None and current != TRASH and current not in visited:
         if len(visited) >= MAX_ANCESTOR_DEPTH:
-            break
+            return frozenset(found), False
         visited.add(current)
-        found |= tags_of(current)
-        current = parent_of(current)
-    return frozenset(found)
+        node = lookup(current)
+        if node is None:
+            return frozenset(found), False
+        if node.tags is None:
+            complete = False
+        else:
+            found |= node.tags
+        if not node.parent_known:
+            return frozenset(found), False
+        current = node.parent
+    return frozenset(found), complete
+
+
+def decide(
+    scope: SyncScope,
+    own: frozenset[str] | None,
+    ancestors: frozenset[str],
+    *,
+    complete: bool = True,
+) -> bool | None:
+    """Whether a document is mirrored: True inside, False outside, None when the known tags
+    do not settle it (its own tags unknown, or a folder above it unknown, and no known tag
+    matched). A known match settles it either way: ``allow`` lets it in, ``deny`` keeps it
+    out."""
+    if scope.mode == "all":
+        return True
+    hit = not scope.tags.isdisjoint(ancestors) or (
+        own is not None and not scope.tags.isdisjoint(own)
+    )
+    if hit:
+        return scope.mode == "allow"
+    if own is None or not complete:
+        return None
+    return scope.mode == "deny"
 
 
 __all__ = [
     "ALL",
+    "MAX_ANCESTOR_DEPTH",
     "MAX_SCOPE_TAGS",
     "MAX_TAGS_PER_DOCUMENT",
     "MAX_TAG_LEN",
+    "MAX_TAG_SCAN",
     "MODES",
+    "NOT_A_FOLDER",
     "SETTING_SYNC_SCOPE",
+    "Known",
     "ScopeError",
     "ScopeMode",
     "SettingsReader",
     "SyncScope",
     "ancestor_tags",
-    "document_tags",
+    "decide",
     "dump_scope",
-    "in_scope",
     "load_scope",
     "make_scope",
     "normalise_tag",
     "scope_fingerprint",
+    "scope_tags",
 ]

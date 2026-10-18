@@ -19,11 +19,16 @@
    ``hash_root``; only ``excluded_at`` is set. One that enters the scope is committed like a
    new document (or just unmarked if its archived version is current). Folders are always
    mirrored. Every listed document is decided again when the scope changed since the last
-   fully processed poll (``sync_state.scope_applied``), when a folder changed, or when a
-   document was un-tombstoned; otherwise only the fetched ones are. Nothing here tombstones
-   or removes anything. An unreadable stored scope ends the poll with ``backoff`` and
-   reason ``scope_malformed`` before any cloud request: guessing ``all`` would download
-   what the user excluded.
+   fully processed poll (``sync_state.scope_applied``, set to a pending marker as soon as a
+   change is seen so an interrupted transition is redone whole), when a folder changed, or
+   when a document was un-tombstoned; otherwise only the fetched ones are. Nothing here
+   tombstones or removes anything. An unreadable stored scope ends the poll with
+   ``backoff`` and reason ``scope_malformed`` before any cloud request: guessing ``all``
+   would download what the user excluded. The decision fails closed: a document whose own
+   ``.content`` could not be read whole (``scope_tags_unknown``), or below a folder whose
+   current version this poll does not know (``scope_ancestor_unknown``), and that no known
+   tag settles, fails for this poll: nothing of it is downloaded and its row is left as it
+   was.
 3. **Commit.** Per changed document: stage, download the blobs not yet in ``blobs/``
    (each streamed through SHA-256 verification and its declared size cap) and store the
    document index itself as a blob, then, in one
@@ -135,14 +140,17 @@ from scriptorium.cloud.protocol import (
 )
 from scriptorium.cloud.scope import (
     ALL,
+    MAX_TAGS_PER_DOCUMENT,
+    NOT_A_FOLDER,
+    Known,
     ScopeError,
     SyncScope,
     ancestor_tags,
-    document_tags,
-    in_scope,
+    decide,
     load_scope,
     normalise_tag,
     scope_fingerprint,
+    scope_tags,
 )
 from scriptorium.db.connect import to_db_time
 from scriptorium.errors import PathEscapeError, ScriptoriumError
@@ -167,10 +175,16 @@ STATE_ANOMALY_CANDIDATES: Final = "anomaly_candidates"
 """With ``anomaly="mass_delete"``: JSON list of the UUIDs that tripped the breaker. Never
 logged; ``admin_clear_anomaly`` turns it into an approval."""
 STATE_SCOPE_APPLIED: Final = "scope_applied"
-"""Fingerprint of the scope the last fully processed poll applied (absent means ``all``)."""
+"""Fingerprint of the scope the last fully processed poll applied (absent means ``all``), or
+:data:`SCOPE_PENDING` while a change is being applied."""
+SCOPE_PENDING: Final = "pending"
+"""``scope_applied`` while a scope change is under way: equal to no fingerprint, so every poll
+until one finishes cleanly decides every listed document again."""
 STATE_SCOPE_EXCLUDED: Final = "scope_excluded"
 """JSON ``{uuid: [entry_hash, [tag, ...]]}`` for excluded documents: their root entry hash and
-document tags when last looked at, so an unchanged one is not fetched on every poll."""
+document tags when last looked at, so an unchanged one is not fetched on every poll. Kept only
+for a document whose ``.metadata`` and whole tag list were read (at most
+``MAX_TAGS_PER_DOCUMENT`` tags); any other is fetched again."""
 
 ANOMALY_GENERATION_REGRESSED: Final = "generation_regressed"
 ANOMALY_EMPTY_ROOT: Final = "empty_root"
@@ -308,7 +322,8 @@ class _Run:
 
 
 class _Seen(NamedTuple):
-    """An excluded document as last looked at: its root entry hash and document tags."""
+    """An excluded document as last looked at: its root entry hash and all its document tags
+    (its parent is the row's, from the same ``.metadata``)."""
 
     hash: str
     tags: frozenset[str]
@@ -320,7 +335,7 @@ class _Facts:
 
     metadata: Mapping[str, Any]
     metadata_ok: bool
-    tags: frozenset[str]
+    tags: frozenset[str] | None  # None: ``.content`` listed but not readable whole
 
     @property
     def folder(self) -> bool:
@@ -386,6 +401,11 @@ class SyncOnce:
         fingerprint = scope_fingerprint(scope)
         applied = self._index.get_state(STATE_SCOPE_APPLIED) or _ALL_FINGERPRINT
         scope_changed = fingerprint != applied
+        if scope_changed and applied != SCOPE_PENDING:
+            # Before anything is decided: a poll that ends part way leaves the marker, so the
+            # next one decides every listed document again even if the scope changes back.
+            with self._index.transaction():
+                self._index.set_state(STATE_SCOPE_APPLIED, SCOPE_PENDING)
 
         # Step 1: the root.
         try:
@@ -658,9 +678,9 @@ class SyncOnce:
                 candidates = listed  # a folder's tags or the scope reach every document below
             else:
                 candidates = frozenset(facts)
-            skip = blocked | set(run.failed)
+            skip = frozenset(blocked | set(run.failed))
             late = self._decide(
-                scope, sorted(candidates - skip), facts, seen, entries, indexes, run
+                scope, sorted(candidates - skip), facts, seen, entries, indexes, skip, run
             )
             return self._fetch_indexes([entries[uuid] for uuid in late], indexes, run)
         finally:
@@ -674,35 +694,26 @@ class SyncOnce:
         seen: dict[str, _Seen],
         entries: Mapping[str, RootEntry],
         indexes: dict[str, DocumentIndex],
+        skip: frozenset[str],
         run: _Run,
     ) -> list[str]:
         """Apply the scope to ``candidates``; returns the excluded documents that entered the
-        scope with a version newer than the one archived (their index is still to fetch)."""
+        scope with a version newer than the one archived (their index is still to fetch).
+
+        A candidate that the known tags do not settle fails for this poll: it leaves
+        ``indexes`` (nothing of it is downloaded) and its row is left as it was."""
         rows: dict[str, DocumentRow | None] = {}
-        tag_cache: dict[str, frozenset[str]] = {}
+        known: dict[str, Known | None] = {}
 
         def row_of(uuid: str) -> DocumentRow | None:
             if uuid not in rows:
                 rows[uuid] = self._index.document(uuid)
             return rows[uuid]
 
-        def parent_of(uuid: str) -> str | None:
-            fact = facts.get(uuid)
-            if fact is not None:
-                return fact.parent
-            row = row_of(uuid)
-            return row.parent if row is not None else None
-
-        def tags_of(uuid: str) -> frozenset[str]:
-            if uuid not in tag_cache:
-                fact, mark = facts.get(uuid), seen.get(uuid)
-                if fact is not None:
-                    tag_cache[uuid] = fact.tags
-                elif mark is not None:
-                    tag_cache[uuid] = mark.tags
-                else:
-                    tag_cache[uuid] = self._archived_tags(uuid)
-            return tag_cache[uuid]
+        def lookup(uuid: str) -> Known | None:
+            if uuid not in known:
+                known[uuid] = self._known(uuid, row_of, facts, seen, entries, skip, run)
+            return known[uuid]
 
         now = self._clock()
         late: list[str] = []
@@ -714,10 +725,21 @@ class SyncOnce:
                 folder = fact.folder
             else:
                 folder = row is not None and row.type == "CollectionType"
-            own = tags_of(uuid)
-            inside = folder or in_scope(
-                scope, own, ancestor_tags(parent_of(uuid), parent_of, tags_of)
-            )
+            me: Known | None = None
+            inside: bool | None = True
+            if scope.mode != "all" and not folder:
+                me = lookup(uuid)
+                own = me.tags if me is not None else None
+                if me is not None and me.parent_known:
+                    above, complete = ancestor_tags(me.parent, lookup)
+                else:
+                    above, complete = frozenset(), False
+                inside = decide(scope, own, above, complete=complete)
+                if inside is None:
+                    indexes.pop(uuid, None)
+                    unknown = "scope_tags_unknown" if own is None else "scope_ancestor_unknown"
+                    self._fail(run, uuid, unknown)
+                    continue
             try:
                 if inside:
                     seen.pop(uuid, None)
@@ -727,18 +749,61 @@ class SyncOnce:
                         self._put(dataclasses.replace(row, excluded_at=None))
                     else:
                         late.append(uuid)
-                elif fact is not None:
+                    continue
+                if fact is not None:
                     indexes.pop(uuid, None)  # before the upsert: never commit it on a failure
                     self._put(self._excluded_row(entry, fact, row, now, run))
-                    seen[uuid] = _Seen(entry.hash, own)
-                elif row is not None:
-                    if row.excluded_at is None:
-                        self._put(dataclasses.replace(row, excluded_at=now))
-                    seen[uuid] = _Seen(entry.hash, own)
+                elif row is not None and row.excluded_at is None:
+                    self._put(dataclasses.replace(row, excluded_at=now))
+                if (
+                    me is not None
+                    and me.parent_known
+                    and me.tags is not None
+                    and len(me.tags) <= MAX_TAGS_PER_DOCUMENT
+                ):
+                    seen[uuid] = _Seen(entry.hash, me.tags)
+                else:
+                    seen.pop(uuid, None)  # fetched again next poll
             except (ScriptoriumError, OSError) as exc:
                 code = exc.code if isinstance(exc, ScriptoriumError) else "local_io"
                 self._fail(run, uuid, code)
         return late
+
+    def _known(
+        self,
+        uuid: str,
+        row_of: Callable[[str], DocumentRow | None],
+        facts: Mapping[str, _Facts],
+        seen: Mapping[str, _Seen],
+        entries: Mapping[str, RootEntry],
+        skip: frozenset[str],
+        run: _Run,
+    ) -> Known | None:
+        """What this poll knows of ``uuid``'s current version (its tags and parent), or None.
+
+        Its ``.metadata``/``.content`` read this poll; else, for an excluded document not
+        changed since it was last looked at, the remembered tags; else, when the root lists
+        the version that is archived, the archived ``.content``. A document that failed or is
+        blocked, or whose current version is none of these, is unknown. One the root does not
+        list is no folder at all, unless the root had entries it could not read.
+        """
+        entry = entries.get(uuid)
+        if entry is None:
+            return NOT_A_FOLDER if run.rejected_entries == 0 else None
+        if uuid in skip:
+            return None
+        fact = facts.get(uuid)
+        if fact is not None:
+            return Known(fact.tags, fact.parent, parent_known=fact.metadata_ok)
+        row = row_of(uuid)
+        if row is None or row.deleted_at is not None:
+            return None
+        mark = seen.get(uuid)
+        if row.excluded_at is not None and mark is not None and mark.hash == entry.hash:
+            return Known(mark.tags, row.parent)
+        if row.hash_root == entry.hash:
+            return Known(self._archived_tags(uuid), row.parent)
+        return None
 
     def _put(self, row: DocumentRow) -> None:
         with self._index.transaction():
@@ -765,7 +830,8 @@ class SyncOnce:
             try:
                 self._check_budget(run)
                 meta = self._fetch_small(files.get(f"{uuid}.metadata"), f"{uuid}.metadata", run)
-                content = self._fetch_small(files.get(f"{uuid}.content"), f"{uuid}.content", run)
+                content_ref = files.get(f"{uuid}.content")
+                content = self._fetch_small(content_ref, f"{uuid}.content", run)
             except _BudgetSpentError as exc:
                 return _Stop("partial", exc.reason)
             except (TokenRejectedError, RateLimitedError) as exc:
@@ -785,11 +851,11 @@ class SyncOnce:
                 continue
             transient.reset()
             metadata = _parse_json(meta)
-            parsed = _parse_json(content)
+            # No ``.content`` in the document's index: the cloud holds no tags for it. One
+            # listed but too large or unparseable: its tags are unknown.
+            tags = frozenset() if content_ref is None else scope_tags(_parse_json(content))
             facts[uuid] = _Facts(
-                metadata=metadata or {},
-                metadata_ok=metadata is not None,
-                tags=document_tags(parsed) if parsed is not None else frozenset(),
+                metadata=metadata or {}, metadata_ok=metadata is not None, tags=tags
             )
         return None
 
@@ -805,14 +871,20 @@ class SyncOnce:
             run.bytes_downloaded += len(data)
         return data
 
-    def _archived_tags(self, uuid: str) -> frozenset[str]:
-        """Document tags of the version in ``library/`` (empty if none or unreadable)."""
+    def _archived_tags(self, uuid: str) -> frozenset[str] | None:
+        """Document tags of the version in ``library/``; None if nothing usable is there (no
+        ``.metadata``, or a ``.content`` that cannot be read whole). An archived version
+        without ``.content`` has no tags."""
         try:
-            path = self._archive.current_files(uuid).get(f"{uuid}.content")
+            files = self._archive.current_files(uuid)
         except (ScriptoriumError, OSError):
+            return None
+        if f"{uuid}.metadata" not in files:
+            return None
+        path = files.get(f"{uuid}.content")
+        if path is None:
             return frozenset()
-        content = _read_json_file(path) if path is not None else None
-        return document_tags(content) if content is not None else frozenset()
+        return scope_tags(_read_json_file(path))
 
     def _excluded_row(
         self,
@@ -1251,10 +1323,12 @@ def _load_seen(raw: str | None) -> dict[str, _Seen]:
             continue
         if len(value) != 2 or not isinstance(value[0], str) or not is_sha256(value[0]):
             continue
-        if not isinstance(value[1], list):
+        tags = value[1]
+        if not isinstance(tags, list) or len(tags) > MAX_TAGS_PER_DOCUMENT:
             continue
-        tags = frozenset(t for t in value[1] if isinstance(t, str) and normalise_tag(t) == t)
-        out[uuid] = _Seen(value[0], tags)
+        if not all(isinstance(t, str) and normalise_tag(t) == t for t in tags):
+            continue  # an entry with a dropped tag could let a document in: drop it whole
+        out[uuid] = _Seen(value[0], frozenset(tags))
     return out
 
 
