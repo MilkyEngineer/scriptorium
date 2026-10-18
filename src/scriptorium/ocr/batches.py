@@ -43,6 +43,7 @@ __all__ = [
     "Tally",
     "collect",
     "custom_id",
+    "judge",
     "plan",
     "poll_state",
     "submit",
@@ -149,7 +150,8 @@ def _reason(result: object) -> str:
     return "item_error"
 
 
-def _outcome(cid: str, spec: OcrSpec, result: object, transcription_type: type[Any]) -> Outcome:
+def judge(cid: str, spec: OcrSpec, result: object, transcription_type: type[Any]) -> Outcome:
+    """The :class:`Outcome` of one result (a batch item's, or a single call's)."""
     if not isinstance(result, transcription_type):
         if hasattr(result, "reason"):
             return Outcome(cid, spec, None, _reason(result))
@@ -198,7 +200,7 @@ def collect(
             tally.duplicates += 1
             continue
         seen.add(cid)
-        yield _outcome(cid, items[cid], result, transcription_type)
+        yield judge(cid, items[cid], result, transcription_type)
     for cid in sorted(items):
         if cid not in seen:
             yield Outcome(cid, items[cid], None, "missing")

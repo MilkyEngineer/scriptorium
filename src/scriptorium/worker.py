@@ -24,6 +24,13 @@ One process, one asyncio loop, four kinds of task:
   ``ProcessPoolExecutor`` is broken for good once a child exits abruptly, so a job that
   finds the pool broken (at submit or while waiting) shuts it down, drops it so the next
   job gets a fresh one (``render_pool_rebuilt``), and fails normally to be retried.
+- **OCR runner** (M2, :mod:`scriptorium.ocr.runner`). Leases ``ocr`` and ``ocr_batch`` jobs
+  in its own loop, at most :data:`~scriptorium.ocr.runner.OCR_SLOTS` at a time and at most
+  ``OCR_USER_CONCURRENCY`` leased ``ocr`` jobs per user, so one user's backlog cannot hold
+  every slot. Claude calls run in the OCR threads while the lease is heartbeated. After each
+  ``ok`` or ``partial`` poll the account loop runs the auto-OCR scan. Without OCR ports
+  (``Worker.ocr`` None, the M1 configuration) every OCR job is ``deferred`` and the scan
+  queues nothing.
 - **Housekeeping.** ``requeue_expired`` at start and every minute; at start, dead render
   jobs that died of their run rather than their page are revived once
   (``JobQueue.revive_dead_renders``); the liveness file
@@ -81,13 +88,15 @@ from scriptorium.config import Settings
 from scriptorium.db.connect import to_db_time, utc_now
 from scriptorium.db.migrations import SchemaMismatch
 from scriptorium.errors import ScriptoriumError
-from scriptorium.jobs.kinds import RENDER_KINDS, RenderSpec, parse_render_payload
+from scriptorium.jobs.kinds import OCR, OCR_KINDS, RENDER_KINDS, RenderSpec, parse_render_payload
 from scriptorium.jobs.queue import JobQueue, JobRow, LeaseLostError
 from scriptorium.library import pages as pg
 from scriptorium.library import render
 from scriptorium.library.archive import Archive
 from scriptorium.library.index import Index, PageRow
 from scriptorium.logging import log_event
+from scriptorium.ocr._ports import OcrPorts
+from scriptorium.ocr.runner import OCR_SLOTS, JobFailure, OcrRunner
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import (
     AccountPaths,
@@ -316,6 +325,8 @@ class Worker:
     queue: JobQueue
     client_factory: ClientFactory | None = None
     render_executor: Executor | None = None
+    ocr: OcrPorts | None = None
+    """F's OCR seams (``build_ocr_ports``); None runs OCR as in M1 (lazy only)."""
     clock: Callable[[], datetime] = utc_now
     monotonic: Callable[[], float] = time.monotonic
     timing: Timing = field(default_factory=Timing)
@@ -342,6 +353,7 @@ class Worker:
             sync_max_poll_bytes=self.settings.sync_max_poll_bytes,
             sync_max_poll_seconds=self.settings.sync_max_poll_seconds,
         )
+        self.ocr_runner = OcrRunner(self)
 
     # ---- start-up and shutdown ----------------------------------------------------------
 
@@ -365,6 +377,7 @@ class Worker:
 
     def close(self) -> None:
         self._poll_executor.shutdown(wait=False, cancel_futures=True)
+        self.ocr_runner.close()
         if self._owns_executor and self.render_executor is not None:
             self.render_executor.shutdown(wait=False, cancel_futures=True)
         with self._contexts_lock:
@@ -414,6 +427,7 @@ class Worker:
             asyncio.create_task(self._housekeeping(stop), name="housekeeping"),
             asyncio.create_task(self._supervise(stop), name="supervisor"),
             asyncio.create_task(self.run_jobs(stop), name="jobs"),
+            asyncio.create_task(self.run_ocr_jobs(stop), name="ocr-jobs"),
         ]
         try:
             await stop.wait()
@@ -530,7 +544,24 @@ class Worker:
 
     async def run_jobs(self, stop: asyncio.Event) -> None:
         """Lease and run render jobs until ``stop``; at most ``RENDER_WORKERS`` at once."""
-        slots = asyncio.Semaphore(self.settings.render_workers)
+        await self._run_kinds(stop, RENDER_KINDS, self.settings.render_workers, None)
+
+    async def run_ocr_jobs(self, stop: asyncio.Event) -> None:
+        """Lease and run OCR jobs until ``stop``: ``OCR_SLOTS`` at once, and at most
+        ``OCR_USER_CONCURRENCY`` leased ``ocr`` jobs per user."""
+        await self._run_kinds(stop, OCR_KINDS, OCR_SLOTS, self._ocr_fairness())
+
+    def _ocr_fairness(self) -> dict[str, int]:
+        return {OCR: self.settings.ocr_user_concurrency}
+
+    async def _run_kinds(
+        self,
+        stop: asyncio.Event,
+        kinds: Sequence[str],
+        width: int,
+        per_uid: Mapping[str, int] | None,
+    ) -> None:
+        slots = asyncio.Semaphore(width)
         running: set[asyncio.Task[None]] = set()
         try:
             while not stop.is_set():
@@ -539,8 +570,9 @@ class Worker:
                     job = await asyncio.to_thread(
                         self.queue.lease,
                         self.owner,
-                        kinds=RENDER_KINDS,
+                        kinds=kinds,
                         ttl_s=self.timing.lease_ttl_s,
+                        per_uid=per_uid,
                     )
                 except Exception:
                     slots.release()
@@ -564,12 +596,17 @@ class Worker:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
 
-    async def drain_jobs(self, *, limit: int = 1000) -> int:
-        """Run leasable jobs one at a time until none is left (tests and tooling)."""
+    async def drain_jobs(self, *, limit: int = 1000, kinds: Sequence[str] = RENDER_KINDS) -> int:
+        """Run leasable jobs of ``kinds`` one at a time until none is left (tests, tooling)."""
         ran = 0
+        per_uid = self._ocr_fairness() if OCR in kinds else None
         while ran < limit:
             job = await asyncio.to_thread(
-                self.queue.lease, self.owner, kinds=RENDER_KINDS, ttl_s=self.timing.lease_ttl_s
+                self.queue.lease,
+                self.owner,
+                kinds=kinds,
+                ttl_s=self.timing.lease_ttl_s,
+                per_uid=per_uid,
             )
             if job is None:
                 break
@@ -582,12 +619,26 @@ class Worker:
         started = self.monotonic()
         outcome = "done"
         try:
-            result = await self._render_job(job)
+            if job.kind in OCR_KINDS:
+                result = await self.ocr_runner.run(job)
+            else:
+                result = await self._render_job(job)
             await asyncio.to_thread(self.queue.complete, job.id, self.owner, result)
         except LeaseLostError:
             outcome = "lease_lost"
         except asyncio.CancelledError:
             raise
+        except JobFailure as exc:
+            # A reason code chosen by the OCR runner (no content), e.g. "ocr_unavailable".
+            outcome = exc.reason
+            level = logging.INFO if exc.reason == "batch_pending" else logging.WARNING
+            log_event(
+                logger, "job_failed", level=level, job=job.id, acct=job.acct, reason=exc.reason
+            )
+            with contextlib.suppress(LeaseLostError):
+                await asyncio.to_thread(
+                    self.queue.fail, job.id, self.owner, exc.reason, final=exc.final
+                )
         except Exception as exc:
             code = exc.code if isinstance(exc, ScriptoriumError) else "internal"
             outcome = code
@@ -678,9 +729,9 @@ class Worker:
         return await self._in_pool(job, render.page_image_bytes, result, max_side_px=max_side)
 
     async def _in_pool[**P, R](
-        self, job: JobRow, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs
+        self, job: JobRow | None, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs
     ) -> R:
-        """Run ``fn`` in the render pool, heartbeating the job; heal a broken pool.
+        """Run ``fn`` in the render pool, heartbeating the job (if any); heal a broken pool.
 
         A pool that is broken (a child exited abruptly) or refuses work is dropped so the
         next job gets a fresh one; the error propagates and this job fails and is retried.
@@ -712,13 +763,15 @@ class Worker:
             pdf = pg.blob_path(paths, source.pdf_sha)
         return rm, pdf
 
-    async def _await_with_heartbeat[T](self, fut: Future[T], job: JobRow) -> T:
-        """Await a pool future, extending the job's lease while it runs."""
+    async def _await_with_heartbeat[T](self, fut: Future[T], job: JobRow | None) -> T:
+        """Await a pool future, extending the job's lease (if any) while it runs."""
         waiter = asyncio.wrap_future(fut)
         while True:
             done, _ = await asyncio.wait({waiter}, timeout=self.timing.job_heartbeat_s)
             if done:
                 return waiter.result()
+            if job is None:
+                continue
             await asyncio.to_thread(
                 self.queue.heartbeat, job.id, self.owner, self.timing.lease_ttl_s
             )
@@ -849,7 +902,16 @@ class AccountLoop:
             bytes=report.bytes_downloaded,
             duration_ms=round((worker.monotonic() - started) * 1000, 1),
         )
-        return await asyncio.to_thread(self.after_poll, ctx, report)
+        delay = await asyncio.to_thread(self.after_poll, ctx, report)
+        if report.outcome in ("ok", "partial"):
+            try:
+                await worker.ocr_runner.scan(ctx, complete=report.outcome == "ok")
+            except Exception:
+                # OCR never fails a poll: the next poll scans again.
+                log_event(
+                    logger, "ocr_scan_failed", level=logging.ERROR, exc_info=True, acct=self.acct
+                )
+        return delay
 
     def _sync(self, ctx: AccountContext, client: CloudClient) -> SyncReport:
         assert self.archive is not None

@@ -35,6 +35,7 @@ from scriptorium.logging import log_event, uid_prefix
 from scriptorium.ocr.client import OcrClient, client_for
 from scriptorium.ocr.ledger import SpendLedger
 from scriptorium.ocr.modes import listed_email_digest
+from scriptorium.ocr._ports import OcrPorts
 from scriptorium.users.store import GlobalStore, account_paths, global_db_path
 
 __all__ = ["IMAGE_SLOTS", "KEY_CHECKS_PER_WINDOW", "KEY_CHECK_WINDOW_S", "Services", "identity_of"]
@@ -70,6 +71,8 @@ class Services:
     """Exchanges a one-time code for a device token (the one cloud write in M1)."""
     identify: Callable[[str], str | None] = identity_of
     clock: Callable[[], datetime] = utc_now
+    ocr: OcrPorts | None = None
+    """F's OCR seams (``build_ocr_ports``); None: lazy mode only, as in M1."""
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     poll_interval_s: float = 0.25
     """How often a tool waiting for a render looks for its PNG."""
