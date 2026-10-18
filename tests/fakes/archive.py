@@ -173,6 +173,9 @@ class FakeArchive:
         self.ops.append(("sweep_staging", str(count)))
         return count
 
+    def take_damaged(self) -> frozenset[str]:
+        return frozenset()
+
     def current_files(self, uuid: str) -> Mapping[str, Path]:
         return {name: self.blob_path(sha) for name, sha in self.library.get(uuid, {}).items()}
 

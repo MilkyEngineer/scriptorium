@@ -213,6 +213,7 @@ class Archive:
         self._lock = threading.RLock()
         self._active: set[str] = set()
         self._inflight: set[str] = set()
+        self._damaged: set[str] = set()
         self._lock_fd: int | None = None
         self._lock_depth = 0
         for directory in (paths.root, paths.blobs, paths.library, paths.tombstones):
@@ -539,6 +540,17 @@ class Archive:
                     out[name] = real
         return out
 
+    def take_damaged(self) -> frozenset[str]:
+        """Documents whose interrupted change was rolled forward with a ``place`` source gone.
+
+        Their ``library/`` entry may lack files of the version ``hash_root`` names, so the
+        sync loop nulls that ``hash_root`` and the next poll commits the document again from
+        ``blobs/``. Each UUID is returned once.
+        """
+        with self._lock:
+            damaged, self._damaged = frozenset(self._damaged), set()
+        return damaged
+
     # ---- staging housekeeping ------------------------------------------------------------
 
     def sweep_staging(self) -> int:
@@ -676,14 +688,17 @@ class Archive:
 
     def _apply(
         self, journal: Path, moves: Sequence[_Move], rmdirs: Sequence[Path], *, live: bool
-    ) -> None:
+    ) -> bool:
         """Make every move of a plan (idempotently), then retire the journal.
 
         ``live`` is the change being made now: a source that has vanished means something
         outside this archive interfered, so it raises and the journal stays for recovery
         rather than report success. In recovery (``live=False``) a missing source is a move
         that cannot be made any more; it is logged and the rest of the plan goes ahead.
+        Returns True if a ``place`` move was skipped that way: the destination entry then
+        lacks part of the version the plan was placing.
         """
+        damaged = False
         touched: set[Path] = set()
         for move in moves:
             src_there, dst_there = os.path.lexists(move.src), os.path.lexists(move.dst)
@@ -695,6 +710,7 @@ class Archive:
                 if live:
                     raise RefusedError("an entry vanished while the archive was changing it")
                 log_event(log, "archive_journal_source_missing", level=logging.WARNING)
+                damaged = damaged or move.kind == "place"
                 continue
             self._mkdir_durable(move.dst.parent)
             self._fs.rename(move.src, move.dst)
@@ -707,6 +723,7 @@ class Archive:
                 self._fs.fsync_dir(directory)
         self._discard(journal)
         self._fs.fsync_dir(journal.parent)
+        return damaged
 
     def _rmdir_if_empty(self, directory: Path) -> bool:
         """Remove an empty directory; anything in it (or it being gone) leaves it alone."""
@@ -734,7 +751,9 @@ class Archive:
         """Roll forward every pending plan of ``uuid``; raises if one cannot be applied."""
         for path, _ in self._journals(uuid):
             moves, rmdirs = self._load_journal(path, uuid)
-            self._apply(path, moves, rmdirs, live=False)
+            if self._apply(path, moves, rmdirs, live=False):
+                with self._lock:
+                    self._damaged.add(uuid)
             log_event(log, "archive_journal_recovered", count=len(moves))
 
     def _recover_all(self) -> set[str]:
@@ -745,7 +764,9 @@ class Archive:
                 continue
             try:
                 moves, rmdirs = self._load_journal(path, uuid)
-                self._apply(path, moves, rmdirs, live=False)
+                if self._apply(path, moves, rmdirs, live=False):
+                    with self._lock:
+                        self._damaged.add(uuid)
             except (RefusedError, OSError, ValueError):
                 stuck.add(uuid)
                 log_event(log, "archive_journal_stuck", level=logging.ERROR, exc_info=True)

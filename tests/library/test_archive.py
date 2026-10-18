@@ -517,10 +517,36 @@ def test_a_source_vanishing_mid_swap_fails_the_commit_and_recovery_finishes(
     assert len(os.listdir(paths.staging / ".journal")) == 1  # kept for recovery
     assert staged.path.exists()  # with the tree it still needs
 
-    Archive(paths).sweep_staging()
+    assert archive.take_damaged() == frozenset()
+    recovered = Archive(paths)
+    recovered.sweep_staging()
     assert tree(paths.library) == {k: v for k, v in V2.items() if k != f"{DOC}.content"}
     assert holding(paths, "2") == V1
     assert os.listdir(paths.staging / ".journal") == []
+    # library/ now lacks part of version 2: sync nulls its hash_root (once per recovery).
+    assert recovered.take_damaged() == {DOC}
+    assert recovered.take_damaged() == frozenset()
+
+
+def test_recovering_through_stage_reports_the_damage(
+    archive: Archive, rec: RecordingFs, paths: AccountPaths
+) -> None:
+    commit(archive, V1, 1)
+    mapping = store(archive, V2)
+    staged = archive.stage(DOC, "j")
+    victim = staged.path / "tree" / f"{DOC}.content"
+
+    def interfere(op: str, _src: Path, dst: Path | None) -> bool:
+        if op == "rename" and dst is not None and HOLDING_DIR in str(dst) and victim.exists():
+            victim.unlink()
+        return False
+
+    rec.crash_when = interfere
+    with staged, pytest.raises(RefusedError):
+        archive.commit(staged, mapping, 2, HASH_ROOT)
+    rec.crash_when = None
+    archive.tombstone(DOC)  # the next change of the document rolls the plan forward first
+    assert archive.take_damaged() == {DOC}
 
 
 def test_new_directories_are_fsynced_into_their_parents(
