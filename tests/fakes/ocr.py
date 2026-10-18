@@ -21,7 +21,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import SecretStr
@@ -30,6 +30,7 @@ from scriptorium.config import Settings
 from scriptorium.ocr._ports import OcrPorts
 from scriptorium.ocr.client import (
     BatchCounts,
+    BatchInfo,
     BatchItem,
     BatchStatus,
     OcrItemError,
@@ -85,6 +86,7 @@ class FakeBatch:
     prompt_version: str
     pngs: dict[str, bytes] = field(default_factory=dict, repr=False)
     state: str = "in_progress"
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     results: dict[str, Transcription | OcrItemError] = field(default_factory=dict)
     stream: list[tuple[object, object]] | None = None
     """Raw ``(custom_id, result)`` lines streamed instead of ``results`` (hostile streams)."""
@@ -97,7 +99,10 @@ class FakeOcrClient:
     :meth:`transcribe`; when they run out every call returns :func:`canned` text, made by
     ``text(png)`` when it is set. ``key_error`` is raised by :meth:`validate_key`.
     ``check_images`` applies the real client's PNG header check, so a test notices a page
-    that was not downscaled.
+    that was not downscaled. ``clock`` dates the batches it creates (a test sets it to its
+    own clock); ``submit_error`` is raised by the next :meth:`submit_batch` (once), after
+    the batch was created if ``submit_error_after_create`` (a lost answer); ``list_error``
+    is raised by :meth:`list_batches` while it is set.
     """
 
     def __init__(
@@ -122,6 +127,10 @@ class FakeOcrClient:
         self.text = text
         self.calls: list[tuple[str, ...]] = []
         self.batches: dict[str, FakeBatch] = {}
+        self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self.submit_error: Exception | None = None
+        self.submit_error_after_create = False
+        self.list_error: Exception | None = None
         self.closed = 0
         self._lock = threading.Lock()
 
@@ -180,15 +189,62 @@ class FakeOcrClient:
     def submit_batch(self, items: Sequence[BatchItem], prompt: Prompt) -> str:
         with self._lock:
             self.calls.append(("submit_batch", str(len(items)), prompt.version))
+            error, self.submit_error = self.submit_error, None
         if self.check_images:
             for item in items:
                 check_png(item.png)
+        if error is not None and not self.submit_error_after_create:
+            raise error
+        batch_id = self.add_batch(
+            [i.custom_id for i in items], prompt.version, {i.custom_id: i.png for i in items}
+        )
+        if error is not None:
+            raise error  # the batch exists, but its id never reached the caller
+        return batch_id
+
+    def add_batch(
+        self,
+        custom_ids: Sequence[str],
+        prompt_version: str = "v1",
+        pngs: Mapping[str, bytes] | None = None,
+        *,
+        created_at: datetime | None = None,
+    ) -> str:
+        """A batch of this key (one the test submits for someone else, or the client's own)."""
         with self._lock:
             batch_id = f"msgbatch_fake_{len(self.batches) + 1:04d}"
             self.batches[batch_id] = FakeBatch(
-                [i.custom_id for i in items], prompt.version, {i.custom_id: i.png for i in items}
+                list(custom_ids),
+                prompt_version,
+                dict(pngs or {}),
+                created_at=created_at or self.clock(),
             )
         return batch_id
+
+    def list_batches(self, limit: int = 100) -> list[BatchInfo]:
+        with self._lock:
+            self.calls.append(("list_batches", str(limit)))
+            if self.list_error is not None:
+                raise self.list_error
+            listed = sorted(self.batches.items(), key=lambda kv: kv[1].created_at, reverse=True)
+        out = []
+        for batch_id, batch in listed[:limit]:
+            state = batch.state if batch.state in ("in_progress", "ended", "canceling") else None
+            if state is None:
+                continue
+            out.append(BatchInfo(batch_id, batch.created_at, state, len(batch.custom_ids)))  # type: ignore[arg-type]
+        return out
+
+    def first_custom_id(self, batch_id: str) -> str | None:
+        with self._lock:
+            self.calls.append(("first_custom_id", batch_id))
+        batch = self.batches.get(batch_id)
+        if batch is None or batch.state != "ended":
+            raise OcrUnavailable("batch_in_progress")
+        if batch.stream is not None:
+            first = batch.stream[0][0] if batch.stream else None
+            return first if isinstance(first, str) else None
+        return next(iter(batch.results), None)
 
     def finish_batch(
         self,

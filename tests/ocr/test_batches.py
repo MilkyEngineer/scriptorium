@@ -12,7 +12,9 @@ from scriptorium.ocr.batches import (
     Planned,
     Tally,
     collect,
+    custom_id,
     fits,
+    nonce_of,
     plan,
     poll_state,
     submit,
@@ -49,6 +51,22 @@ def test_plan_cuts_at_items_and_bytes() -> None:
     heavy = [Planned(spec(n), b"\0" * big) for n in range(3)]
     assert list(plan(heavy)) == ["p0"]
     assert plan([]) == {}
+
+
+def test_plan_tags_every_item_with_the_submissions_nonce() -> None:
+    nonce = "0123456789abcdef"
+    got = plan([Planned(spec(n), b"x") for n in range(3)], nonce)
+    assert list(got) == [f"{nonce}-p{n}" for n in range(3)]
+    assert {nonce_of(cid) for cid in got} == {nonce}
+    with pytest.raises(InvalidArgumentError):
+        custom_id(0, "NOT-HEX")
+
+
+@pytest.mark.parametrize(
+    "cid", ["p0", "0123456789abcde-p0", "0123456789ABCDEF-p0", "-p0", "", None, 7, b"x-p0"]
+)
+def test_nonce_of_reads_only_a_well_formed_tag(cid: object) -> None:
+    assert nonce_of(cid) is None
 
 
 def test_submit_sends_items_and_checks_the_batch_id() -> None:

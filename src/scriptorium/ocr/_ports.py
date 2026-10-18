@@ -34,6 +34,7 @@ from scriptorium.config import Settings
 from scriptorium.errors import ScriptoriumError
 from scriptorium.ocr import modes
 from scriptorium.ocr.client import (
+    BatchInfo,
     BatchItem,
     BatchStatus,
     OcrItemError,
@@ -94,6 +95,8 @@ class OcrClientLike(Protocol):
     def batch_results(
         self, batch_id: str
     ) -> Iterator[tuple[str, Transcription | OcrItemError]]: ...
+    def list_batches(self, limit: int = 100) -> list[BatchInfo]: ...
+    def first_custom_id(self, batch_id: str) -> str | None: ...
     def close(self) -> None: ...
 
 

@@ -8,6 +8,7 @@ import pytest
 
 from scriptorium.errors import InvalidArgumentError
 from scriptorium.jobs.kinds import (
+    CUSTOM_ID_RE,
     MAX_BATCH_ITEMS,
     OCR,
     OCR_BATCH,
@@ -156,6 +157,31 @@ def test_ocr_batch_carries_the_prompt_version_it_was_sent_with() -> None:
     assert older.prompt_version is None and "prompt_version" not in older.payload()
     with pytest.raises(InvalidArgumentError):
         OcrBatchSpec("b1", "user", {"p0": OcrSpec(DOC, PAGE, HASH, 1)}, prompt_version="x")
+
+
+@pytest.mark.parametrize(
+    ("cid", "ok"),
+    [
+        ("p0", True),  # a payload written before the nonce
+        ("p9999", True),
+        ("0123456789abcdef-p0", True),
+        ("0123456789abcdef-p12", True),
+        ("0123456789ABCDEF-p0", False),
+        ("0123456789abcde-p0", False),
+        ("0123456789abcdef-", False),
+        ("0123456789abcdef-q0", False),
+        ("x-p0", False),
+        ("p10000", False),
+    ],
+)
+def test_custom_ids_carry_the_submissions_nonce(cid: str, ok: bool) -> None:
+    assert bool(CUSTOM_ID_RE.fullmatch(cid)) is ok
+    payload = _batch(items={cid: OcrSpec(DOC, PAGE, HASH, 1).payload()})
+    if ok:
+        assert list(parse_ocr_batch_payload(payload).items) == [cid]
+    else:
+        with pytest.raises(InvalidArgumentError):
+            parse_ocr_batch_payload(payload)
 
 
 def test_batch_size_bound() -> None:

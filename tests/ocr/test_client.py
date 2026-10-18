@@ -13,6 +13,7 @@ import os
 import struct
 import zlib
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from scriptorium.errors import InvalidArgumentError
 from scriptorium.ocr.client import (
     MAX_IMAGE_SIDE,
     BatchCounts,
+    BatchInfo,
     BatchItem,
     BatchStatus,
     OcrClient,
@@ -588,6 +590,63 @@ def test_batch_results_broken_stream(make_client: Any) -> None:
         next(stream)
     assert info.value.reason == "stream_failed"
     assert info.value.__context__ is None
+
+
+def _listed(batch_id: str, created: str, status: str = "ended", **kw: Any) -> dict[str, Any]:
+    ended = status == "ended"
+    counts = {"processing": 0 if ended else 3, "succeeded": 3 if ended else 0}
+    counts |= {"errored": 0, "canceled": 0, "expired": 0}
+    return {**batch_json(status, counts=counts, **kw), "id": batch_id, "created_at": created}
+
+
+def test_list_batches_reads_one_page_and_leaves_out_what_it_cannot_use(
+    make_client: Any,
+) -> None:
+    page = {
+        "data": [
+            _listed("msgbatch_03", "2026-10-18T10:05:00Z", "in_progress"),
+            _listed("msgbatch_02", "2026-10-18T10:00:00Z", results_url=RESULTS_URL),
+            _listed("msgbatch_01", "2026-09-01T10:00:00Z", archived=True),
+            _listed("../../models", "2026-10-18T10:00:00Z"),  # untrusted: left out
+            _listed("msgbatch_00", "2026-10-18T09:00:00Z", "unheard_of"),
+        ],
+        "has_more": True,
+        "first_id": "msgbatch_03",
+        "last_id": "msgbatch_00",
+    }
+    api = FakeApi(ok(page))
+    client = make_client(api)
+    assert client.list_batches(5) == [
+        BatchInfo("msgbatch_03", datetime(2026, 10, 18, 10, 5, tzinfo=UTC), "in_progress", 3),
+        BatchInfo("msgbatch_02", datetime(2026, 10, 18, 10, 0, tzinfo=UTC), "ended", 3),
+        BatchInfo("msgbatch_01", datetime(2026, 9, 1, 10, 0, tzinfo=UTC), "expired", 3),
+    ]
+    # One page only: has_more is not followed.
+    (request,) = api.requests
+    assert request.url.path == "/v1/messages/batches" and request.url.params["limit"] == "5"
+    assert request.headers["x-api-key"] == KEY
+    for limit in (0, 1001):
+        with pytest.raises(InvalidArgumentError):
+            client.list_batches(limit)
+
+
+def test_first_custom_id_reads_one_result_line(make_client: Any) -> None:
+    ended = ok(batch_json("ended", results_url=RESULTS_URL))
+    body = _jsonl(
+        {"custom_id": "../../etc", "result": {"type": "canceled"}},  # untrusted: skipped
+        {"custom_id": "0123456789abcdef-p4", "result": {"type": "canceled"}},
+        "{never read",
+    )
+    api = FakeApi(ended, ended, httpx2.Response(200, content=body))
+    assert make_client(api).first_custom_id("msgbatch_01") == "0123456789abcdef-p4"
+    empty = FakeApi(ended, ended, httpx2.Response(200, content=b""))
+    assert make_client(empty).first_custom_id("msgbatch_01") is None
+    running = FakeApi(ok(batch_json()))
+    with pytest.raises(OcrUnavailable) as info:
+        make_client(running).first_custom_id("msgbatch_01")
+    assert info.value.reason == "batch_in_progress"
+    with pytest.raises(InvalidArgumentError):
+        make_client(FakeApi()).first_custom_id("../models")
 
 
 # ---- the SDK stays in one module ------------------------------------------------------------

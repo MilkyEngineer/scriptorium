@@ -49,6 +49,7 @@ from scriptorium.library.layout import is_sha256, is_uuid
 
 __all__ = [
     "BATCH_ID_RE",
+    "BATCH_NONCE_RE",
     "CUSTOM_ID_RE",
     "GONE_RESULT",
     "KEY_ERROR_PREFIX",
@@ -104,9 +105,13 @@ OCR_BATCH: Final = "ocr_batch"
 OCR_KINDS: Final = (OCR, OCR_BATCH)
 MAX_BATCH_ITEMS: Final = 100
 """Most pages in one ``ocr_batch``: bounds the request (images) and the payload (≤ 64 KB)."""
-CUSTOM_ID_RE: Final = re.compile(r"p[0-9]{1,4}")
-"""A batch item's ``custom_id``: ``p<n>``, an index into the job's own item list. It is
-built by Scriptorium, never from names, and a result is matched against the item list."""
+BATCH_NONCE_RE: Final = re.compile(r"[0-9a-f]{16}")
+"""The random tag of one batch submission (``secrets.token_hex(8)``)."""
+CUSTOM_ID_RE: Final = re.compile(r"(?:[0-9a-f]{16}-)?p[0-9]{1,4}")
+"""A batch item's ``custom_id``: ``<nonce>-p<n>``, the submission's random tag and an index
+into the job's own item list (``p<n>`` alone in a payload written before the tag). It is
+built by Scriptorium, never from names, and a result is matched against the item list; the
+tag lets a batch whose submission failed in flight be recognised as this one (§8.2)."""
 BATCH_ID_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
 """A Message Batches id as the API returns it (``msgbatch_…``), checked before it is stored."""
 PROMPT_VERSION_RE: Final = re.compile(r"v[1-9][0-9]{0,5}")

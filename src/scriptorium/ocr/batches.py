@@ -4,7 +4,9 @@ More than ``OCR_BATCH_MIN`` stable pages found by one scan go to Claude as one M
 Batches request (half price, results within 24 hours) instead of one call per page:
 
 - :func:`plan` cuts the pages to at most :data:`~scriptorium.jobs.kinds.MAX_BATCH_ITEMS`
-  items and :data:`MAX_BATCH_PNG_BYTES` of images, each under the custom id ``p<n>``.
+  items and :data:`MAX_BATCH_PNG_BYTES` of images, each under the custom id
+  ``<nonce>-p<n>``: the nonce is fresh per submission, so a batch the API created for a
+  submission that failed in flight can be told apart from any other batch of the key.
 - :func:`submit` sends them (image + prompt only, never a name or a path) and checks the
   batch id the API returns before it goes into a job key.
 - The ``ocr_batch`` job then polls :func:`poll_state` with the queue's backoff
@@ -30,7 +32,7 @@ from datetime import timedelta
 from typing import Final, Literal
 
 from scriptorium.errors import InvalidArgumentError
-from scriptorium.jobs.kinds import BATCH_ID_RE, MAX_BATCH_ITEMS, OcrSpec
+from scriptorium.jobs.kinds import BATCH_ID_RE, BATCH_NONCE_RE, MAX_BATCH_ITEMS, OcrSpec
 from scriptorium.ocr._ports import OcrClientLike
 from scriptorium.ocr.client import BatchItem, BatchStatus, Transcription, check_png
 from scriptorium.ocr.errors import OcrRefused
@@ -49,6 +51,7 @@ __all__ = [
     "custom_id",
     "fits",
     "judge",
+    "nonce_of",
     "plan",
     "poll_state",
     "submit",
@@ -71,8 +74,21 @@ WAIT_STATES: Final = frozenset({"in_progress", "canceling"})
 DONE_STATES: Final = frozenset({"ended", "expired"})
 
 
-def custom_id(n: int) -> str:
-    return f"p{n}"
+def custom_id(n: int, nonce: str | None = None) -> str:
+    """``<nonce>-p<n>`` (``p<n>`` without a nonce, as single calls and old payloads use)."""
+    if nonce is None:
+        return f"p{n}"
+    if not isinstance(nonce, str) or not BATCH_NONCE_RE.fullmatch(nonce):
+        raise InvalidArgumentError("a batch nonce must be 16 hex digits")
+    return f"{nonce}-p{n}"
+
+
+def nonce_of(cid: object) -> str | None:
+    """The nonce a custom id carries, if any (results are untrusted: anything else is None)."""
+    if not isinstance(cid, str):
+        return None
+    head, sep, _tail = cid.partition("-")
+    return head if sep and BATCH_NONCE_RE.fullmatch(head) else None
 
 
 def fits(png: bytes) -> str | None:
@@ -92,14 +108,14 @@ class Planned:
     png: bytes
 
 
-def plan(pages: Sequence[Planned]) -> dict[str, Planned]:
-    """The first pages that fit one batch, keyed by custom id (``p0``, ``p1``, ...)."""
+def plan(pages: Sequence[Planned], nonce: str | None = None) -> dict[str, Planned]:
+    """The first pages that fit one batch, keyed by custom id (``<nonce>-p0``, ...)."""
     out: dict[str, Planned] = {}
     total = 0
     for page in pages:
         if len(out) >= MAX_BATCH_ITEMS or total + len(page.png) > MAX_BATCH_PNG_BYTES:
             break
-        out[custom_id(len(out))] = page
+        out[custom_id(len(out), nonce)] = page
         total += len(page.png)
     return out
 

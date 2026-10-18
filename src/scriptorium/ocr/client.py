@@ -27,8 +27,9 @@ import random
 import re
 import struct
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Final, Literal, Protocol, TypeVar
 from urllib.parse import urlsplit
 
@@ -56,6 +57,7 @@ __all__ = [
     "MAX_IMAGE_BYTES",
     "MAX_IMAGE_SIDE",
     "BatchCounts",
+    "BatchInfo",
     "BatchItem",
     "BatchState",
     "BatchStatus",
@@ -77,6 +79,9 @@ MAX_IMAGE_BYTES: Final = 3_932_160
 #: A batch holds at most 100 000 requests and 256 MB; keep well inside both.
 MAX_BATCH_ITEMS: Final = 10_000
 MAX_BATCH_BYTES: Final = 200 * 1024 * 1024
+#: One page of the key's batch listing (newest first) is all :meth:`OcrClient.list_batches`
+#: reads: the API's own maximum.
+MAX_LIST_BATCHES: Final = 1000
 
 _PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
 _CUSTOM_ID_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -119,6 +124,11 @@ for _name in ("anthropic", "httpx2"):
 
 _T = TypeVar("_T")
 BatchState = Literal["in_progress", "ended", "canceling", "expired"]
+_LISTED_STATES: Final[dict[str, BatchState]] = {
+    "in_progress": "in_progress",
+    "ended": "ended",
+    "canceling": "canceling",
+}
 
 
 class _Lines(Protocol):
@@ -167,6 +177,16 @@ class BatchStatus:
 
     state: BatchState
     counts: BatchCounts
+
+
+@dataclass(frozen=True)
+class BatchInfo:
+    """One batch of the key as the listing shows it: no custom ids, no content."""
+
+    batch_id: str
+    created_at: datetime
+    state: BatchState
+    requests: int
 
 
 @dataclass(frozen=True)
@@ -347,6 +367,54 @@ class OcrClient:
         state: BatchState = batch.processing_status
         return BatchStatus(state, counts)
 
+    def list_batches(self, limit: int = 100) -> list[BatchInfo]:
+        """The key's most recent batches, newest first: one page of at most ``limit``.
+
+        Used to find a batch whose submission failed in flight (the create call may have
+        succeeded). Entries with a malformed id, time or state are left out (untrusted).
+        """
+        if not 1 <= limit <= MAX_LIST_BATCHES:
+            raise InvalidArgumentError(f"limit must be 1 to {MAX_LIST_BATCHES}")
+        # The page's own data only: iterating the page would fetch every later page.
+        page = self._call(lambda: self._sdk.messages.batches.list(limit=limit))
+        out: list[BatchInfo] = []
+        for batch in list(page.data)[:limit]:
+            batch_id = getattr(batch, "id", None)
+            created = getattr(batch, "created_at", None)
+            state = _LISTED_STATES.get(str(getattr(batch, "processing_status", None)))
+            rc = getattr(batch, "request_counts", None)
+            if not isinstance(batch_id, str) or not _BATCH_ID_RE.fullmatch(batch_id):
+                continue
+            if not isinstance(created, datetime) or created.tzinfo is None:
+                continue
+            if state is None:
+                continue
+            try:
+                requests = sum(
+                    int(getattr(rc, name))
+                    for name in ("processing", "succeeded", "errored", "canceled", "expired")
+                )
+            except (TypeError, ValueError):
+                continue
+            if getattr(batch, "archived_at", None) is not None:
+                state = "expired"
+            out.append(BatchInfo(batch_id, created, state, requests))
+        return out
+
+    def first_custom_id(self, batch_id: str) -> str | None:
+        """The ``custom_id`` of an ended batch's first result line (None if it has none).
+
+        Reads one line of the results and closes the stream: enough to tell whose batch it
+        is from the submission's nonce. The result itself is parsed and dropped.
+        """
+        stream = self._results(batch_id)
+        try:
+            for custom_id, _result in stream:
+                return custom_id
+            return None
+        finally:
+            stream.close()
+
     def batch_results(self, batch_id: str) -> Iterator[tuple[str, Transcription | OcrItemError]]:
         """Stream ``(custom_id, result)`` for an ended batch, one line at a time.
 
@@ -355,6 +423,11 @@ class OcrClient:
         before the batch has ended; a failure part-way raises ``OcrUnavailable("stream_failed")``
         and the caller re-reads the batch later (results stay available for 29 days).
         """
+        return self._results(batch_id)
+
+    def _results(
+        self, batch_id: str
+    ) -> Generator[tuple[str, Transcription | OcrItemError], None, None]:
         _check_batch_id(batch_id)
         batch = self._call(lambda: self._sdk.messages.batches.retrieve(batch_id))
         if batch.processing_status != "ended" or not batch.results_url:
@@ -366,7 +439,9 @@ class OcrClient:
         decoder = self._call(lambda: self._sdk.messages.batches.results(batch_id))
         return self._stream(decoder)
 
-    def _stream(self, decoder: _Lines) -> Iterator[tuple[str, Transcription | OcrItemError]]:
+    def _stream(
+        self, decoder: _Lines
+    ) -> Generator[tuple[str, Transcription | OcrItemError], None, None]:
         try:
             iterator = iter(decoder)
             while True:
