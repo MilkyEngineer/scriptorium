@@ -342,7 +342,8 @@ class _Facts:
 
     metadata: Mapping[str, Any]
     metadata_ok: bool
-    tags: frozenset[str] | None  # None: ``.content`` listed but not readable whole
+    tags: frozenset[str] | None  # None: ``.content`` absent or not readable whole
+    content: Mapping[str, Any] | None = None  # the parsed ``.content``, for the tag index
 
     @property
     def folder(self) -> bool:
@@ -869,11 +870,15 @@ class SyncOnce:
                 continue
             transient.reset()
             metadata = _parse_json(meta)
-            # No ``.content`` in the document's index: the cloud holds no tags for it. One
-            # listed but too large or unparseable: its tags are unknown.
-            tags = frozenset() if content_ref is None else scope_tags(_parse_json(content))
+            parsed = _parse_json(content)
+            # A ``.content`` absent from the index, too large or unparseable: the tags are
+            # unknown (fail closed). Every real document and folder has one, so an index
+            # without it is malformed or hostile, and "no tags" would let a deny scope in.
             facts[uuid] = _Facts(
-                metadata=metadata or {}, metadata_ok=metadata is not None, tags=tags
+                metadata=metadata or {},
+                metadata_ok=metadata is not None,
+                tags=scope_tags(parsed),
+                content=parsed,
             )
         return None
 
@@ -891,8 +896,8 @@ class SyncOnce:
 
     def _archived_tags(self, uuid: str) -> frozenset[str] | None:
         """Document tags of the version in ``library/``; None if nothing usable is there (no
-        ``.metadata``, or a ``.content`` that cannot be read whole). An archived version
-        without ``.content`` has no tags."""
+        ``.metadata``, no ``.content``, or one that cannot be read whole): as for a fetched
+        index, a missing ``.content`` makes the tags unknown, not empty."""
         try:
             files = self._archive.current_files(uuid)
         except (ScriptoriumError, OSError):
@@ -901,7 +906,7 @@ class SyncOnce:
             return None
         path = files.get(f"{uuid}.content")
         if path is None:
-            return frozenset()
+            return None
         return scope_tags(_read_json_file(path))
 
     def _excluded_row(

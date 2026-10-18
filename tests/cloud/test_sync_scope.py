@@ -396,6 +396,54 @@ def test_unreadable_tags_leave_a_document_undecided(
     assert h.state("last_root_hash") is None  # the next poll looks again
 
 
+@pytest.mark.parametrize("mode", ["deny", "allow"])
+def test_an_index_without_content_leaves_a_document_undecided(tmp_path: Path, mode: str) -> None:
+    """Every real document has a ``.content``; one whose index leaves it out could be hiding a
+    denied tag, so its tags are unknown, not empty (fail closed)."""
+    files = doc(A, "private")
+    del files[f"{A}.content"]
+    cloud, h = setup(tmp_path, {A: files, B: doc(B, "work")})
+    set_scope(h, mode, "private" if mode == "deny" else "work")
+
+    report = h.poll()
+
+    assert report.outcome == "partial"
+    assert report.failed == {A: "scope_tags_unknown"}
+    assert report.committed == (B,)
+    assert h.index.document(A) is None
+    assert sha256(cloud.docs[A][f"{A}/{A}.rm"]) not in cloud.targets()
+
+
+def test_a_folder_tag_still_settles_a_document_without_content(tmp_path: Path) -> None:
+    files = doc(C, parent=F)
+    del files[f"{C}.content"]
+    cloud, h = setup(tmp_path, {F: folder(F, "private"), C: files})
+    set_scope(h, "deny", "private")
+
+    report = h.poll()
+
+    assert report.outcome == "ok" and report.committed == (F,)
+    assert excluded_at(h, C) is not None
+    assert sha256(cloud.docs[C][f"{C}/{C}.rm"]) not in cloud.targets()
+
+
+def test_an_archived_version_without_content_has_unknown_tags(tmp_path: Path) -> None:
+    """Archived under ``all`` from an index without ``.content``: once a scope is set, its
+    tags are unknown, so it is left as it was rather than decided on "no tags"."""
+    files = doc(A, "private")
+    del files[f"{A}.content"]
+    _cloud, h = setup(tmp_path, {A: files, B: doc(B)})
+    h.poll()
+    before = h.index.document(A)
+    assert before is not None and before.hash_root is not None
+    set_scope(h, "deny", "private")
+
+    report = h.poll()
+
+    assert report.failed == {A: "scope_tags_unknown"}
+    assert h.index.document(A) == before
+
+
 def test_an_archived_document_whose_new_tags_are_unreadable_is_left_as_it_was(
     tmp_path: Path,
 ) -> None:
