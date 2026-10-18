@@ -17,7 +17,9 @@ $KC config credentials --server http://127.0.0.1:8080 --realm master \
   --user "$KC_BOOTSTRAP_ADMIN_USERNAME" --password "$KC_BOOTSTRAP_ADMIN_PASSWORD" </dev/null >/dev/null
 ROLE_ID=$($KC get "roles/$ROLE" -r $R --fields id --format csv --noquotes </dev/null)
 BODY="[{\"id\":\"$ROLE_ID\",\"name\":\"$ROLE\"}]"
-SID=$($KC get client-scopes -r $R --fields id,name --format csv --noquotes </dev/null | awk -F, '$2=="scriptorium"{print $1}')
+# The image has no awk: csv lines are "id,name".
+SID=$($KC get client-scopes -r $R --fields id,name --format csv --noquotes </dev/null | grep ',scriptorium$' | cut -d, -f1)
+[ -n "$SID" ] || { echo "client scope scriptorium not found"; exit 1; }
 if $KC get "client-scopes/$SID/scope-mappings/realm" -r $R --fields name --format csv --noquotes </dev/null | grep -qx "$ROLE"; then
   $KC delete "client-scopes/$SID/scope-mappings/realm" -r $R -b "$BODY" </dev/null
   echo "removed $ROLE from client scope scriptorium"
