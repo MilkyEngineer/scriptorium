@@ -17,7 +17,7 @@ from scriptorium.db.migrations import (
     split_statements,
 )
 from scriptorium.db.schema_account import ACCOUNT_STEPS
-from scriptorium.db.schema_global import GLOBAL_STEPS, SCRIPTORIUM_STEPS
+from scriptorium.db.schema_global import GLOBAL_STEPS, OCR_V1, SCRIPTORIUM_STEPS
 from scriptorium.db.schema_jobs import JOBS_STEPS
 from scriptorium.errors import ScriptoriumError
 from tests.db.sqlite_support import requires_fts5
@@ -221,11 +221,14 @@ def test_jobs_schema_from_each_prior_version(tmp_path: Path, start: int) -> None
 
 def test_scriptorium_steps_create_every_global_table(conn: sqlite3.Connection) -> None:
     """The composed sequence is what every opener of scriptorium.sqlite uses (§6.2)."""
+    # Append-only: M1's file (users..., then jobs) is a prefix of every later sequence.
     assert SCRIPTORIUM_STEPS[: len(GLOBAL_STEPS)] == GLOBAL_STEPS
-    assert SCRIPTORIUM_STEPS[len(GLOBAL_STEPS) :] == JOBS_STEPS
+    m1 = len(GLOBAL_STEPS) + len(JOBS_STEPS)
+    assert SCRIPTORIUM_STEPS[len(GLOBAL_STEPS) : m1] == JOBS_STEPS
+    assert SCRIPTORIUM_STEPS[m1] == OCR_V1
     assert migrate(conn, SCRIPTORIUM_STEPS) == len(SCRIPTORIUM_STEPS)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert {"users", "accounts", "audit", "jobs"} <= tables
+    assert {"users", "accounts", "audit", "jobs", "ocr_spend"} <= tables
     check_version(conn, SCRIPTORIUM_STEPS)
     with pytest.raises(SchemaMismatch):
         check_version(conn, JOBS_STEPS)  # a part of the sequence is never a valid target
@@ -237,3 +240,40 @@ def test_jobs_steps_compose_after_other_steps(conn: sqlite3.Connection) -> None:
     composed = (*TOY, *JOBS_STEPS)
     assert migrate(conn, composed) == len(composed)
     assert conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("start", _prefixes(SCRIPTORIUM_STEPS))
+def test_scriptorium_schema_from_each_prior_version(tmp_path: Path, start: int) -> None:
+    fresh = open_sqlite(tmp_path / "fresh.sqlite")
+    stepped = open_sqlite(tmp_path / "stepped.sqlite")
+    try:
+        migrate(fresh, SCRIPTORIUM_STEPS)
+        migrate(stepped, SCRIPTORIUM_STEPS[:start])
+        migrate(stepped, SCRIPTORIUM_STEPS)
+        assert schema_of(stepped) == schema_of(fresh)
+    finally:
+        fresh.close()
+        stepped.close()
+
+
+def test_ocr_step_keeps_m1_users(conn: sqlite3.Connection) -> None:
+    """An M1 database gains the OCR columns as NULL; nothing about existing users changes."""
+    m1 = (*GLOBAL_STEPS, *JOBS_STEPS)
+    migrate(conn, m1)
+    conn.execute(
+        "INSERT INTO users (uid, iss, sub, display_name, created_at, server_key_allowed) "
+        "VALUES ('0123456789abcdef', 'https://id.example', 's', 'n', "
+        "'2026-01-01T00:00:00.000000Z', 1)"
+    )
+    migrate(conn, SCRIPTORIUM_STEPS)
+    row = conn.execute(
+        "SELECT server_key_allowed, ocr_cap_usd, server_key_email_sha256 FROM users"
+    ).fetchone()
+    assert tuple(row) == (1, None, None)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE users SET ocr_cap_usd = -1")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO ocr_spend (uid, mode, model, input_tokens, output_tokens, cost_usd, at) "
+            "VALUES ('0123456789abcdef', 'lazy', 'm', 1, 1, 0.0, 'x')"
+        )

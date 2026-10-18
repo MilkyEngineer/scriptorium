@@ -474,3 +474,88 @@ def test_active_and_all_accounts(db: Path, gs: GlobalStore) -> None:
 
 def test_worker_heartbeat_path(tmp_path: Path) -> None:
     assert worker_heartbeat_path(tmp_path) == tmp_path / "worker.heartbeat"
+
+
+# ---- OCR additions (§8.1) -------------------------------------------------------------------
+
+
+def test_new_users_have_no_ocr_cap_or_email_digest(gs: GlobalStore) -> None:
+    row = gs.ensure_user(make_user())
+    assert row.ocr_cap_usd is None and row.server_key_email_sha256 is None
+
+
+def test_set_server_key_allowed(gs: GlobalStore) -> None:
+    uid = gs.ensure_user(make_user()).uid
+    gs.set_server_key_allowed(uid, True)
+    row = gs.user(uid)
+    assert row is not None and row.server_key_allowed
+    gs.set_server_key_allowed(uid, False)
+    row = gs.user(uid)
+    assert row is not None and not row.server_key_allowed
+    with pytest.raises(NotFoundError):
+        gs.set_server_key_allowed("f" * 16, True)
+    with pytest.raises(InvalidArgumentError):
+        gs.set_server_key_allowed("reader@example.com", True)
+    with pytest.raises(InvalidArgumentError):
+        gs.set_server_key_allowed(uid, 1)  # type: ignore[arg-type]
+
+
+def test_set_user_ocr_cap(gs: GlobalStore) -> None:
+    uid = gs.ensure_user(make_user()).uid
+    gs.set_user_ocr_cap(uid, 7.5)
+    row = gs.user(uid)
+    assert row is not None and row.ocr_cap_usd == 7.5
+    gs.set_user_ocr_cap(uid, 0)
+    row = gs.user(uid)
+    assert row is not None and row.ocr_cap_usd == 0.0
+    gs.set_user_ocr_cap(uid, None)
+    row = gs.user(uid)
+    assert row is not None and row.ocr_cap_usd is None
+    for bad in (-1.0, float("nan"), float("inf"), True, "5"):
+        with pytest.raises(InvalidArgumentError):
+            gs.set_user_ocr_cap(uid, bad)  # type: ignore[arg-type]
+    with pytest.raises(NotFoundError):
+        gs.set_user_ocr_cap("f" * 16, 1.0)
+
+
+def test_set_server_key_email(gs: GlobalStore) -> None:
+    uid = gs.ensure_user(make_user()).uid
+    digest = "ab" * 32
+    gs.set_server_key_email(uid, digest)
+    row = gs.user(uid)
+    assert row is not None and row.server_key_email_sha256 == digest
+    assert digest not in repr(row)
+    gs.set_server_key_email(uid, None)
+    row = gs.user(uid)
+    assert row is not None and row.server_key_email_sha256 is None
+    for bad in ("reader@example.com", "AB" * 32, "ab" * 31):
+        with pytest.raises(InvalidArgumentError):
+            gs.set_server_key_email(uid, bad)
+
+
+def test_ocr_columns_survive_ensure_user(gs: GlobalStore) -> None:
+    uid = gs.ensure_user(make_user()).uid
+    gs.set_user_ocr_cap(uid, 3.0)
+    gs.set_server_key_allowed(uid, True)
+    row = gs.ensure_user(make_user(name="renamed"))
+    assert (row.ocr_cap_usd, row.server_key_allowed) == (3.0, True)
+
+
+def test_audit_accepts_a_uid_as_the_user_identifier(db: Path, gs: GlobalStore) -> None:
+    gs.audit(
+        uid_hash=make_user().uid_hash,
+        tool="admin_allow_server_key",
+        duration_ms=1,
+        outcome="ok",
+        identifiers={"user": UID},
+    )
+    for bad in ("reader@example.com", "sub-1", UID.upper(), UID + "0"):
+        with pytest.raises(ValueError):
+            gs.audit(
+                uid_hash=make_user().uid_hash,
+                tool="admin_allow_server_key",
+                duration_ms=1,
+                outcome="ok",
+                identifiers={"user": bad},
+            )
+    assert len(_audit_rows(db)) == 1

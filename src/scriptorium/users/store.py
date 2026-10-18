@@ -6,14 +6,16 @@ tenancy). A user's directory is named by ``uid``, the first 16 hex characters of
 are validated by full-string regex before they touch a path, and every path handed out is
 asserted to stay inside its root with symlinks resolved (:meth:`AccountPaths.inside`).
 
-:class:`GlobalStore` owns three tables of ``scriptorium.sqlite``; their schema is step 1 of
-:data:`scriptorium.db.migrations.GLOBAL_STEPS`. Audit rows carry only allowlisted,
+:class:`GlobalStore` owns three tables of ``scriptorium.sqlite``; their schema is in
+``db/schema_global.py`` (``ocr_spend``, in the same file, belongs to ``ocr/ledger.py``). Audit
+rows carry only allowlisted,
 shape-checked identifiers (:data:`AUDIT_IDENTIFIER_KEYS`), never arguments or content.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -21,7 +23,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -168,6 +170,10 @@ class UserRow:
     disabled_at: datetime | None
     quota_gb: float | None
     server_key_allowed: bool
+    ocr_cap_usd: float | None = None
+    """The user's own monthly cap on their own Claude key (§8.1); None = no cap."""
+    server_key_email_sha256: str | None = field(default=None, repr=False)
+    """SHA-256 of the verified email, kept only while it is listed in SERVER_KEY_USERS."""
 
 
 @dataclass(frozen=True)
@@ -185,6 +191,11 @@ _OUTCOME_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _HOST_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}|\[[0-9A-Fa-f:.]{2,45}\]")
 _SNAPSHOT_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}")
 _MAX_LIST: Final = 100
+_USER_UPDATES: Final[Mapping[str, str]] = {
+    "server_key_allowed": "UPDATE users SET server_key_allowed = ? WHERE uid = ?",
+    "ocr_cap_usd": "UPDATE users SET ocr_cap_usd = ? WHERE uid = ?",
+    "server_key_email_sha256": "UPDATE users SET server_key_email_sha256 = ? WHERE uid = ?",
+}
 _MAX_DEVICE_DESC: Final = 128
 _MAX_IDENTITY: Final = 256
 
@@ -223,6 +234,8 @@ AUDIT_IDENTIFIER_KEYS: Final[Mapping[str, Callable[[object], bool]]] = {
     "generation": _is_int,
     "host": _matches(_HOST_RE),
     "snapshot": _matches(_SNAPSHOT_RE),
+    # The target of an admin tool: a 16-character uid, never an email or a sub.
+    "user": _matches(UID_RE),
 }
 
 
@@ -344,7 +357,7 @@ class GlobalStore:
     def _user(conn: sqlite3.Connection, uid: str) -> UserRow | None:
         row = conn.execute(
             "SELECT uid, iss, sub, display_name, created_at, disabled_at, quota_gb, "
-            "server_key_allowed FROM users WHERE uid = ?",
+            "server_key_allowed, ocr_cap_usd, server_key_email_sha256 FROM users WHERE uid = ?",
             (uid,),
         ).fetchone()
         if row is None:
@@ -360,7 +373,50 @@ class GlobalStore:
             disabled_at=_parse_ts(row[5]),
             quota_gb=row[6],
             server_key_allowed=bool(row[7]),
+            ocr_cap_usd=row[8],
+            server_key_email_sha256=row[9],
         )
+
+    def _update_user(self, uid: str, column: str, value: object) -> None:
+        sql = _USER_UPDATES[column]  # fixed statements: a column name never comes from input
+        with self._write() as conn:
+            cur = conn.execute(sql, (value, uid))
+            if cur.rowcount == 0:
+                raise NotFoundError("no such user", hint="the user must have signed in once")
+
+    def set_server_key_allowed(self, uid: str, allowed: bool) -> None:
+        """Grant or withdraw the server's Claude key for ``uid`` (``admin_allow_server_key``).
+
+        Raises NotFoundError for a uid that has never signed in.
+        """
+        if not isinstance(allowed, bool):
+            raise InvalidArgumentError("allowed must be true or false")
+        self._update_user(_check_uid(uid), "server_key_allowed", int(allowed))
+
+    def set_user_ocr_cap(self, uid: str, cap_usd: float | None) -> None:
+        """Set (or clear, with None) the user's own monthly cap on their own key (§8.1)."""
+        if cap_usd is not None and (
+            isinstance(cap_usd, bool)
+            or not isinstance(cap_usd, int | float)
+            or not math.isfinite(cap_usd)
+            or cap_usd < 0
+        ):
+            raise InvalidArgumentError("the monthly cap must be a non-negative number of USD")
+        value = None if cap_usd is None else float(cap_usd)
+        self._update_user(_check_uid(uid), "ocr_cap_usd", value)
+
+    def set_server_key_email(self, uid: str, digest: str | None) -> None:
+        """Record (or clear) the SHA-256 of the user's listed email (§8.1, SERVER_KEY_USERS).
+
+        Only the digest of an email that SERVER_KEY_USERS lists is ever stored; the worker
+        compares it with the digests of the list's current entries, so an email removed from
+        the list stops matching at once.
+        """
+        if digest is not None and (
+            not isinstance(digest, str) or _UID_HASH_RE.fullmatch(digest) is None
+        ):
+            raise InvalidArgumentError("the email digest must be 64 hex characters")
+        self._update_user(_check_uid(uid), "server_key_email_sha256", digest)
 
     # ---- accounts ------------------------------------------------------------------------
 

@@ -62,8 +62,36 @@ CREATE INDEX audit_by_uid_ts ON audit (uid, ts);
 """,
 )
 
-GLOBAL_STEPS: Final[tuple[Step, ...]] = (V1,)
-"""The users/accounts/audit part of the sequence; read-only history."""
+OCR_V1: Final = Step(
+    name="ocr spend and caps v1",
+    sql="""
+-- The user's own monthly cap on their own key (set_claude_api_key); NULL = none (§8.1).
+ALTER TABLE users ADD COLUMN ocr_cap_usd REAL CHECK (ocr_cap_usd IS NULL OR ocr_cap_usd >= 0);
+-- SHA-256 of the user's verified, ASCII-lowered email, recorded at sign-in only while that
+-- email is listed in SERVER_KEY_USERS, so the worker can apply an email entry without the
+-- token; never the email itself.
+ALTER TABLE users ADD COLUMN server_key_email_sha256 TEXT
+    CHECK (server_key_email_sha256 IS NULL OR length(server_key_email_sha256) = 64);
 
-SCRIPTORIUM_STEPS: Final[tuple[Step, ...]] = (*GLOBAL_STEPS, *JOBS_STEPS)
+-- One row per transcribed page through a key; the caps are sums over the UTC calendar month
+-- of `at`. Kept when a transcript is replaced or a user clears their key (§6.2, §8.1).
+CREATE TABLE ocr_spend (
+    id            INTEGER PRIMARY KEY,
+    uid           TEXT NOT NULL CHECK (length(uid) = 16),
+    mode          TEXT NOT NULL CHECK (mode IN ('user', 'server')),
+    model         TEXT NOT NULL,
+    input_tokens  INTEGER NOT NULL CHECK (input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+    cost_usd      REAL NOT NULL CHECK (cost_usd >= 0),
+    at            TEXT NOT NULL
+) STRICT;
+CREATE INDEX ocr_spend_by_uid_at ON ocr_spend (uid, at);
+CREATE INDEX ocr_spend_by_at ON ocr_spend (at);
+""",
+)
+
+GLOBAL_STEPS: Final[tuple[Step, ...]] = (V1,)
+"""The M1 users/accounts/audit part of the sequence; read-only history."""
+
+SCRIPTORIUM_STEPS: Final[tuple[Step, ...]] = (*GLOBAL_STEPS, *JOBS_STEPS, OCR_V1)
 """The whole ``scriptorium.sqlite`` sequence. Append-only; ``len`` is the file's version."""
