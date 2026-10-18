@@ -480,6 +480,45 @@ def test_a_non_retryable_status_on_the_root_index_backs_off(tmp_path: Path) -> N
     assert h.state("anomaly") is None
 
 
+def test_a_failing_document_records_that_tombstoning_is_suspended(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    assert h.poll().outcome == "ok"
+    assert h.state("tombstoning_suspended_since") is None
+
+    cloud.docs[NOTEBOOK][PAGE_101] = fixture_documents()[PDF][PDF_PAGE]  # a new index...
+    cloud.publish()
+    cloud.status[cloud.doc_hash(NOTEBOOK)] = 404  # ...that fails on every poll
+    first = h.poll()
+    assert first.outcome == "partial" and not first.listing_complete
+    since = h.state("tombstoning_suspended_since")
+    assert since is not None and datetime.fromisoformat(since) == first.started_at
+    assert h.state("tombstoning_suspended_failed") == "1"
+    second = h.poll()
+    assert second.started_at > first.started_at
+    assert h.state("tombstoning_suspended_since") == since  # the first poll's time is kept
+    assert h.state("tombstoning_suspended_failed") == "1"
+
+    del cloud.status[cloud.doc_hash(NOTEBOOK)]
+    assert h.poll().listing_complete
+    assert h.state("tombstoning_suspended_since") is None
+    assert h.state("tombstoning_suspended_failed") is None
+
+
+def test_a_poll_stopped_by_an_outage_does_not_suspend_tombstoning(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.poll()
+    cloud.docs[NOTEBOOK][PAGE_101] = fixture_documents()[PDF][PDF_PAGE]
+    cloud.publish()
+    cloud.status[cloud.doc_hash(NOTEBOOK)] = 429  # rate limited: the poll stops
+
+    assert h.poll().outcome == "backoff"
+    assert h.state("tombstoning_suspended_since") is None
+
+
 def test_an_existing_anomaly_short_circuits_without_a_request(tmp_path: Path) -> None:
     cloud = FakeCloud()
     both(cloud)

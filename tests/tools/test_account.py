@@ -293,6 +293,10 @@ async def test_partial_listing_tombstones_nothing(
             status = await library.ok("account_status")
             assert status["sync"]["last_full_listing_ok"] is False
             assert status["sync"]["last_poll_outcome"] == "partial"
+            (warning,) = [w for w in status["warnings"] if w["code"] == "tombstoning_suspended"]
+            assert warning["failed"] == 1
+            assert warning["since"].endswith("Z")
+            assert NOTEBOOK not in json.dumps(warning)  # identifiers of failures stay out
             assert (await library.ok("trash"))["items"] == []
             listed = {item["uuid"] for item in (await library.ok("list"))["items"]}
             assert listed == {NOTEBOOK, PDF}

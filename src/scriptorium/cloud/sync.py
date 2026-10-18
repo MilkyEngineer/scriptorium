@@ -43,6 +43,12 @@ while nothing has been downloaded, so a poll with time left always fetches at le
 A poll that ends early for any reason (a budget, ``backoff``, ``token_rejected``) applies
 no tombstones: deletions wait for a poll that ran to the end.
 
+A listing in which some document index could not be fetched is incomplete, so one document
+that fails on every poll suspends tombstoning for the whole account. That is deliberate,
+and it is made visible: such a poll records ``sync_state.tombstoning_suspended_since`` (the
+time of the first one) and ``tombstoning_suspended_failed`` (how many documents failed), and
+the next complete listing clears both. ``account_status`` warns while they are set.
+
 A root identical to the last fully processed one (same hash) is a complete listing of the
 same documents, so the planner still runs on it: that is what lets a deletion on a quiet
 account reach its second consecutive listing.
@@ -92,6 +98,7 @@ from scriptorium.cloud.protocol import (
     RootInfo,
     is_uuid,
 )
+from scriptorium.db.connect import to_db_time
 from scriptorium.errors import PathEscapeError, ScriptoriumError
 from scriptorium.logging import log_event
 
@@ -106,6 +113,10 @@ STATE_ANOMALY: Final = "anomaly"
 STATE_ANOMALY_REASON: Final = "anomaly_reason"
 STATE_ALLOW_MASS_DELETE: Final = "allow_mass_delete"
 """One-shot administrator approval: ``"true"`` lets the next listing skip the breaker."""
+STATE_TOMBSTONING_SUSPENDED_SINCE: Final = "tombstoning_suspended_since"
+"""When the run of polls whose listing failed on some documents began (cleared when complete)."""
+STATE_TOMBSTONING_SUSPENDED_FAILED: Final = "tombstoning_suspended_failed"
+"""How many document indexes the latest such poll could not fetch."""
 
 ANOMALY_GENERATION_REGRESSED: Final = "generation_regressed"
 ANOMALY_EMPTY_ROOT: Final = "empty_root"
@@ -338,6 +349,8 @@ class SyncOnce:
             complete = stop is None and not run.failed
         run.listing_complete = complete
         current = Listing(uuids=uuids, complete=complete, generation=root.generation)
+        # The listing ran to its end and is incomplete only because documents failed.
+        listing_failures = len(run.failed) if stop is None and not complete else 0
 
         if stop is None:
             plan = self._planner(
@@ -375,7 +388,12 @@ class SyncOnce:
                     self._tombstone(plan.to_tombstone, run)
 
         fully_done = complete and stop is None and not run.failed and run.anomaly is None
-        self._save_listing(current, root_hash=root.hash if fully_done else None)
+        self._save_listing(
+            current,
+            root_hash=root.hash if fully_done else None,
+            listing_failures=listing_failures,
+            started_at=run.started_at,
+        )
 
         if run.anomaly is not None:
             return self._finish(run, "anomaly", reason=run.anomaly)
@@ -402,9 +420,35 @@ class SyncOnce:
             if cursor is None:
                 return frozenset(live), frozenset(dead)
 
-    def _save_listing(self, listing: Listing, *, root_hash: str | None) -> None:
-        """Record this poll's listing for the next one and consume any one-shot approval."""
+    def _save_listing(
+        self,
+        listing: Listing,
+        *,
+        root_hash: str | None,
+        listing_failures: int = 0,
+        started_at: datetime | None = None,
+    ) -> None:
+        """Record this poll's listing for the next one and consume any one-shot approval.
+
+        A complete listing clears the ``tombstoning_suspended_*`` keys; one that failed on
+        ``listing_failures`` documents sets them (keeping the first poll's time).
+        """
         with self._index.transaction():
+            if listing.complete:
+                self._index.set_state(STATE_TOMBSTONING_SUSPENDED_SINCE, None)
+                self._index.set_state(STATE_TOMBSTONING_SUSPENDED_FAILED, None)
+            elif listing_failures and started_at is not None:
+                if self._index.get_state(STATE_TOMBSTONING_SUSPENDED_SINCE) is None:
+                    since = to_db_time(started_at)
+                    self._index.set_state(STATE_TOMBSTONING_SUSPENDED_SINCE, since)
+                    log_event(
+                        logger,
+                        "sync.tombstoning_suspended",
+                        level=logging.WARNING,
+                        acct=self._settings.acct,
+                        count=listing_failures,
+                    )
+                self._index.set_state(STATE_TOMBSTONING_SUSPENDED_FAILED, str(listing_failures))
             self._index.set_state(STATE_LAST_GENERATION, str(listing.generation))
             self._index.set_state(STATE_PREVIOUS_LISTING, _dump_listing(listing))
             ok = "true" if listing.complete else "false"

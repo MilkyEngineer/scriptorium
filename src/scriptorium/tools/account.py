@@ -24,7 +24,13 @@ from scriptorium.accounts import (
     device_token_name,
 )
 from scriptorium.auth.oidc import User
-from scriptorium.cloud.sync import STATE_ANOMALY, STATE_ANOMALY_REASON, STATE_LAST_FULL_LISTING_OK
+from scriptorium.cloud.sync import (
+    STATE_ANOMALY,
+    STATE_ANOMALY_REASON,
+    STATE_LAST_FULL_LISTING_OK,
+    STATE_TOMBSTONING_SUSPENDED_FAILED,
+    STATE_TOMBSTONING_SUSPENDED_SINCE,
+)
 from scriptorium.db.connect import from_db_time
 from scriptorium.errors import RefusedError
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
@@ -221,6 +227,8 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
             STATE_ANOMALY,
             STATE_ANOMALY_REASON,
             STATE_LAST_FULL_LISTING_OK,
+            STATE_TOMBSTONING_SUSPENDED_SINCE,
+            STATE_TOMBSTONING_SUSPENDED_FAILED,
         )
     }
     jobs = svc.queue.counts(account.uid, acct=account.acct)
@@ -254,6 +262,21 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
                 "reason": state[STATE_ANOMALY_REASON],
                 "message": "Sync is paused in read-only mode; the archive is still served.",
                 "hint": "An administrator must look at it and clear it.",
+            }
+        )
+    suspended_since = _time(state[STATE_TOMBSTONING_SUSPENDED_SINCE])
+    if suspended_since is not None:
+        failed_text = state[STATE_TOMBSTONING_SUSPENDED_FAILED] or ""
+        failed = int(failed_text) if failed_text.isdigit() else None
+        warnings.append(
+            {
+                "code": "tombstoning_suspended",
+                "since": suspended_since,
+                "failed": failed,
+                "message": "Some documents could not be listed from reMarkable, so documents "
+                "deleted there are not moved to the trash here until every document lists "
+                "again. Nothing is lost meanwhile.",
+                "hint": "If this persists, ask the operator to check the worker logs.",
             }
         )
     verdicts, rerunnable = svc.queue.dead_renders(account.uid, acct=account.acct)
