@@ -69,16 +69,33 @@ def _pixels(png: bytes) -> Image.Image:
         return im.convert("RGB")
 
 
-def _pixel_difference(a: Image.Image, b: Image.Image) -> tuple[int, float]:
-    """``(max channel difference, fraction of pixels that differ)`` between two RGB images."""
-    diff = ImageChops.difference(a, b)
-    extrema = diff.getextrema()
-    max_channel = max(hi for _, hi in extrema)
-    differing = sum(1 for px in diff.getdata() if px != (0, 0, 0))
-    return max_channel, differing / (a.width * a.height)
+def _difference_mask(a: Image.Image, b: Image.Image) -> Image.Image:
+    """An ``L`` image: the largest channel difference at each pixel (0 where ``a == b``)."""
+    r, g, b_ = ImageChops.difference(a, b).split()
+    return ImageChops.lighter(ImageChops.lighter(r, g), b_)
 
 
-def _assert_matches_golden(result: RenderResult, name: str) -> None:
+def _count_nonzero(mask: Image.Image) -> int:
+    return mask.width * mask.height - mask.histogram()[0]
+
+
+MAX_PAGE_TEXT_FRACTION = 0.01
+"""Share of pixels that may differ from the golden where the PDF page itself is drawn."""
+
+
+def _assert_matches_golden(
+    result: RenderResult, name: str, *, plain_page: RenderResult | None = None
+) -> None:
+    """``result`` is the golden picture.
+
+    Byte equality holds on the machine that made the goldens; elsewhere the PNG bytes depend
+    on the zlib and resvg builds in the wheels, so the decoded pixels are compared instead.
+    Notebook pages must be pixel-identical. For an annotated PDF page, ``plain_page`` is the
+    same page rendered without ink on this platform: every pixel the ink touches must be
+    identical to the golden, while the page raster underneath may differ a little, because the
+    fixture PDF does not embed its fonts and PDFium substitutes whatever the platform has
+    (on Linux the first CI run differed in 0.41% of pixels, all inside the two lines of text).
+    """
     golden = GOLDEN_JSON["pages"][name]
     x, y, w, h = golden["viewbox_units"]
     assert (result.width, result.height) == tuple(golden["px"])
@@ -86,13 +103,25 @@ def _assert_matches_golden(result: RenderResult, name: str) -> None:
     golden_png = (GOLDEN / f"{name}.png").read_bytes()
     assert hashlib.sha256(golden_png).hexdigest() == golden["sha256"], "golden file changed"
     if result.png == golden_png:
-        return  # byte-identical (the case on the machine that produced the goldens)
-    # Pixel-identical is what matters: the PNG bytes depend on the zlib and resvg builds in
-    # the wheels, which differ between platforms (CI on Linux vs the goldens made on macOS).
-    max_channel, fraction = _pixel_difference(_pixels(result.png), _pixels(golden_png))
-    assert (max_channel, fraction) == (0, 0.0), (
-        f"{name}: pixels differ from the golden (max channel diff {max_channel}, "
-        f"{fraction:.4%} of pixels)"
+        return
+    actual, expected = _pixels(result.png), _pixels(golden_png)
+    diff = _difference_mask(actual, expected)
+    if plain_page is None:
+        assert diff.getbbox() is None, (
+            f"{name}: {_count_nonzero(diff)} pixels differ from the golden "
+            f"(largest channel difference {diff.getextrema()[1]})"
+        )
+        return
+    assert (plain_page.width, plain_page.height) == (result.width, result.height)
+    ink = _difference_mask(actual, _pixels(plain_page.png)).point(lambda v: 255 if v else 0)
+    on_ink = ImageChops.multiply(diff, ink)
+    assert on_ink.getbbox() is None, (
+        f"{name}: {_count_nonzero(on_ink)} ink pixels differ from the golden"
+    )
+    fraction = _count_nonzero(diff) / (result.width * result.height)
+    assert fraction <= MAX_PAGE_TEXT_FRACTION, (
+        f"{name}: {fraction:.4%} of page pixels differ from the golden "
+        f"(largest channel difference {diff.getextrema()[1]})"
     )
 
 
@@ -106,7 +135,7 @@ def test_notebook_page_matches_golden(n: int) -> None:
 
 def test_annotated_pdf_page_matches_golden() -> None:
     result = _rendered_pdf()
-    _assert_matches_golden(result, "pdf-01")
+    _assert_matches_golden(result, "pdf-01", plain_page=render_pdf_page(_pdf(), 0))
     # The page is laid out at 226/72 units per point, not at the .rm's 1404 x 1872 paper.
     w_pt, h_pt = 612.0, 792.0  # US Letter, the fixture PDF
     x0, y0, x1, y1 = result.extent_units
