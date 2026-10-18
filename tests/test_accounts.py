@@ -163,3 +163,40 @@ def test_removal_destination_refuses_a_symlinked_removed_directory(
     with pytest.raises(PathEscapeError):
         removal_destination(tmp_path, UID, ACCT, at=AT)
     assert paths.root.is_dir() and not any(elsewhere.iterdir())
+
+
+def test_removal_destination_refuses_a_removed_symlink_inside_the_user_directory(
+    paths: AccountPaths, tmp_path: Path
+) -> None:
+    # Probe P2: resolving inside the user's directory is not enough; removed/ must be itself.
+    user = paths.root.parent.parent
+    inside = user / "elsewhere"
+    inside.mkdir()
+    (user / "removed").symlink_to(inside)
+    with pytest.raises(RefusedError) as refused:
+        removal_destination(tmp_path, UID, ACCT, at=AT)
+    assert not isinstance(refused.value, PathEscapeError)
+    assert str(tmp_path) not in str(refused.value)
+    assert paths.root.is_dir() and not any(inside.iterdir())
+
+
+def test_removal_destination_refuses_a_dangling_removed_symlink(
+    paths: AccountPaths, tmp_path: Path
+) -> None:
+    user = paths.root.parent.parent
+    (user / "removed").symlink_to(user / "nowhere")
+    with pytest.raises(RefusedError):
+        removal_destination(tmp_path, UID, ACCT, at=AT)
+    assert paths.root.is_dir() and not (user / "nowhere").exists()
+
+
+def test_move_aside_refuses_a_removed_directory_swapped_for_a_symlink(
+    paths: AccountPaths, tmp_path: Path
+) -> None:
+    destination = removal_destination(tmp_path, UID, ACCT, at=AT)
+    real = destination.parent.with_name("removed-real")
+    os.rename(destination.parent, real)
+    destination.parent.symlink_to(real)
+    with pytest.raises(NotADirectoryError):
+        move_aside(paths, destination)
+    assert paths.root.is_dir() and not any(real.iterdir())

@@ -123,9 +123,10 @@ def removal_destination(data_dir: Path, uid: str, acct: str, *, at: datetime) ->
 
     Creates ``removed/`` if needed and refuses (:class:`RefusedError`) unless the move can be
     one rename: the account directory is a real directory (not a symlink) inside the user's
-    directory, the destination is inside ``removed/`` and does not exist yet, and both are
-    on the same filesystem (a rename across filesystems would copy, and is refused by the
-    kernel anyway). Nothing is moved or deleted here.
+    directory; ``removed/`` is a real directory too, at exactly ``users/<uid>/removed`` (a
+    symlink is refused even when it points inside the user's directory); the destination
+    does not exist yet; and both are on the same filesystem (a rename across filesystems
+    would copy, and is refused by the kernel anyway). Nothing is moved or deleted here.
     """
     paths = account_paths(data_dir, uid, acct)
     user = user_dir(data_dir, uid)
@@ -137,14 +138,30 @@ def removal_destination(data_dir: Path, uid: str, acct: str, *, at: datetime) ->
         raise RefusedError("the account directory is not a directory")
     resolve_inside(user, paths.root)
     base = removed_dir(data_dir, uid)
-    base.mkdir(mode=0o700, exist_ok=True)
-    base = removed_dir(data_dir, uid)  # again: refuses a symlink planted meanwhile
+    try:
+        base.mkdir(mode=0o700, exist_ok=True)
+    except OSError:  # e.g. a dangling symlink or a file in its place
+        raise RefusedError("removed/ cannot be created") from None
+    base_info = _plain_directory(base)
+    if base_info is None:
+        raise RefusedError("removed/ is not a plain directory")
+    if os.path.realpath(base) != os.path.join(os.path.realpath(user), "removed"):
+        raise RefusedError("removed/ is not where it should be")
     destination = removed_account_path(data_dir, uid, acct, at)
     if os.path.lexists(destination):
         raise RefusedError("the destination already exists")
-    if os.lstat(base).st_dev != info.st_dev:
+    if base_info.st_dev != info.st_dev:
         raise RefusedError("removed/ is on another filesystem")
     return destination
+
+
+def _plain_directory(path: Path) -> os.stat_result | None:
+    """``lstat`` of ``path`` if it is a directory itself (not a symlink to one), else None."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return info if stat.S_ISDIR(info.st_mode) else None
 
 
 def move_aside(paths: AccountPaths, destination: Path) -> None:
@@ -160,6 +177,8 @@ def move_aside(paths: AccountPaths, destination: Path) -> None:
     """
     if os.path.lexists(destination):
         raise FileExistsError("the destination already exists")
+    if _plain_directory(destination.parent) is None:  # checked again: replaced meanwhile?
+        raise NotADirectoryError("removed/ is not a plain directory")
     os.rename(paths.root, destination)
     for parent in (paths.root.parent, destination.parent):
         try:

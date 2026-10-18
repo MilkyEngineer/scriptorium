@@ -318,6 +318,27 @@ async def test_a_failed_move_leaves_the_archive_readable(
     assert done["removed"] is True and not linked.paths.root.exists()
 
 
+async def test_a_symlinked_removed_directory_is_refused_before_anything_changes(
+    library: Served, linked: Linked
+) -> None:
+    user = linked.settings.data_dir / "users" / linked.uid
+    inside = user / "elsewhere"
+    inside.mkdir()
+    (user / "removed").symlink_to(inside)
+    token = (await _dry_run(library))["confirmation_token"]
+
+    refused = await _execute(library, token)
+
+    assert refused["code"] == "refused" and "Nothing was changed" in refused["hint"]
+    assert linked.paths.root.is_dir() and not any(inside.iterdir())
+    row = linked.store.account(linked.uid, linked.acct)
+    assert row is not None and row.active and row.removed_at is None
+    # The token was not spent: once the operator has fixed the directory it works.
+    (user / "removed").unlink()
+    done = await _execute(library, token)
+    assert done["removed"] is True and not any(inside.iterdir())
+
+
 async def _assert_stays_removed(library: Served, linked: Linked) -> None:
     """The account is removed and refused, and nothing recreated its directory."""
     row = linked.store.account(linked.uid, linked.acct)
