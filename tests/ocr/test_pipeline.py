@@ -23,15 +23,20 @@ from scriptorium.ocr.pipeline import (
     KEY_REFUSED_KEY,
     KEY_UNREADABLE,
     MAX_PENDING_BATCHES,
+    MAX_PENDING_SUBMISSIONS,
     PENDING_BATCHES_KEY,
+    PENDING_SUBMISSIONS_KEY,
     AutoOcr,
     KeyRefusal,
     ModeChoice,
+    PendingSubmission,
     add_pending_batch,
+    add_pending_submission,
     affordable_pages,
     blocked_reason,
     clear_key_refusal,
     drop_pending_batch,
+    drop_pending_submission,
     dump_auto_ocr,
     enqueue_page,
     is_deferred,
@@ -41,6 +46,7 @@ from scriptorium.ocr.pipeline import (
     load_auto_ocr,
     load_key_refusal,
     load_pending_batches,
+    load_pending_submissions,
     note_key_refusal,
     remaining_usd,
     resolve_mode,
@@ -340,3 +346,70 @@ def test_pending_batches_are_bounded_and_garbage_is_dropped(index: Index) -> Non
     for raw in ("not json", "{}"):
         index.set_setting(PENDING_BATCHES_KEY, raw)
         assert load_pending_batches(index) == []
+
+
+# ---- pending submissions ----------------------------------------------------------------------
+
+SUBMITTED_AT = datetime(2026, 10, 18, 9, 30, tzinfo=UTC)
+
+
+def _submission(n: int, *, items: int = 2) -> PendingSubmission:
+    nonce = f"{n:016x}"
+    return PendingSubmission(
+        nonce,
+        SUBMITTED_AT,
+        "user",
+        {f"{nonce}-p{i}": spec() for i in range(items)},
+        prompt_version="v1",
+    )
+
+
+def test_pending_submissions_round_trip_and_drop(index: Index) -> None:
+    assert load_pending_submissions(index) == []
+    add_pending_submission(index, _submission(1))
+    add_pending_submission(index, _submission(2, items=3))
+    add_pending_submission(index, _submission(1))  # once per nonce
+    assert load_pending_submissions(index) == [_submission(2, items=3), _submission(1)]
+    stored = json.loads(index.get_setting(PENDING_SUBMISSIONS_KEY) or "[]")
+    assert all("batch_id" not in entry for entry in stored)
+    # Once its batch id is known, the submission becomes that batch's job payload.
+    batch = _submission(1).spec("msgbatch_01")
+    assert (batch.batch_id, batch.mode, batch.prompt_version) == ("msgbatch_01", "user", "v1")
+    assert set(batch.items) == set(_submission(1).items)
+    drop_pending_submission(index, f"{2:016x}")
+    drop_pending_submission(index, "f" * 16)
+    assert load_pending_submissions(index) == [_submission(1)]
+    drop_pending_submission(index, f"{1:016x}")
+    assert index.get_setting(PENDING_SUBMISSIONS_KEY) is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"nonce": "ABCDEF0123456789"},
+        {"nonce": "short"},
+        {"at": "yesterday"},
+        {"at": 1},
+        {"mode": "lazy"},
+        {"items": {}},
+        {"items": {"p0": spec().payload()}},  # not tagged with the nonce
+        {"items": {f"{'e' * 16}-p0": spec().payload()}},  # another submission's tag
+        {"prompt_version": "1"},
+        {"batch_id": "msgbatch_01"},
+    ],
+)
+def test_malformed_pending_submissions_are_dropped(index: Index, change: dict[str, object]) -> None:
+    good = _submission(1).payload()
+    bad = {**_submission(2).payload(), **change}
+    index.set_setting(PENDING_SUBMISSIONS_KEY, json.dumps([bad, good, "x"]))
+    assert load_pending_submissions(index) == [_submission(1)]
+
+
+def test_pending_submissions_are_bounded(index: Index) -> None:
+    for n in range(MAX_PENDING_SUBMISSIONS + 2):
+        add_pending_submission(index, _submission(n))
+    kept = [s.nonce for s in load_pending_submissions(index)]
+    assert kept == [f"{n:016x}" for n in range(2, MAX_PENDING_SUBMISSIONS + 2)]
+    for raw in ("not json", "{}"):
+        index.set_setting(PENDING_SUBMISSIONS_KEY, raw)
+        assert load_pending_submissions(index) == []

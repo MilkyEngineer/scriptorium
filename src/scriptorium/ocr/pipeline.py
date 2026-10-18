@@ -18,6 +18,14 @@
   written there as soon as the API has accepted it and removed once its ``ocr_batch`` job is
   queued, so a batch whose job could not be queued is adopted by the next scan instead of
   being paid for and never collected.
+- **Pending submissions** (``settings`` key ``ocr_pending_submissions``): written *before*
+  a batch is submitted (its random nonce, time, mode, items and prompt version; no batch id
+  yet) and replaced by a pending batch once the API answers with the id. A submission whose
+  answer was lost (a timeout, a dropped connection, a 5xx: the batch may exist) stays, and
+  the scan looks for it in the key's batch listing: a batch created around that time with
+  as many requests, whose results carry the nonce, is adopted; none after a grace period
+  means it was never created; an entry that cannot be settled is dropped after a day and
+  logged as ``ocr_batch_lost``.
 - **Queueing a page** follows the queue's dedupe convention: the key
   ``ocr:<acct>:<document>:<page>:<hash>`` names one page version, so ten polls of an
   unchanged page find the same job. A job that cannot run now (no key, a cap reached, a
@@ -36,9 +44,10 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 from pydantic import SecretStr
 
@@ -46,11 +55,14 @@ from scriptorium.config import Settings
 from scriptorium.db.connect import from_db_time, to_db_time
 from scriptorium.errors import ScriptoriumError
 from scriptorium.jobs.kinds import (
+    BATCH_NONCE_RE,
     KEY_ERROR_PREFIX,
+    PROMPT_VERSION_RE,
     BatchMode,
     OcrBatchSpec,
     OcrSpec,
     parse_ocr_batch_payload,
+    parse_ocr_payload,
 )
 from scriptorium.jobs.queue import JobQueue, JobRow, is_deferred
 from scriptorium.library.index import Index
@@ -74,16 +86,20 @@ __all__ = [
     "OCR_IMAGE_SIDE",
     "OCR_MAX_ATTEMPTS",
     "PENDING_BATCHES_KEY",
+    "PENDING_SUBMISSIONS_KEY",
     "SERVER_MODES",
     "TRANSCRIPT_MAX_BYTES",
     "AutoOcr",
     "KeyRefusal",
     "ModeChoice",
+    "PendingSubmission",
     "Queued",
     "add_pending_batch",
+    "add_pending_submission",
     "blocked_reason",
     "clear_key_refusal",
     "drop_pending_batch",
+    "drop_pending_submission",
     "dump_auto_ocr",
     "enqueue_page",
     "is_deferred",
@@ -93,6 +109,7 @@ __all__ = [
     "load_auto_ocr",
     "load_key_refusal",
     "load_pending_batches",
+    "load_pending_submissions",
     "note_key_refusal",
     "remaining_usd",
     "resolve_mode",
@@ -116,6 +133,8 @@ KEY_REFUSED_HOLD: Final = timedelta(hours=6)
 """How long a refused key is left alone before one job tries it again."""
 PENDING_BATCHES_KEY: Final = "ocr_pending_batches"
 MAX_PENDING_BATCHES: Final = 10
+PENDING_SUBMISSIONS_KEY: Final = "ocr_pending_submissions"
+MAX_PENDING_SUBMISSIONS: Final = 10
 _MODEL_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,99}")
 """A model id as ``SpendLedger.record`` accepts it."""
 
@@ -334,6 +353,118 @@ def drop_pending_batch(index: Index, batch_id: str) -> None:
         not kept and index.get_setting(PENDING_BATCHES_KEY) is not None
     ):
         _store_pending(index, kept)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSubmission:
+    """A batch being submitted, or whose submission failed after the request may have
+    reached the API: everything its ``ocr_batch`` job needs except the batch id.
+
+    Every item's custom id starts with ``<nonce>-``; ``at`` is when it was written (just
+    before the request), so the batch, if it exists, was created around then.
+    """
+
+    nonce: str
+    at: datetime
+    mode: BatchMode
+    items: Mapping[str, OcrSpec]
+    prompt_version: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.nonce, str) or not BATCH_NONCE_RE.fullmatch(self.nonce):
+            raise ScriptoriumError("pending submission nonce is malformed")
+        if not isinstance(self.at, datetime) or self.at.tzinfo is None:
+            raise ScriptoriumError("pending submission time is malformed")
+        prefix = self.nonce + "-"
+        if any(not isinstance(cid, str) or not cid.startswith(prefix) for cid in self.items):
+            raise ScriptoriumError("pending submission item id is malformed")
+        if self.prompt_version is not None and (
+            not isinstance(self.prompt_version, str)
+            or not PROMPT_VERSION_RE.fullmatch(self.prompt_version)
+        ):
+            raise ScriptoriumError("pending submission prompt version is malformed")
+        self.spec("pending_" + self.nonce)  # mode, items and their ids, as a job checks them
+
+    def spec(self, batch_id: str) -> OcrBatchSpec:
+        """The ``ocr_batch`` job of this submission once its batch id is known."""
+        return OcrBatchSpec(batch_id, self.mode, self.items, prompt_version=self.prompt_version)
+
+    def payload(self) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "nonce": self.nonce,
+            "at": to_db_time(self.at),
+            "mode": self.mode,
+            "items": {cid: spec.payload() for cid, spec in sorted(self.items.items())},
+        }
+        if self.prompt_version is not None:
+            body["prompt_version"] = self.prompt_version
+        return body
+
+
+_SUBMISSION_FIELDS: Final = frozenset({"nonce", "at", "mode", "items"})
+
+
+def _parse_submission(entry: object) -> PendingSubmission:
+    if not isinstance(entry, Mapping) or set(entry) - {"prompt_version"} != _SUBMISSION_FIELDS:
+        raise ScriptoriumError("pending submission is malformed")
+    items = entry["items"]
+    at = entry["at"]
+    if not isinstance(items, Mapping) or not isinstance(at, str):
+        raise ScriptoriumError("pending submission is malformed")
+    try:
+        when = from_db_time(at)
+    except ValueError:
+        raise ScriptoriumError("pending submission time is malformed") from None
+    return PendingSubmission(
+        nonce=entry["nonce"],
+        at=when,
+        mode=entry["mode"],
+        items={str(cid): parse_ocr_payload(item) for cid, item in items.items()},
+        prompt_version=entry.get("prompt_version"),
+    )
+
+
+def load_pending_submissions(index: Index) -> list[PendingSubmission]:
+    """Submissions not yet settled (oldest first); malformed entries are dropped."""
+    raw = index.get_setting(PENDING_SUBMISSIONS_KEY)
+    if raw is None:
+        return []
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(value, list):
+        return []
+    out: list[PendingSubmission] = []
+    for entry in value[:MAX_PENDING_SUBMISSIONS]:
+        try:
+            out.append(_parse_submission(entry))
+        except ScriptoriumError:
+            continue
+    return out
+
+
+def _store_submissions(index: Index, entries: list[PendingSubmission]) -> None:
+    if not entries:
+        index.set_setting(PENDING_SUBMISSIONS_KEY, None)
+        return
+    body = [e.payload() for e in entries[-MAX_PENDING_SUBMISSIONS:]]
+    index.set_setting(PENDING_SUBMISSIONS_KEY, json.dumps(body, separators=(",", ":")))
+
+
+def add_pending_submission(index: Index, entry: PendingSubmission) -> None:
+    """Remember ``entry`` before its batch is submitted (the scan is the only writer)."""
+    kept = [e for e in load_pending_submissions(index) if e.nonce != entry.nonce]
+    _store_submissions(index, [*kept, entry])
+
+
+def drop_pending_submission(index: Index, nonce: str) -> None:
+    pending = load_pending_submissions(index)
+    kept = [e for e in pending if e.nonce != nonce]
+    if len(kept) != len(pending) or (
+        not kept and index.get_setting(PENDING_SUBMISSIONS_KEY) is not None
+    ):
+        _store_submissions(index, kept)
 
 
 # ---- queueing ---------------------------------------------------------------------------------

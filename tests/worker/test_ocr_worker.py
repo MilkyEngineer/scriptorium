@@ -15,6 +15,7 @@ import dataclasses
 import io
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Iterator
 from datetime import timedelta
@@ -46,6 +47,7 @@ from scriptorium.ocr.pipeline import (
     KEY_REFUSED_KEY,
     OCR_IMAGE_SIDE,
     PENDING_BATCHES_KEY,
+    PENDING_SUBMISSIONS_KEY,
     AutoOcr,
     clear_key_refusal,
     dump_auto_ocr,
@@ -814,6 +816,7 @@ async def test_the_real_binding_stops_at_the_users_server_allowance(tmp_path: Pa
 def batching(tmp_path: Path) -> Iterator[Harness]:
     linked = link(tmp_path, settings={"ocr_batch_min": 3})
     client, ledger, resolver = FakeOcrClient(text=default_text), FakeSpendLedger(), FakeResolver()
+    client.clock = lambda: linked.clock.now  # batches are created at the test's time
     linked.worker.ocr = fake_ports(client=client, ledger=ledger, resolver=resolver)
     _move_notebook_into_folder(linked)
     h = Harness(linked, client, ledger, resolver)
@@ -832,7 +835,11 @@ async def test_more_than_the_minimum_goes_as_one_batch(batching: Harness) -> Non
     h = batching
     await h.poll(2)
     (batch_id,) = h.client.batches
-    assert h.client.batches[batch_id].custom_ids == [f"p{n}" for n in range(7)]
+    cids = h.client.batches[batch_id].custom_ids
+    nonce = cids[0].partition("-")[0]
+    assert re.fullmatch(r"[0-9a-f]{16}", nonce)
+    assert cids == [f"{nonce}-p{n}" for n in range(7)]
+    assert h.linked.index().get_setting(PENDING_SUBMISSIONS_KEY) is None
     assert h.client.count("transcribe") == 0 and h.jobs() == []
     (job,) = h.jobs("ocr_batch")
     assert job.dedupe_key == f"ocr_batch:{h.linked.acct}:{batch_id}"
@@ -884,16 +891,17 @@ async def test_batch_results_are_checked_against_the_jobs_items(batching: Harnes
     await h.poll(2)
     (batch_id,) = h.client.batches
     pngs = h.client.batches[batch_id].pngs
-    good = canned(default_text(pngs["p0"]), batch=True)
+    p = h.client.batches[batch_id].custom_ids
+    good = canned(default_text(pngs[p[0]]), batch=True)
     await _until_ended(  # runs the batch job, then the single jobs it queued
         h,
         batch_id,
         stream=[
-            ("p0", good),
-            ("p0", canned("a second answer for p0", batch=True)),
+            (p[0], good),
+            (p[0], canned("a second answer for p0", batch=True)),
             ("p77", canned("not one of ours", batch=True)),
-            ("p1", OcrItemError("overloaded", True)),
-            ("p2", canned("x" * (31 * 1024), batch=True)),
+            (p[1], OcrItemError("overloaded", True)),
+            (p[2], canned("x" * (31 * 1024), batch=True)),
         ],
     )
     (job,) = h.jobs("ocr_batch")
@@ -921,8 +929,11 @@ async def test_a_page_refused_in_a_batch_is_not_sent_again(batching: Harness) ->
     h = batching
     await h.poll(2)
     (batch_id,) = h.client.batches
-    results = {f"p{n}": canned(f"page {n}", batch=True) for n in range(7)}
-    results["p3"] = OcrItemError("refused", False, 1800, 9)
+    p = h.client.batches[batch_id].custom_ids
+    results: dict[str, Transcription | OcrItemError] = {
+        cid: canned(f"page {n}", batch=True) for n, cid in enumerate(p)
+    }
+    results[p[3]] = OcrItemError("refused", False, 1800, 9)
     await _until_ended(h, batch_id, results=results)
     (job,) = h.jobs("ocr_batch")
     assert job.result is not None
@@ -1065,11 +1076,121 @@ async def test_a_batch_whose_job_was_not_queued_is_adopted_by_the_next_scan(
     assert h.client.pages_sent() == 7
 
 
+# ---- a submission whose answer was lost (review finding 5) ------------------------------------
+
+
+def _submissions(h: Harness) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = json.loads(
+        h.linked.index().get_setting(PENDING_SUBMISSIONS_KEY) or "[]"
+    )
+    return entries
+
+
+def _events(caplog: pytest.LogCaptureFixture, name: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == name]
+
+
+async def test_a_batch_whose_create_answer_was_lost_is_found_by_its_nonce_and_collected(
+    batching: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="scriptorium")
+    h = batching
+    h.client.submit_error = OcrUnavailable("timeout")
+    h.client.submit_error_after_create = True  # the API made the batch; its id never came back
+    await h.poll(2)
+    (batch_id,) = h.client.batches
+    assert h.jobs("ocr_batch") == [] and h.jobs() == []
+    (entry,) = _submissions(h)
+    assert "batch_id" not in entry and len(entry["items"]) == len(PAGES)
+    cids = h.client.batches[batch_id].custom_ids
+    assert sorted(entry["items"]) == sorted(cids)
+    assert all(cid.startswith(entry["nonce"] + "-") for cid in cids)
+    # While the batch runs it cannot be told apart yet: nothing is adopted, nothing re-sent.
+    h.linked.clock.now += timedelta(minutes=30)
+    await h.poll(2)
+    assert len(h.client.batches) == 1 and h.client.count("transcribe") == 0
+    assert h.jobs("ocr_batch") == [] and len(_submissions(h)) == 1
+    assert h.client.count("list_batches") == 2
+    # Ended: its first result carries the nonce, so it is adopted, collected and billed once.
+    h.client.finish_batch(batch_id)
+    await h.poll()
+    (job,) = h.jobs("ocr_batch")
+    assert (job.payload["batch_id"], job.state) == (batch_id, "done")
+    assert _submissions(h) == [] and h.linked.index().get_setting(PENDING_BATCHES_KEY) is None
+    assert set(h.transcribed()) == set(PAGES)
+    assert h.client.pages_sent() == len(PAGES) and h.ledger.pages() == len(PAGES)
+    assert {r.batch_id for r in h.ledger.rows} == {batch_id}
+    assert len(_events(caplog, "ocr_batch_recovered")) == 1
+
+
+async def test_a_batch_create_refused_outright_leaves_nothing_to_look_for(
+    batching: Harness,
+) -> None:
+    h = batching
+    h.client.submit_error = OcrUnavailable("rate_limited")  # a 429: nothing was created
+    await h.poll(2)
+    assert h.client.batches == {} and _submissions(h) == []
+    await h.poll()  # the next scan simply submits again
+    assert len(h.client.batches) == 1 and len(h.jobs("ocr_batch")) == 1
+    assert h.client.count("list_batches") == 0
+
+
+async def test_a_submission_whose_batch_never_appears_is_dropped_after_the_grace(
+    batching: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="scriptorium")
+    h = batching
+    h.client.submit_error = OcrUnavailable("connection")  # it may or may not have arrived
+    await h.poll(2)
+    assert h.client.batches == {} and len(_submissions(h)) == 1
+    # Another batch of the key, as large and as recent, is not taken for it: its results do
+    # not carry the submission's nonce.
+    other = h.client.add_batch([f"{'0' * 16}-p{n}" for n in range(len(PAGES))])
+    h.client.finish_batch(
+        other, {f"{'0' * 16}-p{n}": canned(batch=True) for n in range(len(PAGES))}
+    )
+    await h.poll()  # within the grace: kept, and its pages still wait
+    assert len(_submissions(h)) == 1 and h.jobs("ocr_batch") == []
+    assert h.client.count("submit_batch") == 1
+    h.linked.clock.now += runner_mod.SUBMISSION_GRACE
+    await h.poll()  # never created: dropped, and its pages go in a new batch at once
+    assert _submissions(h) == []
+    (job,) = h.jobs("ocr_batch")
+    assert job.payload["batch_id"] not in (other,) and len(h.client.batches) == 2
+    (dropped,) = _events(caplog, "ocr_batch_submission_dropped")
+    assert dropped.levelno == logging.INFO
+    assert _events(caplog, "ocr_batch_lost") == []
+
+
+async def test_a_submission_that_cannot_be_settled_is_dropped_after_a_day(
+    batching: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="scriptorium")
+    h = batching
+    h.client.submit_error = OcrUnavailable("server_error")
+    h.client.submit_error_after_create = True
+    await h.poll(2)
+    (lost,) = h.client.batches
+    h.client.list_error = OcrUnavailable("server_error")  # the listing cannot be read
+    await h.poll()
+    assert len(_submissions(h)) == 1 and h.jobs("ocr_batch") == []
+    assert len(_events(caplog, "ocr_batch_reconcile_failed")) == 1
+    h.linked.clock.now += runner_mod.SUBMISSION_GIVE_UP
+    await h.poll()
+    (record,) = _events(caplog, "ocr_batch_lost")
+    assert record.levelno == logging.WARNING
+    assert _submissions(h) == []
+    # Its pages are candidates again; the lost batch is never collected.
+    assert len(h.client.batches) == 2
+    (job,) = h.jobs("ocr_batch")
+    assert job.payload["batch_id"] != lost
+
+
 async def test_a_refused_key_in_a_batch_defers_the_fallback(batching: Harness) -> None:
     h = batching
     await h.poll(2)
     (batch_id,) = h.client.batches
-    results = {f"p{n}": OcrItemError("bad_key", False) for n in range(7)}
+    results = {cid: OcrItemError("bad_key", False) for cid in h.client.batches[batch_id].custom_ids}
     await _until_ended(h, batch_id, results=results)
     note = json.loads(h.linked.index().get_setting(KEY_REFUSED_KEY) or "{}")
     assert (note["mode"], note["reason"]) == ("server", "bad_key")

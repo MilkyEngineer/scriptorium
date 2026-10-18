@@ -1,11 +1,16 @@
 """The worker's half of server-side OCR (Architecture §7 step 6, §8; Plan 05 §3.2).
 
-- **The scan** runs after every ``ok`` or ``partial`` poll of an account. It first adopts any
-  batch the API accepted whose ``ocr_batch`` job was never queued (``ocr_pending_batches``).
-  With auto-OCR enabled for some folders and a user or server key available (``resolve``),
-  it lists the pages under those folders that have no transcript of their current version,
-  keeps those that :func:`~scriptorium.ocr.debounce.is_stable`, drops pages already in a
-  running or pending batch or with an ``ocr`` job (a page version is queued once, ever,
+- **The scan** runs after every ``ok`` or ``partial`` poll of an account. It first settles
+  any submission whose answer was lost (``ocr_pending_submissions``, written before every
+  batch request): the key's batch listing is searched for a batch created around then with
+  as many requests whose results carry the submission's nonce, which is adopted; one never
+  created is dropped after :data:`SUBMISSION_GRACE`, one that cannot be settled after
+  :data:`SUBMISSION_GIVE_UP` (``ocr_batch_lost``). It then adopts any batch the API accepted
+  whose ``ocr_batch`` job was never queued (``ocr_pending_batches``). With auto-OCR enabled
+  for some folders and a user or server key available (``resolve``), it lists the pages
+  under those folders that have no transcript of their current version, keeps those that
+  :func:`~scriptorium.ocr.debounce.is_stable`, drops pages already in a running, pending or
+  unsettled batch or with an ``ocr`` job (a page version is queued once, ever,
   unless its last job died of a refused key), and bounds what is left by the cap's remaining
   room at an estimated price per page. More than ``OCR_BATCH_MIN`` pages go to Claude as one
   Message Batches request and an ``ocr_batch`` job polls it; fewer become single ``ocr``
@@ -44,11 +49,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, NoReturn
+from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn
 
 from scriptorium.db.connect import from_db_time, to_db_time
 from scriptorium.errors import InvalidArgumentError, NotFoundError, ScriptoriumError
@@ -68,21 +74,24 @@ from scriptorium.jobs.kinds import (
 from scriptorium.jobs.queue import JobRow, LeaseLostError
 from scriptorium.library import pages as pg
 from scriptorium.library import render
-from scriptorium.library.index import PageRow
+from scriptorium.library.index import Index, PageRow
 from scriptorium.logging import log_event
 from scriptorium.ocr import batches
 from scriptorium.ocr._ports import OcrClientLike, OcrPorts
-from scriptorium.ocr.client import Transcription
+from scriptorium.ocr.client import BatchInfo, Transcription
 from scriptorium.ocr.debounce import STATE_OCR_POLL_AT, is_stable
 from scriptorium.ocr.errors import KEY_REASONS, OcrRefused, OcrUnavailable
 from scriptorium.ocr.ledger import cost_usd, month_bounds
 from scriptorium.ocr.pipeline import (
     KEY_REFUSED_HOLD,
     OCR_IMAGE_SIDE,
+    PendingSubmission,
     add_pending_batch,
+    add_pending_submission,
     affordable_pages,
     blocked_reason,
     drop_pending_batch,
+    drop_pending_submission,
     enqueue_page,
     is_key_failure,
     key_error,
@@ -90,6 +99,7 @@ from scriptorium.ocr.pipeline import (
     load_auto_ocr,
     load_key_refusal,
     load_pending_batches,
+    load_pending_submissions,
     note_key_refusal,
     remaining_usd,
     resolve_mode,
@@ -124,6 +134,22 @@ DEFER_RECHECK: Final = timedelta(hours=1)
 being allowed the server key, or a scan that finds a usable key wakes it sooner."""
 BATCH_KEY_REASONS: Final = KEY_REASONS - {"model_unavailable"}
 """Key reasons that a batch lookup can tell: a 404 there means the batch is unknown."""
+NOT_CREATED_REASONS: Final = frozenset({"rate_limited", "overloaded"})
+"""``OcrUnavailable`` reasons of a batch create that guarantee no batch exists (429, 529).
+Any other unavailability (a timeout, a dropped connection, a 5xx) may come after the API
+created the batch, and so may ``OcrRefused("unexpected_response")``; every other refusal is
+a 4xx verdict or a check made before anything was sent."""
+SUBMISSION_WINDOW: Final = timedelta(minutes=10)
+"""How far a listed batch's ``created_at`` may be from a pending submission's time (clock
+skew both ways) and still be looked at as that submission's batch."""
+SUBMISSION_GRACE: Final = timedelta(minutes=10)
+"""How long a submission whose batch the listing does not show is kept before it is taken
+as never created (a new batch may take a moment to be listed)."""
+SUBMISSION_GIVE_UP: Final = timedelta(hours=26)
+"""How long a submission is kept while it cannot be settled (its key gone or refused, its
+batch not readable yet): a batch ends within 24 hours, so its nonce is readable by then."""
+LIST_LIMIT: Final = 100
+"""Batches of the key looked at per reconciliation (one page of the listing, newest first)."""
 
 
 class JobFailure(Exception):  # noqa: N818 - a job outcome, not an error type for callers
@@ -166,6 +192,15 @@ def _read_png(path: Path) -> bytes | None:
     if len(data) > MAX_PNG_BYTES:
         raise JobFailure("too_large", final=True)
     return data
+
+
+def _may_exist(exc: Exception) -> bool:
+    """Whether a failed batch create may have created the batch all the same."""
+    if isinstance(exc, OcrUnavailable):
+        return exc.reason not in NOT_CREATED_REASONS
+    if isinstance(exc, OcrRefused):
+        return exc.reason == "unexpected_response"
+    return False  # InvalidArgumentError: refused before anything was sent
 
 
 def _prompt_version(version: object) -> str | None:
@@ -638,6 +673,7 @@ class OcrRunner:
         worker = self.worker
         settings = worker.settings
         index = ctx.index
+        await self._reconcile(ctx, ports, now)
         adopted = await asyncio.to_thread(self._adopt_pending, ctx)
         if adopted:
             log_event(logger, "ocr_batch_adopted", acct=ctx.acct, count=adopted)
@@ -690,6 +726,131 @@ class OcrRunner:
             log_event(logger, "ocr_scan", acct=ctx.acct, outcome="single", count=queued)
         return queued
 
+    async def _reconcile(self, ctx: AccountContext, ports: OcrPorts, now: datetime) -> None:
+        """Settle every submission whose answer was lost: adopt its batch, or drop it.
+
+        A batch is this submission's if the key lists it within :data:`SUBMISSION_WINDOW` of
+        the submission's time, with as many requests, and its first result line carries the
+        submission's nonce (results are readable once the batch has ended; until then the
+        submission waits). No such batch after :data:`SUBMISSION_GRACE`, with the listing
+        reaching back past the window: it was never created. Unsettled after
+        :data:`SUBMISSION_GIVE_UP`: dropped and logged as ``ocr_batch_lost``, and its pages
+        become candidates again.
+        """
+        pending = await asyncio.to_thread(load_pending_submissions, ctx.index)
+        if not pending:
+            return
+        listings: dict[str, tuple[OcrClientLike, list[BatchInfo]] | None] = {}
+        try:
+            for entry in pending:
+                age = now - entry.at
+                if age >= SUBMISSION_GIVE_UP:
+                    await asyncio.to_thread(drop_pending_submission, ctx.index, entry.nonce)
+                    log_event(
+                        logger,
+                        "ocr_batch_lost",
+                        level=logging.WARNING,
+                        acct=ctx.acct,
+                        reason="unresolved",
+                        count=len(entry.items),
+                    )
+                    continue
+                if entry.mode not in listings:
+                    listings[entry.mode] = await self._listing(ctx, ports, entry.mode, now)
+                listing = listings[entry.mode]
+                if listing is None:
+                    continue  # no usable key for that mode now: kept until it can be told
+                client, infos = listing
+                verdict, batch_id = await asyncio.to_thread(self._find_batch, client, entry, infos)
+                if verdict == "found" and batch_id is not None:
+                    bspec = entry.spec(batch_id)
+                    await asyncio.to_thread(self._submitted, ctx.index, bspec, entry.nonce)
+                    log_event(logger, "ocr_batch_recovered", acct=ctx.acct, count=len(entry.items))
+                elif verdict == "absent" and age >= SUBMISSION_GRACE:
+                    await asyncio.to_thread(drop_pending_submission, ctx.index, entry.nonce)
+                    log_event(
+                        logger,
+                        "ocr_batch_submission_dropped",
+                        acct=ctx.acct,
+                        reason="not_created",
+                        count=len(entry.items),
+                    )
+        finally:
+            for listing in listings.values():
+                if listing is not None:
+                    listing[0].close()
+
+    async def _listing(
+        self, ctx: AccountContext, ports: OcrPorts, mode: BatchMode, now: datetime
+    ) -> tuple[OcrClientLike, list[BatchInfo]] | None:
+        """A client for ``mode``'s key and that key's recent batches; None if it cannot."""
+        worker = self.worker
+        refusal = await asyncio.to_thread(load_key_refusal, ctx.index)
+        if refusal is not None and refusal.applies(mode, now):
+            return None
+        box = SecretBox(worker.settings, ctx.uid)
+        key = await asyncio.to_thread(ports.batch_key, worker.settings, box, mode)
+        if key is None:
+            return None
+        client = ports.client(worker.settings, key)
+        del key
+        try:
+            infos = await asyncio.to_thread(client.list_batches, LIST_LIMIT)
+        except (OcrRefused, OcrUnavailable, InvalidArgumentError) as exc:
+            client.close()
+            reason = exc.reason if isinstance(exc, OcrRefused | OcrUnavailable) else "invalid"
+            log_event(
+                logger,
+                "ocr_batch_reconcile_failed",
+                level=logging.WARNING,
+                acct=ctx.acct,
+                reason=reason,
+            )
+            return None
+        except BaseException:
+            client.close()
+            raise
+        return client, infos
+
+    @staticmethod
+    def _find_batch(
+        client: OcrClientLike, entry: PendingSubmission, infos: Sequence[BatchInfo]
+    ) -> tuple[Literal["found", "waiting", "absent"], str | None]:
+        """``found`` and the id of the submission's batch; ``waiting`` while a batch that may
+        be it is still running or the listing does not reach back far enough; else
+        ``absent``."""
+        earliest = entry.at - SUBMISSION_WINDOW
+        latest = entry.at + SUBMISSION_WINDOW
+        waiting = False
+        for info in infos:
+            if not earliest <= info.created_at <= latest or info.requests != len(entry.items):
+                continue
+            if info.state != "ended":
+                waiting = waiting or info.state in ("in_progress", "canceling")
+                continue
+            try:
+                first = client.first_custom_id(info.batch_id)
+            except (OcrRefused, OcrUnavailable, InvalidArgumentError):
+                waiting = True  # cannot tell now; asked again by the next scan
+                continue
+            if batches.nonce_of(first) == entry.nonce:
+                return "found", info.batch_id
+        if waiting:
+            return "waiting", None
+        # One page of the listing, newest first: if it is full and its oldest batch is newer
+        # than the window, the submission's batch may be further back.
+        if len(infos) >= LIST_LIMIT and all(i.created_at > earliest for i in infos):
+            return "waiting", None
+        return "absent", None
+
+    @staticmethod
+    def _submitted(index: Index, bspec: OcrBatchSpec, nonce: str) -> None:
+        """The submission has its batch id: a pending batch replaces the pending submission
+        (in that order, so a crash between the two leaves both, and the batch is adopted
+        once under its id)."""
+        add_pending_batch(index, bspec)
+        drop_pending_submission(index, nonce)
+
     def _adopt_pending(self, ctx: AccountContext) -> int:
         """Queue the ``ocr_batch`` job of every pending batch that has none; forget them."""
         queue = self.worker.queue
@@ -728,6 +889,7 @@ class OcrRunner:
         running = queue.active(ctx.uid, acct=ctx.acct, kind=OCR_BATCH)
         in_batch: set[tuple[str, str, str]] = set()
         specs: list[OcrBatchSpec] = load_pending_batches(index)
+        submissions = load_pending_submissions(index)
         for job in running:
             try:
                 specs.append(parse_ocr_batch_payload(job.payload))
@@ -735,6 +897,9 @@ class OcrRunner:
                 continue
         for bspec in specs:
             in_batch.update((s.document, s.page, s.hash) for s in bspec.items.values())
+        # A submission not yet settled may be a batch the API is running: its pages wait.
+        for entry in submissions:
+            in_batch.update((s.document, s.page, s.hash) for s in entry.items.values())
         generations: dict[str, int | None] = {}
         out: list[OcrSpec] = []
         for row in stable:
@@ -751,7 +916,7 @@ class OcrRunner:
             out.append(OcrSpec(row.document, row.page_id, row.content_hash, generation))
             if len(out) >= MAX_BATCH_ITEMS:
                 break
-        return out, bool(running)
+        return out, bool(running) or bool(submissions)
 
     @staticmethod
     def _generation(ctx: AccountContext, row: PageRow, cache: dict[str, int | None]) -> int | None:
@@ -815,7 +980,8 @@ class OcrRunner:
             if await asyncio.to_thread(self._gone, ctx.uid, ctx.acct):
                 return 0  # the account went away under the scan: nothing is sent
             raise
-        planned = batches.plan(pages)
+        nonce = secrets.token_hex(8)
+        planned = batches.plan(pages, nonce)
         if len(planned) <= worker.settings.ocr_batch_min:
             return None
         # Checked again right before the submission: another account of the user, or a
@@ -840,11 +1006,23 @@ class OcrRunner:
         if await asyncio.to_thread(self._gone, ctx.uid, ctx.acct):
             return 0  # removed since the scan began: nothing is sent for it
         prompt = ports.prompt()
+        submission = PendingSubmission(
+            nonce,
+            worker.clock(),
+            mode,
+            {cid: p.spec for cid, p in planned.items()},
+            prompt_version=_prompt_version(prompt.version),
+        )
+        # Written before the request: if the answer is lost, the batch may exist all the
+        # same, and the next scans look for it by this entry's nonce (_reconcile).
+        await asyncio.to_thread(add_pending_submission, ctx.index, submission)
         client = ports.client(worker.settings, key)
         del key
         try:
             batch_id = await asyncio.to_thread(batches.submit, client, prompt, planned)
         except (InvalidArgumentError, OcrRefused, OcrUnavailable) as exc:
+            if not _may_exist(exc):
+                await asyncio.to_thread(drop_pending_submission, ctx.index, nonce)
             if isinstance(exc, OcrRefused):
                 reason = await asyncio.to_thread(self._refused, ctx, mode, exc)
             elif isinstance(exc, OcrUnavailable):
@@ -861,15 +1039,10 @@ class OcrRunner:
             return 0
         finally:
             client.close()
-        bspec = OcrBatchSpec(
-            batch_id,
-            mode,
-            {cid: p.spec for cid, p in planned.items()},
-            prompt_version=_prompt_version(prompt.version),
-        )
+        bspec = submission.spec(batch_id)
         # Paid for from here on: remembered before anything else can fail, so the next scan
         # adopts the batch if its job cannot be queued now.
-        await asyncio.to_thread(add_pending_batch, ctx.index, bspec)
+        await asyncio.to_thread(self._submitted, ctx.index, bspec, nonce)
         job = await asyncio.to_thread(
             worker.queue.enqueue,
             uid=ctx.uid,
