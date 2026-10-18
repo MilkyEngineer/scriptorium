@@ -33,12 +33,12 @@ import binascii
 import json
 import sqlite3
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Final, Self
 
 from scriptorium.db.connect import (
@@ -53,6 +53,8 @@ from scriptorium.db.migrations import SchemaMismatch, check_version, current_ver
 from scriptorium.db.migrations import migrate as run_migrations
 from scriptorium.db.schema_account import ACCOUNT_STEPS
 from scriptorium.errors import InvalidArgumentError, NotFoundError
+from scriptorium.library.layout import is_uuid
+from scriptorium.library.tags import MAX_TAGS_PER_DOCUMENT, TagSet, normalise_tag
 
 DOCUMENT_TYPES: Final = frozenset({"DocumentType", "CollectionType"})
 DELETION_CAUSES: Final = frozenset({"user", "aged", "unknown"})
@@ -89,6 +91,7 @@ class DocumentRow:
     page_count: int = 0
     hash_root: str | None = None
     generation: int | None = None
+    tags: tuple[str, ...] = ()  # the document's own tags, sorted (not its pages'); M2
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +158,7 @@ class SearchHit:
     doc_name: str
     doc_path: str
     snippet: str
+    tags: tuple[str, ...] = ()  # the page's own tags and its document's, sorted
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +172,7 @@ class DocumentHit:
     document: str
     doc_name: str
     doc_path: str
+    tags: tuple[str, ...] = ()  # the document's own tags, sorted
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +223,49 @@ def _search_terms(query: str) -> list[str]:
     return terms
 
 
+def _tag_filter(tags: Sequence[str] | None) -> list[str] | None:
+    """The names of a ``tags=`` filter, normalised as stored; ``None`` (or empty) = no filter.
+
+    A filter is an any-of match on exact (normalised) names. A name the tablet could never
+    have stored (not a string, a control character, empty) is ``invalid_argument``.
+    """
+    if not tags:
+        return None
+    if isinstance(tags, str):
+        raise InvalidArgumentError("tags is a list of tag names.")
+    if len(tags) > MAX_TAGS_PER_DOCUMENT:
+        raise InvalidArgumentError(f"A filter takes at most {MAX_TAGS_PER_DOCUMENT} tags.")
+    names: list[str] = []
+    for tag in tags:
+        name = normalise_tag(tag)
+        if name is None:
+            raise InvalidArgumentError("A tag name is empty or holds a control character.")
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _marks(count: int) -> str:
+    """``?, ?, …`` for an ``IN`` list of ``count`` bound values."""
+    return ", ".join("?" * count)
+
+
+def _has_tag(document: str, page: str, count: int) -> str:
+    """``EXISTS`` clause: the row ``document`` names has one of ``count`` bound tag names.
+
+    ``document`` and ``page`` are fixed SQL fragments from this module, never input.
+    """
+    return (
+        f"EXISTS (SELECT 1 FROM tags g WHERE g.document = {document} AND {page} "  # noqa: S608
+        f"AND g.name IN ({_marks(count)}))"
+    )
+
+
+def _tags_text(names: Iterable[str]) -> str:
+    """``transcripts.doc_tags``: the names, sorted, one per line (each is its own FTS text)."""
+    return "\n".join(sorted(names))
+
+
 def _fts_query(terms: Sequence[str]) -> str:
     """Every term as a quoted FTS5 string: no operators, no syntax errors."""
     return " ".join('"' + term.replace('"', '""') + '"' for term in terms)
@@ -239,7 +287,7 @@ def _opt_time(moment: datetime | None) -> str | None:
     return None if moment is None else to_db_time(moment)
 
 
-def _document(row: sqlite3.Row) -> DocumentRow:
+def _document(row: sqlite3.Row, tags: Mapping[str, tuple[str, ...]] | None = None) -> DocumentRow:
     return DocumentRow(
         uuid=row["uuid"],
         type=row["type"],
@@ -253,6 +301,7 @@ def _document(row: sqlite3.Row) -> DocumentRow:
         page_count=row["page_count"],
         hash_root=row["hash_root"],
         generation=row["generation"],
+        tags=() if tags is None else tags.get(row["uuid"], ()),
     )
 
 
@@ -423,7 +472,9 @@ class Index:
     def document(self, uuid: str) -> DocumentRow | None:
         with self._lock:
             row = self._conn.execute("SELECT * FROM documents WHERE uuid = ?", (uuid,)).fetchone()
-        return None if row is None else _document(row)
+            if row is None:
+                return None
+            return _document(row, self._document_tags([uuid]))
 
     def document_uuids(self, *, deleted: bool) -> frozenset[str]:
         """Every document and folder UUID: tombstoned ones with ``deleted=True``, the rest
@@ -443,6 +494,7 @@ class Index:
         *,
         include_trash: bool,
         include_deleted: bool,
+        tags: Sequence[str] | None = None,
         cursor: str | None,
         limit: int,
     ) -> Page[DocumentRow]:
@@ -451,17 +503,37 @@ class Index:
         Sort key ``(type, name case-insensitively, uuid)``. At the root, ``include_trash`` also
         lists the top of the trash; pass ``parent="trash"`` to list only that. Tombstoned rows
         appear only with ``include_deleted``.
+
+        ``tags`` (§11.2) keeps the documents and folders carrying any of the names as their
+        own tags (exact, normalised names; page tags do not count) and makes the listing
+        recursive: everything below ``parent`` at any depth, in one flat list under the same
+        sort key. At the root, the trash's subtree is included only with ``include_trash``.
         """
         _check_limit(limit)
         parent = _norm_parent(parent)
-        where: list[str] = []
+        names = _tag_filter(tags)
+        start: str
         params: list[Any] = []
         if parent is None and include_trash:
-            where.append("(parent IS NULL OR parent = ?)")
+            start = "(parent IS NULL OR parent = ?)"
             params.append(TRASH)
         else:
-            where.append("parent IS ?")
+            start = "parent IS ?"
             params.append(parent)
+        where: list[str] = []
+        prefix = ""
+        if names is None:
+            where.append(start)
+        else:
+            # Every row reachable from parent; UNION drops repeats, so a parent cycle in cloud
+            # metadata ends the walk.
+            prefix = (
+                f"WITH RECURSIVE sub(uuid) AS (SELECT uuid FROM documents WHERE {start} "  # noqa: S608
+                "UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid) "
+            )
+            where.append("uuid IN (SELECT uuid FROM sub)")
+            where.append(_has_tag("documents.uuid", "g.page = ''", len(names)))
+            params.extend(names)
         if not include_deleted:
             where.append("deleted_at IS NULL")
         if cursor is not None:
@@ -469,12 +541,13 @@ class Index:
             where.append("(type, name COLLATE NOCASE, uuid) > (?, ?, ?)")
             params.extend(key)
         sql = (
-            f"SELECT * FROM documents WHERE {' AND '.join(where)} "  # noqa: S608 - fixed clauses
-            "ORDER BY type, name COLLATE NOCASE, uuid LIMIT ?"
+            f"{prefix}SELECT * FROM documents WHERE {' AND '.join(where)} "  # noqa: S608
+            "ORDER BY type, name COLLATE NOCASE, uuid LIMIT ?"  # fixed clauses, values bound
         )
         with self._lock:
             rows = self._conn.execute(sql, (*params, limit + 1)).fetchall()
-        items = [_document(r) for r in rows[:limit]]
+            found = self._document_tags([r["uuid"] for r in rows[:limit]])
+        items = [_document(r, found) for r in rows[:limit]]
         next_cursor = None
         if len(rows) > limit:
             last = items[-1]
@@ -495,7 +568,8 @@ class Index:
                 "ORDER BY type, name COLLATE NOCASE, uuid LIMIT ?",
                 (*params, limit + 1),
             ).fetchall()
-        items = [_document(r) for r in rows[:limit]]
+            found = self._document_tags([r["uuid"] for r in rows[:limit]])
+        items = [_document(r, found) for r in rows[:limit]]
         next_cursor = None
         if len(rows) > limit:
             last = items[-1]
@@ -743,6 +817,100 @@ class Index:
             )
         return own is not None
 
+    # ---- tags (§6.1, M2) ----------------------------------------------------------------
+
+    def replace_tags(self, document: str, tags: TagSet) -> None:
+        """Make ``tags`` the document's tags: a whole replace, so a tag removed on the tablet
+        disappears here. Joins the caller's transaction (§7 step 3 commits pages and tags
+        together).
+
+        ``tags`` comes from :func:`scriptorium.library.tags.parse_tags`; a set it could not
+        have produced (too many names, a name it would not store, a page id that is not a
+        UUID) is ``invalid_argument``. The tag text indexed with the document's transcripts
+        is refreshed in the same transaction.
+        """
+        if len(tags) > MAX_TAGS_PER_DOCUMENT:
+            raise InvalidArgumentError(f"A document has at most {MAX_TAGS_PER_DOCUMENT} tags.")
+        rows: list[tuple[str, str, str]] = [(document, "", name) for name in tags.document]
+        for page_id, names in tags.pages.items():
+            if not is_uuid(page_id):
+                raise InvalidArgumentError("A page tag names a page id that is not a UUID.")
+            rows.extend((document, page_id, name) for name in names)
+        if any(normalise_tag(name) != name for _, _, name in rows):
+            raise InvalidArgumentError("A tag name is not normalised.")
+        with self.transaction():
+            self._conn.execute("DELETE FROM tags WHERE document = ?", (document,))
+            self._conn.executemany("INSERT INTO tags(document, page, name) VALUES (?, ?, ?)", rows)
+            for row in self._conn.execute(
+                "SELECT id, page, doc_tags FROM transcripts WHERE document = ?", (document,)
+            ).fetchall():
+                text = _tags_text(tags.for_page(row["page"]))
+                if text != row["doc_tags"]:
+                    self._conn.execute(
+                        "UPDATE transcripts SET doc_tags = ? WHERE id = ?", (text, row["id"])
+                    )
+
+    def tags_of(self, document: str) -> TagSet:
+        """The document's stored tags (empty for an unknown document)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT page, name FROM tags WHERE document = ?", (document,)
+            ).fetchall()
+        own = frozenset(r["name"] for r in rows if r["page"] == "")
+        pages: dict[str, set[str]] = {}
+        for r in rows:
+            if r["page"] != "":
+                pages.setdefault(r["page"], set()).add(r["name"])
+        return TagSet(own, MappingProxyType({p: frozenset(n) for p, n in pages.items()}))
+
+    def documents_tagged(self, names: Sequence[str]) -> frozenset[str]:
+        """Documents and folders (any state) carrying any of ``names`` as their own tags.
+
+        Names are normalised as stored and matched exactly; a name that could never be stored
+        matches nothing. Page tags do not count. For the sync scope filter (§11.1).
+        """
+        wanted = sorted({n for n in map(normalise_tag, names) if n is not None})
+        found: set[str] = set()
+        with self._lock:
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start : start + 500]
+                found.update(
+                    r["document"]
+                    for r in self._conn.execute(
+                        "SELECT DISTINCT document FROM tags "  # noqa: S608 - placeholders only
+                        f"WHERE page = '' AND name IN ({_marks(len(chunk))})",
+                        chunk,
+                    )
+                )
+        return frozenset(found)
+
+    def _document_tags(self, uuids: Sequence[str]) -> dict[str, tuple[str, ...]]:
+        """Each document's own tags, sorted; documents without any are absent."""
+        out: dict[str, list[str]] = {}
+        for start in range(0, len(uuids), 500):
+            chunk = list(uuids[start : start + 500])
+            for r in self._conn.execute(
+                "SELECT document, name FROM tags "  # noqa: S608 - placeholders only
+                f"WHERE page = '' AND document IN ({_marks(len(chunk))}) ORDER BY document, name",
+                chunk,
+            ):
+                out.setdefault(r["document"], []).append(r["name"])
+        return {uuid: tuple(names) for uuid, names in out.items()}
+
+    def _page_tags(self, documents: Iterable[str]) -> dict[str, dict[str, set[str]]]:
+        """``document → page id ('' for the document) → names`` for ``documents``."""
+        wanted = sorted(set(documents))
+        out: dict[str, dict[str, set[str]]] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start : start + 500]
+            for r in self._conn.execute(
+                "SELECT document, page, name FROM tags "  # noqa: S608 - placeholders only
+                f"WHERE document IN ({_marks(len(chunk))})",
+                chunk,
+            ):
+                out.setdefault(r["document"], {}).setdefault(r["page"], set()).add(r["name"])
+        return out
+
     # ---- transcripts --------------------------------------------------------------------
 
     def put_transcript(
@@ -764,14 +932,16 @@ class Index:
             if row is None:
                 raise NotFoundError("Page not found.")
             name, path = self._name_and_path(document)
+            on_document = self._page_tags([document]).get(document, {})
+            tags_text = _tags_text(on_document.get("", set()) | on_document.get(page_id, set()))
             self._conn.execute(
                 "INSERT INTO transcripts(page, content_hash, document, text, model, mode, "
-                "created_at, doc_name, doc_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "created_at, doc_name, doc_path, doc_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(document, page, content_hash) DO UPDATE SET text = excluded.text, "
                 "model = excluded.model, mode = excluded.mode, "
                 "created_at = excluded.created_at, doc_name = excluded.doc_name, "
-                "doc_path = excluded.doc_path, input_tokens = NULL, output_tokens = NULL, "
-                "cost_usd = NULL",
+                "doc_path = excluded.doc_path, doc_tags = excluded.doc_tags, "
+                "input_tokens = NULL, output_tokens = NULL, cost_usd = NULL",
                 (
                     page_id,
                     content_hash,
@@ -782,6 +952,7 @@ class Index:
                     to_db_time(self._clock()),
                     name,
                     path,
+                    tags_text,
                 ),
             )
 
@@ -808,19 +979,32 @@ class Index:
         )
 
     def search(
-        self, query: str, *, cursor: str | None, limit: int
+        self,
+        query: str,
+        *,
+        folder: str | None = None,
+        tags: Sequence[str] | None = None,
+        cursor: str | None,
+        limit: int,
     ) -> Page[SearchHit | DocumentHit]:
-        """Full-text search over transcripts, document names and folder paths, then names.
+        """Full-text search over transcripts, document names, folder paths and tag names, then
+        names (§11.2).
 
-        Every whitespace-separated term must match (FTS5 operators are not interpreted). The
-        transcript hits come first, sorted by bm25 rank, then transcript id; the cursor carries
-        the last ``(rank, id)``, so a page boundary is exact for an unchanged index (ranks
-        shift when transcripts are added). After them come :class:`DocumentHit` rows: live
-        documents with no transcript at all whose name contains every term, compared
-        case-insensitively (§11.2), sorted by name and UUID.
+        Every whitespace-separated term must match (each is quoted: FTS5 operators, tag names
+        included, are never interpreted). The transcript hits come first, sorted by bm25 rank,
+        then transcript id; the cursor carries the last ``(rank, id)``, so a page boundary is
+        exact for an unchanged index (ranks shift when transcripts are added). After them come
+        :class:`DocumentHit` rows: live documents with no transcript at all whose name or own
+        tags contain every term, compared case-insensitively, sorted by name and UUID.
+
+        ``folder`` (a folder UUID) keeps documents anywhere below it. ``tags`` is an any-of
+        filter on exact, normalised names: a transcript hit matches on its page's own tags or
+        its document's, a document hit on its document's own tags. Hits carry ``tags``: for a
+        page, its own and its document's; for a document, its own.
         """
         _check_limit(limit)
         terms = _search_terms(query)
+        names = _tag_filter(tags)
         name_key: list[Any] | None = None
         fts_key: list[Any] | None = None
         if cursor is not None:
@@ -829,70 +1013,114 @@ class Index:
             except InvalidArgumentError:
                 name_key = _decode_cursor(cursor, "search-name", (str, str))
         items: list[SearchHit | DocumentHit] = []
-        if name_key is None:
-            rows = self._search_fts(terms, fts_key, limit + 1)
-            items.extend(_search_hit(r) for r in rows[:limit])
-            if len(rows) > limit:
-                last = rows[limit - 1]
-                key = (float(last["rank"]), int(last["id"]))
-                return Page(items, _encode_cursor("search", key))
-        room = limit - len(items)
-        names = self._search_names(terms, name_key, room + 1)
-        hits = names[:room]
         with self._lock:
+            if name_key is None:
+                rows = self._search_fts(terms, folder, names, fts_key, limit + 1)
+                found = self._page_tags(r["document"] for r in rows[:limit])
+                items.extend(_search_hit(r, found) for r in rows[:limit])
+                if len(rows) > limit:
+                    last = rows[limit - 1]
+                    key = (float(last["rank"]), int(last["id"]))
+                    return Page(items, _encode_cursor("search", key))
+            room = limit - len(items)
+            matched = self._search_names(terms, folder, names, name_key, room + 1)
+            hits = matched[:room]
+            own = self._document_tags([uuid for uuid, _ in hits])
             for uuid, name in hits:
                 _, path = self._name_and_path(uuid)
-                items.append(DocumentHit(document=uuid, doc_name=name, doc_path=path))
+                items.append(
+                    DocumentHit(document=uuid, doc_name=name, doc_path=path, tags=own.get(uuid, ()))
+                )
         next_cursor = None
-        if len(names) > room:
+        if len(matched) > room:
             # The name phase's sort key is (name, uuid); "" sorts before every name.
             after = (hits[-1][1], hits[-1][0]) if hits else ("", "")
             next_cursor = _encode_cursor("search-name", after)
         return Page(items, next_cursor)
 
+    @staticmethod
+    def _subtree(folder: str | None) -> tuple[str, list[Any]]:
+        """A ``WITH`` prefix naming ``sub``, every row below ``folder``; ``""`` for none."""
+        if folder is None:
+            return "", []
+        # UNION drops repeats, so a parent cycle in cloud metadata ends the walk.
+        return (
+            "WITH RECURSIVE sub(uuid) AS (SELECT uuid FROM documents WHERE parent = ? "
+            "UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid) ",
+            [folder],
+        )
+
     def _search_fts(
-        self, terms: Sequence[str], after: Sequence[Any] | None, limit: int
+        self,
+        terms: Sequence[str],
+        folder: str | None,
+        names: Sequence[str] | None,
+        after: Sequence[Any] | None,
+        limit: int,
     ) -> list[sqlite3.Row]:
-        where = "transcripts_fts MATCH ?"
-        params: list[Any] = [_fts_query(terms)]
+        prefix, params = self._subtree(folder)
+        where = ["transcripts_fts MATCH ?"]
+        params.append(_fts_query(terms))
+        if folder is not None:
+            where.append("t.document IN (SELECT uuid FROM sub)")
+        if names is not None:
+            where.append(_has_tag("t.document", "g.page IN ('', t.page)", len(names)))
+            params.extend(names)
         if after is not None:
             rank, last_id = after
-            where += " AND (transcripts_fts.rank > ? OR (transcripts_fts.rank = ? AND t.id > ?))"
+            where.append("(transcripts_fts.rank > ? OR (transcripts_fts.rank = ? AND t.id > ?))")
             params.extend((rank, rank, last_id))
-        with self._lock:
-            rows: list[sqlite3.Row] = self._conn.execute(
-                "SELECT t.id, t.page, t.content_hash, t.document, t.doc_name, t.doc_path, "  # noqa: S608
-                "p.idx AS idx, p.content_hash AS current_hash, transcripts_fts.rank AS rank, "
-                "snippet(transcripts_fts, 0, '', '', '…', 16) AS snippet "
-                "FROM transcripts_fts JOIN transcripts t ON t.id = transcripts_fts.rowid "
-                "LEFT JOIN pages p ON p.document = t.document AND p.uuid = t.page "
-                f"WHERE {where} ORDER BY transcripts_fts.rank, t.id LIMIT ?",  # fixed clauses
-                (*params, limit),
-            ).fetchall()
+        rows: list[sqlite3.Row] = self._conn.execute(
+            f"{prefix}SELECT t.id, t.page, t.content_hash, t.document, t.doc_name, "  # noqa: S608
+            "t.doc_path, p.idx AS idx, p.content_hash AS current_hash, "
+            "transcripts_fts.rank AS rank, "
+            "snippet(transcripts_fts, 0, '', '', '…', 16) AS snippet "
+            "FROM transcripts_fts JOIN transcripts t ON t.id = transcripts_fts.rowid "
+            "LEFT JOIN pages p ON p.document = t.document AND p.uuid = t.page "
+            f"WHERE {' AND '.join(where)} "  # fixed clauses, values bound
+            "ORDER BY transcripts_fts.rank, t.id LIMIT ?",
+            (*params, limit),
+        ).fetchall()
         return rows
 
     def _search_names(
-        self, terms: Sequence[str], after: Sequence[Any] | None, limit: int
+        self,
+        terms: Sequence[str],
+        folder: str | None,
+        names: Sequence[str] | None,
+        after: Sequence[Any] | None,
+        limit: int,
     ) -> list[tuple[str, str]]:
-        """``(uuid, name)`` of untranscribed live documents whose name holds every term."""
+        """``(uuid, name)`` of untranscribed live documents whose name or own tags hold every
+        term."""
+        prefix, params = self._subtree(folder)
         where = [
             "d.type = 'DocumentType'",
             "d.deleted_at IS NULL",
             "NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.document = d.uuid)",
         ]
-        params: list[Any] = []
         for term in terms:
-            where.append("instr(scriptorium_fold(d.name), ?) > 0")
-            params.append(_fold(term))
+            where.append(
+                "(instr(scriptorium_fold(d.name), ?) > 0 OR EXISTS (SELECT 1 FROM tags g "
+                "WHERE g.document = d.uuid AND g.page = '' "
+                "AND instr(scriptorium_fold(g.name), ?) > 0))"
+            )
+            folded = _fold(term)
+            params.extend((folded, folded))
+        if folder is not None:
+            where.append("d.uuid IN (SELECT uuid FROM sub)")
+        if names is not None:
+            where.append(_has_tag("d.uuid", "g.page = ''", len(names)))
+            params.extend(names)
         if after is not None:
             where.append("(d.name COLLATE NOCASE, d.uuid) > (?, ?)")
             params.extend(after)
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT d.uuid, d.name FROM documents d WHERE {' AND '.join(where)} "  # noqa: S608
-                "ORDER BY d.name COLLATE NOCASE, d.uuid LIMIT ?",  # fixed clauses, values bound
-                (*params, limit),
-            ).fetchall()
+        rows = self._conn.execute(
+            f"{prefix}SELECT d.uuid, d.name FROM documents d "  # noqa: S608
+            f"WHERE {' AND '.join(where)} "  # fixed clauses, values bound
+            "ORDER BY d.name COLLATE NOCASE, d.uuid LIMIT ?",
+            (*params, limit),
+        ).fetchall()
         return [(r["uuid"], r["name"]) for r in rows]
 
     # ---- sync state -----------------------------------------------------------------------
@@ -981,7 +1209,9 @@ class Index:
             )
 
 
-def _search_hit(r: sqlite3.Row) -> SearchHit:
+def _search_hit(r: sqlite3.Row, tags: Mapping[str, Mapping[str, set[str]]]) -> SearchHit:
+    on_document = tags.get(r["document"], {})
+    names = on_document.get("", set()) | on_document.get(r["page"], set())
     return SearchHit(
         page_id=r["page"],
         document=r["document"],
@@ -991,6 +1221,7 @@ def _search_hit(r: sqlite3.Row) -> SearchHit:
         doc_name=r["doc_name"],
         doc_path=r["doc_path"],
         snippet=r["snippet"],
+        tags=tuple(sorted(names)),
     )
 
 

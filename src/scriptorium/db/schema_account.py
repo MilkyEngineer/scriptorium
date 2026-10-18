@@ -212,5 +212,56 @@ ALTER TABLE documents ADD COLUMN excluded_at TEXT;
 """,
 )
 
-ACCOUNT_STEPS: Final[tuple[Step, ...]] = (V1, V2, V3)
+V4: Final = Step(
+    name="account index v4: tags, searchable as text",
+    # Tags from each document's .content (§6.1), replaced whole per document at commit. A
+    # document (or folder) tag has page = '' rather than NULL: every column of a WITHOUT ROWID
+    # primary key is NOT NULL, and with NULL a rowid table's key would not make document tags
+    # unique. Names are bounded and normalised by library/tags.py before they get here.
+    #
+    # transcripts.doc_tags holds the names that apply to the transcript's page (its own page
+    # tags and its document's tags, one per line), denormalised like doc_name/doc_path so the
+    # FTS triggers delete exactly what they indexed. FTS5 cannot add a column to an existing
+    # table, so transcripts_fts is recreated with the fourth column and rebuilt from the
+    # transcripts (external content: the ids stay, nothing is lost). The column order keeps
+    # text first, which snippet() reads as column 0.
+    sql="""
+CREATE TABLE tags(
+    document  TEXT NOT NULL,
+    page      TEXT NOT NULL DEFAULT '',
+    name      TEXT NOT NULL,
+    PRIMARY KEY (document, page, name)
+) WITHOUT ROWID;
+CREATE INDEX tags_name ON tags(name);
+
+ALTER TABLE transcripts ADD COLUMN doc_tags TEXT NOT NULL DEFAULT '';
+DROP TRIGGER transcripts_ai;
+DROP TRIGGER transcripts_ad;
+DROP TRIGGER transcripts_au;
+DROP TABLE transcripts_fts;
+CREATE VIRTUAL TABLE transcripts_fts USING fts5(
+    text, doc_name, doc_path, doc_tags,
+    content='transcripts', content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+INSERT INTO transcripts_fts(transcripts_fts) VALUES ('rebuild');
+CREATE TRIGGER transcripts_ai AFTER INSERT ON transcripts BEGIN
+    INSERT INTO transcripts_fts(rowid, text, doc_name, doc_path, doc_tags)
+    VALUES (new.id, new.text, new.doc_name, new.doc_path, new.doc_tags);
+END;
+CREATE TRIGGER transcripts_ad AFTER DELETE ON transcripts BEGIN
+    INSERT INTO transcripts_fts(transcripts_fts, rowid, text, doc_name, doc_path, doc_tags)
+    VALUES ('delete', old.id, old.text, old.doc_name, old.doc_path, old.doc_tags);
+END;
+CREATE TRIGGER transcripts_au AFTER UPDATE OF text, doc_name, doc_path, doc_tags ON transcripts
+BEGIN
+    INSERT INTO transcripts_fts(transcripts_fts, rowid, text, doc_name, doc_path, doc_tags)
+    VALUES ('delete', old.id, old.text, old.doc_name, old.doc_path, old.doc_tags);
+    INSERT INTO transcripts_fts(rowid, text, doc_name, doc_path, doc_tags)
+    VALUES (new.id, new.text, new.doc_name, new.doc_path, new.doc_tags);
+END;
+""",
+)
+
+ACCOUNT_STEPS: Final[tuple[Step, ...]] = (V1, V2, V3, V4)
 """Append-only. ``len(ACCOUNT_STEPS)`` is the per-account schema version."""

@@ -4,7 +4,9 @@ It follows the merged ``Index`` where sync depends on it: ``upsert_document`` va
 row and never changes ``deleted_at``/``deletion_cause`` of an existing one,
 ``append_history`` is idempotent per ``(uuid, generation)``, ``mark_deleted`` and
 ``unmark_deleted`` raise ``NotFoundError`` for an unknown document, and ``recent`` pages
-newest first with tombstoned rows included. ``transaction()`` snapshots the tables and
+newest first with tombstoned rows included. ``replace_tags``/``tags_of``/``documents_tagged``
+follow the M2 tag methods (whole replace per document; own tags only for
+``documents_tagged``, names normalised as stored). ``transaction()`` snapshots the tables and
 restores them if the block raises anything, ``BaseException`` included, so a crash inside
 the commit step leaves no row behind, as SQLite's rollback would; nested blocks join the
 outermost one, as in the real index.
@@ -16,13 +18,14 @@ for other workstreams.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from scriptorium.cloud.ports import DocumentRow
 from scriptorium.errors import InvalidArgumentError, NotFoundError
+from scriptorium.library.tags import MAX_TAGS_PER_DOCUMENT, TagSet, normalise_tag
 
 DOCUMENT_TYPES = frozenset({"DocumentType", "CollectionType"})
 DELETION_CAUSES = frozenset({"user", "aged", "unknown"})
@@ -47,6 +50,7 @@ class FakeIndex:
     history: list[tuple[str, int, str, datetime]] = field(default_factory=list)
     index_blobs: dict[tuple[str, int], str | None] = field(default_factory=dict)
     state: dict[str, str] = field(default_factory=dict)
+    tags: dict[str, TagSet] = field(default_factory=dict)
     depth: int = 0
     rollbacks: int = 0
     writes_outside_transaction: int = 0
@@ -61,12 +65,12 @@ class FakeIndex:
             finally:
                 self.depth -= 1
             return
-        snapshot = (dict(self.documents), list(self.history), dict(self.state))
+        snapshot = (dict(self.documents), list(self.history), dict(self.state), dict(self.tags))
         self.depth = 1
         try:
             yield
         except BaseException:
-            self.documents, self.history, self.state = snapshot
+            self.documents, self.history, self.state, self.tags = snapshot
             self.rollbacks += 1
             raise
         finally:
@@ -153,6 +157,26 @@ class FakeIndex:
             self.state.pop(key, None)
         else:
             self.state[key] = value
+
+    # ---- tags ---------------------------------------------------------------------------
+
+    def replace_tags(self, document: str, tags: TagSet) -> None:
+        if len(tags) > MAX_TAGS_PER_DOCUMENT:
+            raise InvalidArgumentError("too many tags")
+        if any(normalise_tag(name) != name for name in tags.names()):
+            raise InvalidArgumentError("A tag name is not normalised.")
+        self._write()
+        if len(tags):
+            self.tags[document] = tags
+        else:
+            self.tags.pop(document, None)
+
+    def tags_of(self, document: str) -> TagSet:
+        return self.tags.get(document, TagSet())
+
+    def documents_tagged(self, names: Sequence[str]) -> frozenset[str]:
+        wanted = {n for n in map(normalise_tag, names) if n is not None}
+        return frozenset(uuid for uuid, tags in self.tags.items() if tags.document & wanted)
 
     # ---- helpers ------------------------------------------------------------------------
 
