@@ -1,0 +1,104 @@
+{
+ "description": "Synthetic. Four documents; the first three document indexes answer 503.",
+ "format": 1,
+ "interactions": [
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "POST",
+    "url": "https://cloud.example.com/token/json/2/user/new"
+   },
+   "response": {
+    "body": "scrubbed-user-token",
+    "headers": {
+     "content-type": "text/plain"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v4/root"
+   },
+   "response": {
+    "body": "{\"hash\": \"556e19cd0b1dc35298a0cc955a726d25a7b54df9d75a7a48ead39dd935ef5ae4\", \"generation\": 2, \"schemaVersion\": 4}",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "root.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/556e19cd0b1dc35298a0cc955a726d25a7b54df9d75a7a48ead39dd935ef5ae4"
+   },
+   "response": {
+    "body": "4\n0:.:4:243633\n2fab2ee2ea8591d351343523e253f2cebdf36d13434a5997209c7f8166c5c8f9:0:00000000-0000-4000-8000-000000000001:9:165280\n5b8d4935bb74f53080b643e8dea6496748430626397e20ec3afa22cd38136b67:0:00000000-0000-4000-8000-000000000002:5:25747\n29d7cb1458d9927810182b688088208f5eb0b41031c8b3ce4bfa0b76a6664f68:0:00000000-0000-4000-8000-000000000101:5:17907\n8766557d956aee5ba622ce7d6f104681eacbd28df979801226bc1d2b07c7fe01:0:00000000-0000-4000-8000-000000000102:5:34699\n",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/2fab2ee2ea8591d351343523e253f2cebdf36d13434a5997209c7f8166c5c8f9"
+   },
+   "response": {
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 503
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000002.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/5b8d4935bb74f53080b643e8dea6496748430626397e20ec3afa22cd38136b67"
+   },
+   "response": {
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 503
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000101.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/29d7cb1458d9927810182b688088208f5eb0b41031c8b3ce4bfa0b76a6664f68"
+   },
+   "response": {
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 503
+   }
+  }
+ ],
+ "synthetic": true
+}

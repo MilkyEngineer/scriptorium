@@ -1,0 +1,22 @@
+{
+ "description": "Synthetic. The token endpoint answers 403 for the device token.",
+ "format": 1,
+ "interactions": [
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "POST",
+    "url": "https://cloud.example.com/token/json/2/user/new"
+   },
+   "response": {
+    "headers": {
+     "content-type": "text/plain"
+    },
+    "status": 403
+   }
+  }
+ ],
+ "synthetic": true
+}

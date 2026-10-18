@@ -1,0 +1,22 @@
+{
+ "description": "Synthetic. The token endpoint answers 503: an outage, not a rejection.",
+ "format": 1,
+ "interactions": [
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "POST",
+    "url": "https://cloud.example.com/token/json/2/user/new"
+   },
+   "response": {
+    "headers": {
+     "content-type": "text/plain"
+    },
+    "status": 503
+   }
+  }
+ ],
+ "synthetic": true
+}

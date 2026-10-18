@@ -1,0 +1,38 @@
+{
+ "description": "Synthetic. The root answers 503.",
+ "format": 1,
+ "interactions": [
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "POST",
+    "url": "https://cloud.example.com/token/json/2/user/new"
+   },
+   "response": {
+    "body": "scrubbed-user-token",
+    "headers": {
+     "content-type": "text/plain"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v4/root"
+   },
+   "response": {
+    "headers": {
+     "content-type": "application/json"
+    },
+    "status": 503
+   }
+  }
+ ],
+ "synthetic": true
+}
