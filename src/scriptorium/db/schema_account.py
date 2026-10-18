@@ -49,6 +49,10 @@ CREATE TABLE history(
     generation  INTEGER NOT NULL,
     hash_root   TEXT NOT NULL,
     seen_at     TEXT NOT NULL,
+    -- SHA-256 of this version's document index body, the blob that lists its files. It is
+    -- not hash_root (a sync 1.5 index is addressed by the hash of its entries), so it is
+    -- recorded here to make the version's file set recoverable (§6).
+    index_sha256 TEXT,
     PRIMARY KEY (uuid, generation)
 ) WITHOUT ROWID;
 

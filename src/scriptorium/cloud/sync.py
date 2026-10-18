@@ -454,15 +454,19 @@ class SyncOnce:
         files = doc_index.files
         with self._archive.stage(entry.uuid, f"sync-{secrets.token_hex(6)}") as staged:
             self._fetch_blobs(files, run)
+            body_sha: str | None = None
             if doc_index.body:
                 # This version's file list, kept like any blob (§6). Its content address is
-                # SHA-256 of the body: hash_root itself only for a body-addressed index.
+                # SHA-256 of the body, not hash_root (a sync 1.5 index is addressed by the
+                # hash of its entries), so the history row records it.
                 body_sha = hashlib.sha256(doc_index.body).hexdigest()
                 self._archive.put_blob(body_sha, io.BytesIO(doc_index.body))
             seen_at = self._clock()
             row = self._document_row(entry, doc_index, root.generation, seen_at, run)
             with self._index.transaction():
-                self._index.append_history(entry.uuid, root.generation, entry.hash, seen_at)
+                self._index.append_history(
+                    entry.uuid, root.generation, entry.hash, seen_at, index_sha256=body_sha
+                )
                 self._index.upsert_document(row)
                 self._archive.commit(
                     staged,

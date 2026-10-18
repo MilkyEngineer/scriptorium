@@ -104,6 +104,7 @@ class HistoryRow:
     generation: int
     hash_root: str
     seen_at: datetime
+    index_sha256: str | None = None  # blob holding this version's file list (§6)
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,14 +519,26 @@ class Index:
 
     # ---- history and pages ----------------------------------------------------------------
 
-    def append_history(self, uuid: str, generation: int, hash_root: str, seen_at: datetime) -> None:
+    def append_history(
+        self,
+        uuid: str,
+        generation: int,
+        hash_root: str,
+        seen_at: datetime,
+        *,
+        index_sha256: str | None = None,
+    ) -> None:
         """Record that root ``generation`` holds ``hash_root`` for ``uuid``. Idempotent: a
-        second call for the same ``(uuid, generation)`` keeps the first row."""
+        second call for the same ``(uuid, generation)`` keeps the first row.
+
+        ``index_sha256`` names the blob holding this version's document index (its file
+        list), which is what makes the version recoverable from ``blobs/`` (§6).
+        """
         with self.transaction():
             self._conn.execute(
-                "INSERT INTO history(uuid, generation, hash_root, seen_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(uuid, generation) DO NOTHING",
-                (uuid, generation, hash_root, to_db_time(seen_at)),
+                "INSERT INTO history(uuid, generation, hash_root, seen_at, index_sha256) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(uuid, generation) DO NOTHING",
+                (uuid, generation, hash_root, to_db_time(seen_at), index_sha256),
             )
 
     def history(self, uuid: str) -> list[HistoryRow]:
@@ -535,7 +548,13 @@ class Index:
                 "SELECT * FROM history WHERE uuid = ? ORDER BY generation DESC", (uuid,)
             ).fetchall()
         return [
-            HistoryRow(r["uuid"], r["generation"], r["hash_root"], from_db_time(r["seen_at"]))
+            HistoryRow(
+                r["uuid"],
+                r["generation"],
+                r["hash_root"],
+                from_db_time(r["seen_at"]),
+                r["index_sha256"],
+            )
             for r in rows
         ]
 

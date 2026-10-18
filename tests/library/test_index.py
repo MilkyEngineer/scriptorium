@@ -370,9 +370,16 @@ def test_history_is_newest_generation_first_and_idempotent(index: Index) -> None
     for gen in (3, 1, 2):
         index.append_history(uid(1), gen, f"h{gen}", T0 + timedelta(minutes=gen))
     index.append_history(uid(1), 2, "other", T0)  # same generation again: first row kept
+    index.append_history(uid(1), 4, "h4", T0, index_sha256="a" * 64)
     rows = index.history(uid(1))
-    assert [(r.generation, r.hash_root) for r in rows] == [(3, "h3"), (2, "h2"), (1, "h1")]
-    assert rows[0].seen_at == T0 + timedelta(minutes=3)
+    assert [(r.generation, r.hash_root) for r in rows] == [
+        (4, "h4"),
+        (3, "h3"),
+        (2, "h2"),
+        (1, "h1"),
+    ]
+    assert rows[1].seen_at == T0 + timedelta(minutes=3)
+    assert [r.index_sha256 for r in rows] == ["a" * 64, None, None, None]
     assert index.history(uid(2)) == []
 
 

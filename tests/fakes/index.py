@@ -42,6 +42,7 @@ class Page:
 class FakeIndex:
     documents: dict[str, DocumentRow] = field(default_factory=dict)
     history: list[tuple[str, int, str, datetime]] = field(default_factory=list)
+    index_blobs: dict[tuple[str, int], str | None] = field(default_factory=dict)
     state: dict[str, str] = field(default_factory=dict)
     depth: int = 0
     rollbacks: int = 0
@@ -122,11 +123,20 @@ class FakeIndex:
 
     # ---- history and state --------------------------------------------------------------
 
-    def append_history(self, uuid: str, generation: int, hash_root: str, seen_at: datetime) -> None:
+    def append_history(
+        self,
+        uuid: str,
+        generation: int,
+        hash_root: str,
+        seen_at: datetime,
+        *,
+        index_sha256: str | None = None,
+    ) -> None:
         self._write()
         if any(h[0] == uuid and h[1] == generation for h in self.history):
             return  # ON CONFLICT(uuid, generation) DO NOTHING
         self.history.append((uuid, generation, hash_root, seen_at))
+        self.index_blobs[(uuid, generation)] = index_sha256
 
     def history_of(self, uuid: str) -> list[tuple[int, str]]:
         return [(gen, hash_root) for u, gen, hash_root, _ in self.history if u == uuid]
