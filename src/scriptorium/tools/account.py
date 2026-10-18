@@ -733,6 +733,20 @@ def register(registry: ToolRegistry) -> None:
     registry.add(ToolSpec.from_handler(account_status, args=StatusArgs, annotations=READ_ONLY))
     registry.add(
         ToolSpec.from_handler(
+            set_claude_api_key,
+            args=SetKeyArgs,
+            annotations=tool_annotations(read_only=False, idempotent=True, open_world=True),
+        )
+    )
+    registry.add(
+        ToolSpec.from_handler(
+            clear_claude_api_key,
+            args=NoArgs,
+            annotations=tool_annotations(read_only=False, destructive=True, idempotent=True),
+        )
+    )
+    registry.add(
+        ToolSpec.from_handler(
             set_auto_ocr,
             args=AutoOcrArgs,
             annotations=tool_annotations(read_only=False, idempotent=True),
@@ -742,8 +756,10 @@ def register(registry: ToolRegistry) -> None:
 
 __all__ = [
     "account_status",
+    "clear_claude_api_key",
     "connect_remarkable",
     "disconnect_remarkable",
     "register",
     "set_auto_ocr",
+    "set_claude_api_key",
 ]
