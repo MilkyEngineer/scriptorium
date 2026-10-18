@@ -29,7 +29,14 @@ M1_TOOLS = {
     "trash",
     "save_transcript",
 }
-M2_TOOLS = {"search", "set_claude_api_key", "clear_claude_api_key"}
+M2_TOOLS = {
+    "search",
+    "set_claude_api_key",
+    "clear_claude_api_key",
+    "transcribe",
+    "ocr_status",
+    "set_auto_ocr",
+}
 ADMIN_TOOLS = {"admin_allow_server_key"}
 NOTEBOOK_NAME = "Scriptorium Test Notebook"
 TRANSCRIPT_MARKER = "transcript-marker-7f3a"

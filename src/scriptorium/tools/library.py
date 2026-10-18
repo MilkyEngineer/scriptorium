@@ -64,7 +64,7 @@ from scriptorium.tools._library import (
     use_account,
     use_document,
 )
-from scriptorium.tools.ocr import LAZY_INSTRUCTION, OLD_VERSION_NOTE
+from scriptorium.tools.ocr import LAZY_INSTRUCTION, OLD_VERSION_NOTE, await_server_transcript
 
 PNG: Final = "image/png"
 PAGE_IMAGE_SIDE: Final = 1024
@@ -330,9 +330,12 @@ class ReadPageArgs(ToolArgs):
 
 async def read_page(ctx: ToolContext, args: ReadPageArgs) -> CallToolResult:
     """Read one page of a reMarkable document (pages are numbered from 1). Returns the
-    page's transcript when there is one. Otherwise returns the page image with instructions:
-    transcribe it and store the result with save_transcript, using the content_hash given.
-    version reads the page as it was at an earlier generation listed by versions()."""
+    page's transcript when there is one. Without one, if the server transcribes with an API
+    key it queues the page, waits a few seconds and answers pending with a job id if the
+    transcript is not ready yet (call again shortly); otherwise it returns the page image with
+    instructions: transcribe it and store the result with save_transcript, using the
+    content_hash given. version reads the page as it was at an earlier generation listed by
+    versions()."""
     account = await use_account(ctx, args.account)
     doc = await use_document(ctx, account, args.document)
     ctx.audit["page"] = args.page
@@ -343,6 +346,10 @@ async def read_page(ctx: ToolContext, args: ReadPageArgs) -> CallToolResult:
     transcript = await asyncio.to_thread(
         account.index.transcript, doc.uuid, source.page_id, source.content_hash
     )
+    if transcript is None and pages.current:
+        transcript = await await_server_transcript(
+            ctx, account, doc, source, pages.version.generation
+        )
     if transcript is not None:
         text, truncated = cap_text(transcript.text, RESULT_CAP_BYTES - _META_ROOM)
         meta = {

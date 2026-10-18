@@ -1,4 +1,4 @@
-"""OCR tools (§11.3, M1 subset): save_transcript, and the lazy-mode instruction (§8.2).
+"""OCR tools (§11.3): save_transcript, transcribe, ocr_status; the lazy instruction (§8.2).
 
 In lazy mode the user's own Claude session transcribes: ``read_page`` returns the page image
 with :data:`LAZY_INSTRUCTION`, and ``save_transcript`` stores the result keyed by
@@ -6,6 +6,13 @@ with :data:`LAZY_INSTRUCTION`, and ``save_transcript`` stores the result keyed b
 UUIDs, so each document's page has its own transcript. A transcript is accepted only for the
 page's *current* hash (``stale_hash`` otherwise), so a page edited since it was read is never
 mislabelled.
+
+With a user or server key (M2, §8.1) the worker transcribes: ``transcribe`` queues ``ocr``
+jobs, ``read_page`` queues one on a miss and waits ``PENDING_WAIT_SECONDS`` for it
+(:func:`await_server_transcript`), and ``ocr_status`` reports the queue, the last failure
+reasons and the month's spend. The server never holds a key beyond the ``resolve`` call
+that decides the mode; the worker resolves again before it spends anything.
+
 Transcripts are note content: they are stored, returned to their owner, and never logged
 or audited (the audit row carries only their byte count).
 """
@@ -13,35 +20,58 @@ or audited (the audit row carries only their byte count).
 from __future__ import annotations
 
 import asyncio
-from typing import Final
+import base64
+import re
+import time
+from typing import Annotated, Any, Final
 
-from mcp_types import CallToolResult
+from mcp_types import CallToolResult, ImageContent, TextContent
 from pydantic import Field
 
-from scriptorium.library.index import DocumentRow
+from scriptorium.jobs.kinds import OCR_KINDS, OcrSpec
+from scriptorium.library import pages as pg
+from scriptorium.library.index import DocumentRow, TranscriptRow
+from scriptorium.ocr.batches import PENDING_REASON
+from scriptorium.ocr.pipeline import (
+    LAZY,
+    OCR_IMAGE_SIDE,
+    SERVER_MODES,
+    TRANSCRIPT_MAX_BYTES,
+    blocked_reason,
+    enqueue_page,
+    load_auto_ocr,
+    resolve_mode,
+)
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
 from scriptorium.tools._conventions import (
+    READ_ONLY,
     RESULT_CAP_BYTES,
     ErrorCode,
     ToolArgs,
     ToolError,
     invalid_argument,
+    iso_utc,
     json_result,
+    json_text,
+    page_to_index,
     tool_annotations,
 )
 from scriptorium.tools._library import (
     ACCT_PATTERN,
     IDENTIFIER_MAX,
     Account,
+    Pages,
+    downscaled,
     load_pages,
+    page_png,
+    page_ref,
     pick_page,
+    services,
     use_account,
     use_document,
 )
+from scriptorium.tools._services import Services
 
-TRANSCRIPT_MAX_BYTES: Final = 30 * 1024
-"""Largest transcript accepted: one page of handwriting is a few KB, and ``read_page`` must
-return it whole within the 32 KB result cap (§11.0)."""
 MODEL_MAX: Final = 100
 LAZY_MODE: Final = "lazy"
 
@@ -136,8 +166,319 @@ async def save_transcript(ctx: ToolContext, args: SaveTranscriptArgs) -> CallToo
     )
 
 
+# ---- the mode ----------------------------------------------------------------------------------
+
+
+LAZY_MAX_PAGES: Final = 3
+"""Page images ``transcribe`` returns per call in lazy mode (each is a few hundred KB)."""
+TRANSCRIBE_MAX_PAGES: Final = 200
+RECENT_ERRORS: Final = 5
+_REASON: Final = re.compile(r"[a-z_]{1,40}")
+LAZY_TRANSCRIBE_NOTE: Final = (
+    "Lazy mode: no API key is available to this server for your pages, so you transcribe "
+    "them. For each page below, follow the instructions and call save_transcript. To have "
+    "the server transcribe in the background instead, set your own Claude API key with "
+    "set_claude_api_key or ask the operator for the server key."
+)
+
+
+def ocr_mode(svc: Services, uid: str) -> tuple[str, str]:
+    """``(mode, reason)`` for ``uid`` now; the key ``resolve`` returns is dropped here."""
+    ports = svc.ocr
+    if ports is None:
+        return LAZY, "not_configured"
+    resolution = resolve_mode(ports, svc.settings, svc.store, uid, svc.clock())
+    mode, reason = resolution.mode, resolution.reason
+    if mode not in SERVER_MODES or resolution.api_key is None:
+        return LAZY, reason
+    return mode, reason
+
+
+def _reason(error: str | None) -> str:
+    return error if error is not None and _REASON.fullmatch(error) else "other"
+
+
+def ocr_queue(svc: Services, account: Account) -> dict[str, dict[str, int]]:
+    """``{kind: {queued, running, retrying, done, dead}}`` for the account's OCR jobs."""
+    counts = svc.queue.counts(account.uid, acct=account.acct)
+    out: dict[str, dict[str, int]] = {}
+    for kind in OCR_KINDS:
+        by_state = counts.get(kind, {})
+        out[kind] = {
+            "queued": by_state.get("queued", 0),
+            "running": by_state.get("leased", 0),
+            "retrying": by_state.get("failed", 0),
+            "done": by_state.get("done", 0),
+            "dead": by_state.get("dead", 0),
+        }
+    return out
+
+
+# ---- read_page's server-side path --------------------------------------------------------------
+
+
+async def await_server_transcript(
+    ctx: ToolContext, account: Account, doc: DocumentRow, source: pg.PageSource, generation: int
+) -> TranscriptRow | None:
+    """With a user or server key: queue OCR for the current page version and wait for it.
+
+    Returns the transcript if it arrives within ``PENDING_WAIT_SECONDS``; raises ``pending``
+    with the job id if the job is still queued or running then. None means "answer as in
+    lazy mode": no key, a page not indexed yet, or a job that finished without a transcript
+    (refused, failed for good, re-runs spent). A deferred job is queued again, since a key is
+    available now.
+    """
+    svc = services(ctx)
+    mode, _ = await asyncio.to_thread(ocr_mode, svc, account.uid)
+    if mode not in SERVER_MODES:
+        return None
+    index = account.index
+    row = await asyncio.to_thread(index.page_by_id, doc.uuid, source.page_id)
+    if row is None or row.content_hash != source.content_hash:
+        return None
+    spec = OcrSpec(doc.uuid, source.page_id, source.content_hash, generation)
+    # A dead job is not retried from here: every read of a page the API refuses would pay
+    # again. transcribe retries it on request.
+    job, _how = await asyncio.to_thread(
+        enqueue_page, svc.queue, uid=account.uid, acct=account.acct, spec=spec, retry_failed=False
+    )
+    if job is None:
+        return None
+    ctx.audit["job"] = job.id
+    deadline = time.monotonic() + svc.settings.pending_wait_seconds
+    while True:
+        transcript = await asyncio.to_thread(
+            index.transcript, doc.uuid, source.page_id, source.content_hash
+        )
+        if transcript is not None:
+            return transcript
+        if job.state in ("done", "dead", "cancelled"):
+            return None
+        if time.monotonic() >= deadline:
+            raise ToolError(
+                ErrorCode.PENDING,
+                "The page is being transcribed.",
+                "Call read_page again in a few seconds; ocr_status shows the queue.",
+                extra={"job": job.id, "state": job.state},
+            )
+        await svc.sleep(svc.poll_interval_s)
+        fresh = await asyncio.to_thread(svc.queue.get, job.id, account.uid)
+        job = job if fresh is None else fresh
+
+
+# ---- transcribe --------------------------------------------------------------------------------
+
+
+class TranscribeArgs(ToolArgs):
+    document: str = Field(
+        min_length=1, max_length=IDENTIFIER_MAX, description="Document UUID or path of names."
+    )
+    pages: list[Annotated[int, Field(ge=1, le=100_000)]] = Field(
+        default_factory=list,
+        max_length=TRANSCRIBE_MAX_PAGES,
+        description="Page numbers, from 1; every page of the document when empty.",
+    )
+    force: bool = Field(
+        default=False, description="Transcribe again even pages that have a transcript."
+    )
+    account: str | None = Field(
+        default=None, pattern=ACCT_PATTERN, description="Account id; the linked one by default."
+    )
+
+
+def _page_numbers(pages: Pages, wanted: list[int]) -> list[int]:
+    if not pages.sources:
+        raise invalid_argument("This document has no pages.")
+    count = len(pages.sources)
+    numbers = sorted(set(wanted)) if wanted else list(range(1, count + 1))
+    for number in numbers:
+        page_to_index(number, count)
+    if len(numbers) > TRANSCRIBE_MAX_PAGES:
+        raise invalid_argument(
+            f"At most {TRANSCRIBE_MAX_PAGES} pages per call; this document has {count}.",
+            "Pass pages in groups.",
+        )
+    return numbers
+
+
+def _queue_pages(
+    svc: Services,
+    account: Account,
+    doc: DocumentRow,
+    pages: Pages,
+    numbers: list[int],
+    force: bool,
+) -> list[dict[str, object]]:
+    index = account.index
+    out: list[dict[str, object]] = []
+    for number in numbers:
+        source = pick_page(pages, number)
+        item: dict[str, object] = {"page": number}
+        row = index.page_by_id(doc.uuid, source.page_id)
+        if row is None or row.content_hash != source.content_hash:
+            item["state"] = "not_indexed"
+        elif not force and index.transcript(doc.uuid, source.page_id, source.content_hash):
+            item["state"] = "transcribed"
+        else:
+            spec = OcrSpec(
+                doc.uuid, source.page_id, source.content_hash, pages.version.generation, force
+            )
+            job, how = enqueue_page(
+                svc.queue, uid=account.uid, acct=account.acct, spec=spec, retry_failed=True
+            )
+            if job is None:
+                item["state"] = "rerun_cap"
+            else:
+                item.update({"job": job.id, "state": job.state, "how": how})
+        out.append(item)
+    return out
+
+
+async def _lazy_pages(
+    ctx: ToolContext,
+    account: Account,
+    doc: DocumentRow,
+    pages: Pages,
+    numbers: list[int],
+    force: bool,
+    reason: str,
+) -> CallToolResult:
+    content: list[TextContent | ImageContent] = []
+    listed: list[dict[str, object]] = []
+    total = 0
+    for number in numbers:
+        source = pick_page(pages, number)
+        ref = page_ref(doc, pages, source)
+        exists = await asyncio.to_thread(
+            account.index.transcript, doc.uuid, source.page_id, source.content_hash
+        )
+        if exists is not None and not force:
+            listed.append({**ref, "transcript": "exists"})
+            continue
+        png = await page_png(ctx, account, source, pages.version.generation)
+        png = await downscaled(ctx, account, source, png, OCR_IMAGE_SIDE)
+        total += len(png)
+        listed.append({**ref, "transcript": None})
+        content.append(TextContent(text=json_text(ref)))
+        content.append(
+            ImageContent(data=base64.b64encode(png).decode("ascii"), mime_type="image/png")
+        )
+    head = {"mode": LAZY, "reason": reason, "document": doc.uuid, "pages": listed}
+    note = LAZY_TRANSCRIBE_NOTE if content else "Every page asked for has a transcript already."
+    text = f"{note}\n\n{LAZY_INSTRUCTION if content else ''}\n\n{json_text(head)}".strip()
+    ctx.audit["bytes"] = total
+    return CallToolResult(content=[TextContent(text=text), *content])
+
+
+async def transcribe(ctx: ToolContext, args: TranscribeArgs) -> CallToolResult:
+    """Transcribe pages of a reMarkable document (all pages when pages is empty). With an
+    API key available (your own, or the server's if the operator allows it) the pages are
+    queued for background transcription and the call returns the job ids and the mode; read
+    the pages with read_page once the jobs are done. In lazy mode (no key) it returns up to
+    three page images with instructions for you to transcribe and save with
+    save_transcript. force transcribes pages again even if they have a transcript."""
+    account = await use_account(ctx, args.account)
+    doc = await use_document(ctx, account, args.document)
+    svc = services(ctx)
+    pages = await asyncio.to_thread(load_pages, account, doc, None)
+    numbers = _page_numbers(pages, args.pages)
+    ctx.audit["pages"] = numbers[:50]
+    ctx.audit["generation"] = pages.version.generation
+    mode, reason = await asyncio.to_thread(ocr_mode, svc, account.uid)
+    if mode not in SERVER_MODES:
+        if len(numbers) > LAZY_MAX_PAGES:
+            raise invalid_argument(
+                f"In lazy mode transcribe returns at most {LAZY_MAX_PAGES} page images per "
+                f"call; this asks for {len(numbers)} pages.",
+                "Ask for up to three pages at a time, e.g. pages=[1, 2, 3], and save each "
+                "transcript with save_transcript.",
+            )
+        return await _lazy_pages(ctx, account, doc, pages, numbers, args.force, reason)
+    jobs = await asyncio.to_thread(_queue_pages, svc, account, doc, pages, numbers, args.force)
+    ctx.audit["count"] = sum(1 for j in jobs if "job" in j)
+    return json_result(
+        {
+            "document": doc.uuid,
+            "mode": mode,
+            "reason": reason,
+            "generation": pages.version.generation,
+            "jobs": jobs,
+            "hint": "read_page returns each page's transcript once its job is done; "
+            "ocr_status shows the queue.",
+        },
+        cap=RESULT_CAP_BYTES,
+    )
+
+
+# ---- ocr_status --------------------------------------------------------------------------------
+
+
+class OcrStatusArgs(ToolArgs):
+    account: str | None = Field(
+        default=None, pattern=ACCT_PATTERN, description="Account id; the linked one by default."
+    )
+
+
+def _money(value: float | None) -> float | None:
+    return None if value is None else round(float(value), 4)
+
+
+def _ocr_status(svc: Services, account: Account) -> dict[str, Any]:
+    uid = account.uid
+    queue = ocr_queue(svc, account)
+    errors = [
+        {"kind": kind, "reason": _reason(error), "at": iso_utc(at)}
+        for kind, error, at in svc.queue.recent_errors(
+            uid, acct=account.acct, kinds=OCR_KINDS, limit=RECENT_ERRORS * 4
+        )
+        if error != PENDING_REASON
+    ][:RECENT_ERRORS]
+    mode, reason = ocr_mode(svc, uid)
+    auto = load_auto_ocr(account.index)
+    payload: dict[str, Any] = {
+        "account": account.acct,
+        "mode": mode,
+        "reason": reason,
+        "auto_ocr": {"enabled": auto.enabled, "folders": list(auto.folders)},
+        "queue": queue,
+        "dead": sum(q["dead"] for q in queue.values()),
+        "recent_errors": errors,
+        "spend_this_month": None,
+        "remaining_this_month": None,
+    }
+    ports = svc.ocr
+    if ports is None:
+        return payload
+    now = svc.clock()
+    spend = ports.ledger.month(uid=uid, mode=None, at=now)
+    payload["spend_this_month"] = {
+        "cost_usd": _money(spend.cost_usd),
+        "pages": spend.pages,
+        "input_tokens": spend.input_tokens,
+        "output_tokens": spend.output_tokens,
+    }
+    allowance = ports.ledger.allowance(svc.settings, svc.store, uid, now)
+    payload["remaining_this_month"] = {
+        "server_key_global_usd": _money(allowance.global_remaining_usd),
+        "server_key_user_usd": _money(allowance.user_remaining_usd),
+        "own_key_usd": _money(allowance.own_remaining_usd),
+        "blocked": blocked_reason(allowance, mode) if mode in SERVER_MODES else None,
+    }
+    return payload
+
+
+async def ocr_status(ctx: ToolContext, args: OcrStatusArgs) -> CallToolResult:
+    """Show background transcription for your account: the OCR mode and why (your own API
+    key, the server key, or lazy mode), whether auto-OCR is on and for which folders, the
+    queue of transcription jobs by state, the reasons of the latest failures, and this
+    month's spend and what remains under each cap that applies."""
+    account = await use_account(ctx, args.account)
+    payload = await asyncio.to_thread(_ocr_status, services(ctx), account)
+    return json_result(payload, cap=RESULT_CAP_BYTES)
+
+
 def register(registry: ToolRegistry) -> None:
-    """Add the M1 OCR tool."""
+    """Add the OCR tools."""
     registry.add(
         ToolSpec.from_handler(
             save_transcript,
@@ -145,6 +486,25 @@ def register(registry: ToolRegistry) -> None:
             annotations=tool_annotations(read_only=False, idempotent=True),
         )
     )
+    registry.add(
+        ToolSpec.from_handler(
+            transcribe,
+            args=TranscribeArgs,
+            annotations=tool_annotations(read_only=False, open_world=True),
+        )
+    )
+    registry.add(ToolSpec.from_handler(ocr_status, args=OcrStatusArgs, annotations=READ_ONLY))
 
 
-__all__ = ["LAZY_INSTRUCTION", "OLD_VERSION_NOTE", "register", "save_transcript"]
+__all__ = [
+    "LAZY_INSTRUCTION",
+    "OLD_VERSION_NOTE",
+    "TRANSCRIPT_MAX_BYTES",
+    "await_server_transcript",
+    "ocr_mode",
+    "ocr_queue",
+    "ocr_status",
+    "register",
+    "save_transcript",
+    "transcribe",
+]

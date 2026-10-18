@@ -14,7 +14,7 @@ results say only whether a key is stored (§8.1).
 from __future__ import annotations
 
 import asyncio
-from typing import Final
+from typing import Annotated, Final
 
 from mcp_types import CallToolResult
 from pydantic import ConfigDict, Field, SecretStr, field_validator
@@ -42,6 +42,13 @@ from scriptorium.errors import RefusedError, ScriptoriumError
 from scriptorium.ocr.errors import OcrRefused, OcrUnavailable
 from scriptorium.ocr.ledger import month_bounds
 from scriptorium.ocr.modes import USER_KEY_SECRET, read_user_key, resolve, server_key_permitted
+from scriptorium.ocr.pipeline import (
+    AUTO_OCR_KEY,
+    AUTO_OCR_MAX_FOLDERS,
+    SERVER_MODES,
+    AutoOcr,
+    dump_auto_ocr,
+)
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
 from scriptorium.tools._conventions import (
     READ_ONLY,
@@ -58,12 +65,19 @@ from scriptorium.tools._conventions import (
 from scriptorium.tools._library import (
     ACCT_PATTERN,
     CONNECT_URL,
+    FOLDER,
+    IDENTIFIER_MAX,
     Account,
+    display_name,
     not_linked,
     open_account,
+    resolve,
     services,
+    state_of,
+    use_account,
 )
 from scriptorium.tools._services import KEY_CHECK_WINDOW_S, Services
+from scriptorium.tools.ocr import ocr_queue
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import worker_heartbeat_path
 from scriptorium.worker import HEARTBEAT_STALE_SECONDS, heartbeat_age, read_heartbeat
@@ -72,9 +86,24 @@ DEVICES_URL: Final = "https://my.remarkable.com/"
 CONSOLE_URL: Final = "https://console.anthropic.com/settings/keys"
 OCR_LAZY_NOTE: Final = (
     "Pages are transcribed by your own Claude session: read_page returns a page's image "
-    "with instructions, and save_transcript stores the result."
+    "with instructions, and save_transcript stores the result. With your own Claude API key "
+    "(or the server's, if the operator allows it) pages are transcribed in the background."
+)
+OCR_SERVER_NOTE: Final = (
+    "Pages are transcribed in the background; read_page waits briefly for a page's "
+    "transcript and otherwise answers pending. ocr_status shows the queue and the spend."
 )
 MAX_OWN_CAP_USD: Final = 100_000.0
+
+
+def _ocr_summary(svc: Services, account: Account | None, uid: str) -> dict[str, object]:
+    """F's key/cap summary plus G's queue numbers (Architecture §11.1 ``account_status.ocr``)."""
+    summary = ocr_summary(svc, uid)
+    if summary.get("mode") in SERVER_MODES:
+        summary["note"] = OCR_SERVER_NOTE
+    if account is not None:
+        summary["queue"] = ocr_queue(svc, account)
+    return summary
 
 
 # ---- connect_remarkable ----------------------------------------------------------------------
@@ -570,7 +599,7 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
         },
         "library": counts,
         "jobs": {"pending": pending, "dead": dead},
-        "ocr": ocr_summary(svc, account.uid),
+        "ocr": _ocr_summary(svc, account, account.uid),
         "quota": None,
         "worker": worker,
     }
@@ -588,7 +617,7 @@ def _account_status(svc: Services, user: User, acct: str | None) -> dict[str, ob
                 f"No reMarkable account is linked. Get a one-time code from {CONNECT_URL} "
                 "and call connect_remarkable with it."
             ),
-            "ocr": ocr_summary(svc, uid),
+            "ocr": _ocr_summary(svc, None, uid),
         }
     account = open_account(svc, user, acct)
     payload = {"user": uid, **_status(svc, account)}
@@ -615,6 +644,75 @@ async def account_status(ctx: ToolContext, args: StatusArgs) -> CallToolResult:
     return json_result(payload, cap=RESULT_CAP_BYTES)
 
 
+# ---- set_auto_ocr ------------------------------------------------------------------------------
+
+
+class AutoOcrArgs(ToolArgs):
+    folders: list[Annotated[str, Field(min_length=1, max_length=IDENTIFIER_MAX)]] = Field(
+        default_factory=list,
+        max_length=AUTO_OCR_MAX_FOLDERS,
+        description="Folder UUIDs or paths of names; their sub-folders are included.",
+    )
+    enabled: bool = Field(description="true to transcribe new pages in these folders.")
+    account: str | None = Field(
+        default=None, pattern=ACCT_PATTERN, description="Account id; the linked one by default."
+    )
+
+
+def _set_auto_ocr(svc: Services, account: Account, args: AutoOcrArgs) -> dict[str, object]:
+    index = account.index
+    found: dict[str, str] = {}
+    for ident in args.folders:
+        folder = resolve(index, ident, want=FOLDER)
+        state = state_of(folder)
+        if state != "live":
+            raise invalid_argument(
+                f"That folder is {state}; auto-OCR applies to live folders only.",
+                "Pick a folder from list.",
+            )
+        found[folder.uuid] = display_name(folder.name)
+    if args.enabled and not found:
+        raise invalid_argument(
+            "Name at least one folder to turn auto-OCR on.",
+            'Pass folder UUIDs or paths from list, e.g. folders=["Notes"].',
+        )
+    setting = AutoOcr(args.enabled, tuple(sorted(found)))
+    index.set_setting(AUTO_OCR_KEY, dump_auto_ocr(setting))
+    mode, reason = ocr_mode(svc, account.uid)
+    if not args.enabled:
+        note = "Auto-OCR is off; transcribe and read_page still transcribe on request."
+    elif mode in SERVER_MODES:
+        note = "New and changed pages in these folders are transcribed after each sync."
+    else:
+        note = (
+            "Saved, but no API key is available for your pages, so nothing is transcribed "
+            "in the background until one is (set_claude_api_key, or ask the operator)."
+        )
+    return {
+        "account": account.acct,
+        "enabled": setting.enabled,
+        "folders": [{"uuid": u, "name": found[u]} for u in setting.folders],
+        "mode": mode,
+        "reason": reason,
+        "note": note,
+    }
+
+
+async def set_auto_ocr(ctx: ToolContext, args: AutoOcrArgs) -> CallToolResult:
+    """Turn automatic transcription on or off for folders of your reMarkable library. When
+    on, the worker transcribes new and changed pages in the given folders and their
+    sub-folders after each sync, once a page has stopped changing, using your own Claude API
+    key or the server's within its monthly caps; ocr_status shows progress and spend. The
+    call replaces the previous folder list; enabled=false turns auto-OCR off."""
+    account = await use_account(ctx, args.account)
+    payload = await asyncio.to_thread(_set_auto_ocr, services(ctx), account, args)
+    folders = payload["folders"]
+    if isinstance(folders, list):
+        ctx.audit["uuids"] = [f["uuid"] for f in folders]
+        ctx.audit["count"] = len(folders)
+    return json_result(payload, cap=RESULT_CAP_BYTES)
+
+
 def register(registry: ToolRegistry) -> None:
     """Add the account tools."""
     registry.add(
@@ -634,26 +732,17 @@ def register(registry: ToolRegistry) -> None:
     registry.add(ToolSpec.from_handler(account_status, args=StatusArgs, annotations=READ_ONLY))
     registry.add(
         ToolSpec.from_handler(
-            set_claude_api_key,
-            args=SetKeyArgs,
-            annotations=tool_annotations(read_only=False, idempotent=True, open_world=True),
-        )
-    )
-    registry.add(
-        ToolSpec.from_handler(
-            clear_claude_api_key,
-            args=NoArgs,
-            annotations=tool_annotations(read_only=False, destructive=True, idempotent=True),
+            set_auto_ocr,
+            args=AutoOcrArgs,
+            annotations=tool_annotations(read_only=False, idempotent=True),
         )
     )
 
 
 __all__ = [
     "account_status",
-    "clear_claude_api_key",
     "connect_remarkable",
     "disconnect_remarkable",
-    "ocr_summary",
     "register",
-    "set_claude_api_key",
+    "set_auto_ocr",
 ]
