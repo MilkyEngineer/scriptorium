@@ -21,6 +21,7 @@ from scriptorium import accounts
 from scriptorium.accounts import device_token_name, move_aside, poll_lock, removal_destination
 from scriptorium.auth.oidc import OIDCValidator
 from scriptorium.cloud.scope import SETTING_SYNC_SCOPE
+from scriptorium.cloud.sync import SCOPE_PENDING, STATE_SCOPE_APPLIED
 from scriptorium.errors import NotFoundError
 from scriptorium.tools import account as account_tools
 from scriptorium.tools._services import Services
@@ -171,6 +172,45 @@ async def test_a_damaged_stored_scope_is_replaced(library: Served, linked: Linke
     result = await library.ok("set_sync_scope", {"mode": "all"})
     assert result["previous"] is None and result["changed"] is True
     assert linked.index().get_setting(SETTING_SYNC_SCOPE) is None
+
+
+async def test_status_reports_the_scope_and_whether_the_worker_applied_it(
+    library: Served, linked: Linked
+) -> None:
+    status = await library.ok("account_status")
+    assert status["scope"] == {"mode": "all", "tags": [], "applied": True, "excluded": 0}
+
+    _tag(linked, NOTEBOOK, WORK)
+    _tag(linked, PDF, WORK)
+    await linked.sync()
+    denied = await library.ok("set_sync_scope", {"mode": "deny", "tags": [WORK]})
+    assert denied["changed"] is True and denied["applied"] is False
+
+    status = await library.ok("account_status")  # stored, not yet polled
+    assert status["scope"] == {"mode": "deny", "tags": [WORK], "applied": False, "excluded": 0}
+    linked.index().set_state(STATE_SCOPE_APPLIED, SCOPE_PENDING)  # a poll that ended part way
+    assert (await library.ok("account_status"))["scope"]["applied"] is False
+
+    await linked.sync()
+
+    assert _excluded(linked, NOTEBOOK) and _excluded(linked, PDF)
+    status = await library.ok("account_status")
+    assert status["scope"] == {"mode": "deny", "tags": [WORK], "applied": True, "excluded": 2}
+    again = await library.ok("set_sync_scope", {"mode": "deny", "tags": [WORK]})
+    assert again["changed"] is False and again["applied"] is True
+
+
+async def test_status_reports_a_malformed_stored_scope(library: Served, linked: Linked) -> None:
+    linked.index().set_setting(SETTING_SYNC_SCOPE, "{not json")
+    status = await library.ok("account_status")
+    assert status["scope"] == {
+        "mode": None,
+        "tags": [],
+        "applied": False,
+        "excluded": 0,
+        "malformed": True,
+    }
+    assert status["account"] == linked.acct
 
 
 # ---- disconnect_remarkable(keep_archive=false) ---------------------------------------------------

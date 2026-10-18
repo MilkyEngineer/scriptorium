@@ -11,8 +11,10 @@ A Claude API key is checked with the cheapest API call before it is sealed (Secr
 results say only whether a key is stored (§8.1).
 
 ``set_sync_scope`` stores the account's scope (``cloud/scope.py``) in its index; the worker
-applies it on its next poll. Tag names are the user's display strings: they are returned to
-the user and never logged or audited (the audit records how many there are).
+applies it on its next poll, and ``account_status`` reports whether it has
+(``sync_state.scope_applied`` against the stored scope's fingerprint, compared as the worker
+compares them). Tag names are the user's display strings: they are returned to the user and
+never logged or audited (the audit records how many there are).
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ from scriptorium.accounts import (
 )
 from scriptorium.auth.oidc import User
 from scriptorium.cloud.scope import (
+    ALL,
     MAX_SCOPE_TAGS,
     MAX_TAG_LEN,
     SETTING_SYNC_SCOPE,
@@ -53,11 +56,13 @@ from scriptorium.cloud.scope import (
     dump_scope,
     load_scope,
     make_scope,
+    scope_fingerprint,
 )
 from scriptorium.cloud.sync import (
     STATE_ANOMALY,
     STATE_ANOMALY_REASON,
     STATE_LAST_FULL_LISTING_OK,
+    STATE_SCOPE_APPLIED,
     STATE_TOMBSTONING_SUSPENDED_FAILED,
     STATE_TOMBSTONING_SUSPENDED_SINCE,
 )
@@ -522,6 +527,25 @@ def _scope_view(scope: SyncScope) -> dict[str, object]:
     return {"mode": scope.mode, "tags": sorted(scope.tags)}
 
 
+def _scope_applied(index: Index, scope: SyncScope) -> bool:
+    """Whether the worker's last fully processed poll applied ``scope``, read as the worker
+    reads it: ``scope_applied`` absent means ``all``, and the pending marker equals no scope."""
+    applied = index.get_state(STATE_SCOPE_APPLIED) or scope_fingerprint(ALL)
+    return applied == scope_fingerprint(scope)
+
+
+def _scope_status(index: Index) -> dict[str, object]:
+    """The ``scope`` object of ``account_status``: the stored scope, whether the worker has
+    applied it, and how many documents (not tombstoned) are outside it. A stored scope the
+    worker cannot read (it backs off with ``scope_malformed``) is reported, not raised."""
+    excluded = len(index.document_uuids(deleted=False, excluded=True))
+    try:
+        scope = load_scope(index)
+    except ScopeError:
+        return {"mode": None, "tags": [], "applied": False, "excluded": excluded, "malformed": True}
+    return {**_scope_view(scope), "applied": _scope_applied(index, scope), "excluded": excluded}
+
+
 def _set_scope(svc: Services, user: User, scope: SyncScope) -> dict[str, object]:
     uid = svc.uid(user)
     row = next((r for r in svc.store.accounts(uid) if r.active), None)
@@ -558,6 +582,7 @@ def _set_scope(svc: Services, user: User, scope: SyncScope) -> dict[str, object]
         "scope": _scope_view(scope),
         "previous": None if before is None else _scope_view(before),
         "changed": before != scope,
+        "applied": _scope_applied(index, scope),
         "unmatched_tags": unmatched,
         "message": message,
     }
@@ -569,8 +594,9 @@ async def set_sync_scope(ctx: ToolContext, args: ScopeArgs) -> CallToolResult:
     or sitting in a folder that carries one (mode "allow"), or every document except those
     (mode "deny"). Tags are matched exactly after trimming, and tags on single pages do not
     count. The worker applies the scope on its next sync: documents outside it are listed as
-    excluded and never downloaded. Narrowing the scope never deletes anything already
-    archived; those versions stay readable."""
+    excluded and never downloaded; the result's "applied" stays false until then, and
+    account_status shows when it turns true. Narrowing the scope never deletes anything
+    already archived; those versions stay readable."""
     try:
         scope = make_scope(args.mode, args.tags)
     except ScopeError as exc:
@@ -859,6 +885,7 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
         "jobs": {"pending": pending, "dead": dead},
         "ocr": account_ocr(svc, account, account.uid),
         "quota": None,
+        "scope": _scope_status(index),
         "worker": worker,
     }
 
@@ -901,10 +928,11 @@ async def account_status(ctx: ToolContext, args: StatusArgs) -> CallToolResult:
     """Show the state of your linked reMarkable account: whether it is linked, when it last
     synced, how many documents, pages and transcripts are archived, pending and failed page
     renders, how pages are transcribed (the OCR mode and why, this month's spend and the caps
-    that apply), and warnings (the account needs relinking, sync is paused by an anomaly such
-    as a mass deletion, the worker is not running). Also shows your user id, which an
-    administrator needs to change your settings. Works before linking too: it then explains
-    how to connect."""
+    that apply), the sync scope (its mode and tags, whether the worker has applied it yet, and
+    how many documents it excludes), and warnings (the account needs relinking, sync is paused
+    by an anomaly such as a mass deletion, the worker is not running). Also shows your user id,
+    which an administrator needs to change your settings. Works before linking too: it then
+    explains how to connect."""
     payload = await asyncio.to_thread(_account_status, services(ctx), ctx.user, args.account)
     acct = payload.get("account")
     if isinstance(acct, str):
