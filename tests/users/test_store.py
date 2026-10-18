@@ -564,3 +564,73 @@ def test_audit_accepts_a_uid_as_the_user_identifier(db: Path, gs: GlobalStore) -
                 identifiers=identifiers,
             )
     assert len(_audit_rows(db)) == 1
+
+
+# ---- removed accounts and confirmations (M2) ---------------------------------------------------
+
+
+def test_a_removed_account_is_inactive_never_polled_and_never_reused(gs: GlobalStore) -> None:
+    uid = gs.ensure_user(make_user()).uid
+    first = gs.link_account(uid, "identity", "d")
+    at = datetime(2026, 10, 18, tzinfo=UTC)
+    gs.mark_removed(uid, first.acct, at=at)
+    row = gs.account(uid, first.acct)
+    assert row is not None and not row.active and row.removed_at == at
+    assert gs.active_accounts() == []
+    with pytest.raises(NotFoundError):  # already removed
+        gs.mark_removed(uid, first.acct, at=at)
+    again = gs.link_account(uid, "identity", "d")
+    assert again.acct != first.acct and again.removed_at is None
+    assert [r.acct for r in gs.accounts(uid)] == [first.acct, again.acct]
+    assert {r.acct: r.removed_at for r in gs.all_accounts()} == {
+        first.acct: at,
+        again.acct: None,
+    }
+
+
+def test_unmark_removed_keeps_the_account_inactive(gs: GlobalStore) -> None:
+    uid = gs.ensure_user(make_user()).uid
+    row = gs.link_account(uid, None, "d")
+    gs.mark_removed(uid, row.acct, at=datetime(2026, 10, 18, tzinfo=UTC))
+    gs.unmark_removed(uid, row.acct)
+    after = gs.account(uid, row.acct)
+    assert after is not None and after.removed_at is None and not after.active
+
+
+def test_mark_removed_is_scoped_to_the_user(gs: GlobalStore) -> None:
+    alice = gs.ensure_user(make_user("alice")).uid
+    bob = gs.ensure_user(make_user("bob")).uid
+    row = gs.link_account(alice, None, "d")
+    with pytest.raises(NotFoundError):
+        gs.mark_removed(bob, row.acct, at=datetime(2026, 10, 18, tzinfo=UTC))
+    assert gs.accounts(alice)[0].active
+
+
+def test_spend_confirmation_records_each_digest_once(gs: GlobalStore) -> None:
+    now = datetime(2026, 10, 18, tzinfo=UTC)
+    digest = "ab" * 32
+    assert gs.spend_confirmation(digest, now=now)
+    assert not gs.spend_confirmation(digest, now=now + timedelta(seconds=5))
+    assert gs.spend_confirmation("cd" * 32, now=now)
+    for bad in ("AB" * 32, "ab" * 31, "", "zz" * 32):
+        with pytest.raises(InvalidArgumentError):
+            gs.spend_confirmation(bad, now=now)
+
+
+def test_admin_audit_keys_take_a_uid_and_a_length(gs: GlobalStore) -> None:
+    gs.audit(
+        uid_hash=UID,
+        tool="admin_clear_anomaly",
+        duration_ms=1.0,
+        outcome="ok",
+        identifiers={"user": UID, "reason_chars": 12},
+    )
+    for bad in ({"user": "someone@example.com"}, {"reason_chars": "too long a reason"}):
+        with pytest.raises(ValueError):
+            gs.audit(
+                uid_hash=UID,
+                tool="admin_clear_anomaly",
+                duration_ms=1.0,
+                outcome="ok",
+                identifiers=bad,
+            )

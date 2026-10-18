@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -184,6 +184,9 @@ class AccountRow:
     active: bool
     linked_at: datetime
     device_desc: str
+    removed_at: datetime | None = None
+    """Set once ``disconnect_remarkable(keep_archive=false)`` moved the account's directory to
+    ``users/<uid>/removed/``: the account is never opened, polled or relinked again."""
 
 
 _TOOL_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -196,6 +199,11 @@ _USER_UPDATES: Final[Mapping[str, str]] = {
     "ocr_cap_usd": "UPDATE users SET ocr_cap_usd = ? WHERE uid = ?",
     "server_key_email_sha256": "UPDATE users SET server_key_email_sha256 = ? WHERE uid = ?",
 }
+_ACCOUNT_COLUMNS: Final = (
+    "acct, uid, rm_account_identity, active, linked_at, device_desc, removed_at"
+)
+_SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
+_CONFIRMATION_KEEP_SECONDS: Final = 2 * 600
 _MAX_DEVICE_DESC: Final = 128
 _MAX_IDENTITY: Final = 256
 
@@ -238,6 +246,7 @@ AUDIT_IDENTIFIER_KEYS: Final[Mapping[str, Callable[[object], bool]]] = {
     "user": _matches(UID_RE),
     # What an admin grant or withdrawal set (admin_allow_server_key); a flag, nothing else.
     "allowed": lambda value: isinstance(value, bool),
+    "reason_chars": _is_int,  # an administrator's free-text reason is audited by length only
 }
 
 
@@ -426,8 +435,8 @@ class GlobalStore:
         """Every account the user ever linked, oldest first (inactive ones included)."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT acct, uid, rm_account_identity, active, linked_at, device_desc "
-                "FROM accounts WHERE uid = ? ORDER BY linked_at, acct",
+                f"SELECT {_ACCOUNT_COLUMNS} FROM accounts WHERE uid = ? "  # noqa: S608
+                "ORDER BY linked_at, acct",
                 (_check_uid(uid),),
             ).fetchall()
         return [_account_row(r) for r in rows]
@@ -436,8 +445,7 @@ class GlobalStore:
         """Account ``acct`` if it belongs to ``uid`` (active or not), else None."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT acct, uid, rm_account_identity, active, linked_at, device_desc "
-                "FROM accounts WHERE uid = ? AND acct = ?",
+                f"SELECT {_ACCOUNT_COLUMNS} FROM accounts WHERE uid = ? AND acct = ?",  # noqa: S608
                 (_check_uid(uid), _check_acct(acct)),
             ).fetchone()
         return None if row is None else _account_row(row)
@@ -447,17 +455,18 @@ class GlobalStore:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT a.acct, a.uid, a.rm_account_identity, a.active, a.linked_at, "
-                "a.device_desc FROM accounts a JOIN users u ON u.uid = a.uid "
-                "WHERE a.active = 1 AND u.disabled_at IS NULL ORDER BY a.linked_at, a.acct"
+                "a.device_desc, a.removed_at FROM accounts a JOIN users u ON u.uid = a.uid "
+                "WHERE a.active = 1 AND a.removed_at IS NULL AND u.disabled_at IS NULL "
+                "ORDER BY a.linked_at, a.acct"
             ).fetchall()
         return [_account_row(r) for r in rows]
 
     def all_accounts(self) -> list[AccountRow]:
-        """Every account ever linked, by anyone (the server migrates their indexes at start)."""
+        """Every account ever linked, by anyone (the server migrates their indexes at start);
+        removed ones included, with ``removed_at`` set."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT acct, uid, rm_account_identity, active, linked_at, device_desc "
-                "FROM accounts ORDER BY linked_at, acct"
+                f"SELECT {_ACCOUNT_COLUMNS} FROM accounts ORDER BY linked_at, acct"  # noqa: S608
             ).fetchall()
         return [_account_row(r) for r in rows]
 
@@ -506,15 +515,15 @@ class GlobalStore:
                         hint="it must be disconnected there first",
                     )
             active = conn.execute(
-                "SELECT acct, uid, rm_account_identity, active, linked_at, device_desc "
-                "FROM accounts WHERE uid = ? AND active = 1",
+                f"SELECT {_ACCOUNT_COLUMNS} FROM accounts WHERE uid = ? AND active = 1",  # noqa: S608
                 (uid,),
             ).fetchone()
             reuse = None
             if rm_identity is not None:
+                # A removed account's directory is in removed/: relinking gets a new one.
                 reuse = conn.execute(
-                    "SELECT acct, uid, rm_account_identity, active, linked_at, device_desc "
-                    "FROM accounts WHERE uid = ? AND rm_account_identity = ? "
+                    f"SELECT {_ACCOUNT_COLUMNS} FROM accounts "  # noqa: S608
+                    "WHERE uid = ? AND rm_account_identity = ? AND removed_at IS NULL "
                     "ORDER BY linked_at DESC LIMIT 1",
                     (uid, rm_identity),
                 ).fetchone()
@@ -539,8 +548,7 @@ class GlobalStore:
                     (acct, uid, rm_identity, now, device_desc),
                 )
             row = conn.execute(
-                "SELECT acct, uid, rm_account_identity, active, linked_at, device_desc "
-                "FROM accounts WHERE acct = ?",
+                f"SELECT {_ACCOUNT_COLUMNS} FROM accounts WHERE acct = ?",  # noqa: S608
                 (acct,),
             ).fetchone()
         return _account_row(row)
@@ -554,6 +562,50 @@ class GlobalStore:
             )
             if cur.rowcount == 0:
                 raise NotFoundError("no such account")
+
+    def mark_removed(self, uid: str, acct: str, *, at: datetime) -> None:
+        """Deactivate the account and record that its directory is being moved to
+        ``removed/`` (``disconnect_remarkable(keep_archive=false)``). Set before the move, so
+        no reader recreates the directory meanwhile; :meth:`unmark_removed` undoes it if the
+        move fails."""
+        with self._write() as conn:
+            cur = conn.execute(
+                "UPDATE accounts SET active = 0, removed_at = ? "
+                "WHERE uid = ? AND acct = ? AND removed_at IS NULL",
+                (_iso(at), _check_uid(uid), _check_acct(acct)),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("no such account")
+
+    def unmark_removed(self, uid: str, acct: str) -> None:
+        """Clear ``removed_at`` after a move that did not happen (the account stays inactive)."""
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE accounts SET removed_at = NULL WHERE uid = ? AND acct = ?",
+                (_check_uid(uid), _check_acct(acct)),
+            )
+
+    # ---- confirmation tokens -------------------------------------------------------------
+
+    def spend_confirmation(self, digest: str, *, now: datetime) -> bool:
+        """Record an executed confirmation token (§11.0); False if it was recorded before.
+
+        ``digest`` is the SHA-256 of the token (``tools._conventions.confirmation_digest``).
+        Rows older than twice the token lifetime are pruned in the same transaction: such a
+        token fails its expiry check before it gets here.
+        """
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            raise InvalidArgumentError("confirmation digest is malformed")
+        stamp = _iso(now)
+        horizon = _iso(now - timedelta(seconds=_CONFIRMATION_KEEP_SECONDS))
+        with self._write() as conn:
+            conn.execute("DELETE FROM confirmations WHERE used_at < ?", (horizon,))
+            cur = conn.execute(
+                "INSERT INTO confirmations (sha256, used_at) VALUES (?, ?) "
+                "ON CONFLICT (sha256) DO NOTHING",
+                (digest, stamp),
+            )
+            return cur.rowcount == 1
 
     # ---- audit ---------------------------------------------------------------------------
 
@@ -599,4 +651,5 @@ def _account_row(row: sqlite3.Row) -> AccountRow:
         active=bool(row[3]),
         linked_at=linked,
         device_desc=row[5],
+        removed_at=_parse_ts(row[6]),
     )

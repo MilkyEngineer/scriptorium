@@ -9,17 +9,21 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Final
+from typing import Any, Final, Protocol
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
-from scriptorium.auth.oidc import User
+from scriptorium.config import Settings
 
 # ---- errors ---------------------------------------------------------------------------
 
@@ -274,17 +278,143 @@ def tool_annotations(
 # ---- confirmation tokens (§11.0 destructive actions) --------------------------------------
 
 CONFIRMATION_TTL_SECONDS: Final = 600
+CONFIRMATION_SKEW_SECONDS: Final = 60
+"""A token issued up to this far in the future (a clock step back) is still accepted."""
+CONFIRMATION_REFUSALS: Final = frozenset({"malformed", "expired", "not_bound", "used"})
+_CONFIRMATION_INFO: Final = b"confirmation"
+_CONFIRMATION_VERSION: Final = 1
+_ISSUED_BYTES: Final = 8
+_MAC_BYTES: Final = 32
+_TOKEN_RE: Final = re.compile(r"[A-Za-z0-9_-]{54}")
+"""``base64url(issued_at || mac)`` without padding: 40 bytes are 54 characters."""
+
+
+class ConfirmationLedger(Protocol):
+    """Where executed tokens are recorded (``GlobalStore``: the ``confirmations`` table)."""
+
+    def spend_confirmation(self, digest: str, *, now: datetime) -> bool:
+        """Record ``digest``; False if it was recorded already (the token was used)."""
+        ...
+
+
+def _confirmation_key(settings: Settings) -> bytes:
+    """HKDF-SHA256 of the newest master key, info ``confirmation`` (§11.0)."""
+    newest = settings.master_key_list()[0]
+    material = base64.urlsafe_b64decode(newest.encode("ascii"))
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_CONFIRMATION_INFO)
+    return hkdf.derive(material)
+
+
+def _confirmation_mac(
+    settings: Settings, *, uid: str, tool: str, args: Mapping[str, Any], issued_at: int
+) -> bytes:
+    """HMAC-SHA256 over the canonical JSON of what the token is bound to."""
+    try:
+        payload = json.dumps(
+            {
+                "v": _CONFIRMATION_VERSION,
+                "uid": uid,
+                "tool": tool,
+                "args": dict(args),
+                "issued_at": issued_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("confirmation arguments must be plain JSON") from None
+    return hmac.new(_confirmation_key(settings), payload, hashlib.sha256).digest()
+
+
+def _confirmation_refused(reason: str) -> ToolError:
+    hints = {
+        "malformed": "Pass the confirmation_token from the dry run exactly as it was returned.",
+        "expired": "Tokens are valid for 10 minutes: call the tool again without a token for "
+        "a new dry run.",
+        "not_bound": "The token belongs to other arguments (or another user or tool): call the "
+        "tool again without a token, with the arguments you mean.",
+        "used": "That token was already used: call the tool again without a token for a new "
+        "dry run.",
+    }
+    return ToolError(
+        ErrorCode.REFUSED,
+        "The confirmation token was not accepted.",
+        hints[reason],
+        extra={"reason": reason},
+    )
 
 
 def issue_confirmation_token(
-    user: User, tool: str, arguments: Mapping[str, object], summary: Mapping[str, object]
+    settings: Settings, *, uid: str, tool: str, args: Mapping[str, Any], now: datetime
 ) -> str:
-    """Mint a token bound to the user and the exact arguments of a dry run (valid 10 min)."""
-    raise NotImplementedError("confirmation tokens arrive with the first destructive tool")
+    """A token for the dry run of ``tool`` by ``uid`` with exactly ``args`` (valid 10 min).
+
+    ``base64url(issued_at || HMAC-SHA256)``: the arguments are never in the token, only the
+    MAC over them, so the execute call must present the same arguments and the server
+    recomputes the payload. Stateless to issue; :func:`spend_confirmation_token` makes it
+    single-use.
+    """
+    issued_at = int(now.timestamp())
+    mac = _confirmation_mac(settings, uid=uid, tool=tool, args=args, issued_at=issued_at)
+    raw = issued_at.to_bytes(_ISSUED_BYTES, "big", signed=True) + mac
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _decode_confirmation(token: object) -> tuple[int, bytes] | None:
+    if not isinstance(token, str) or _TOKEN_RE.fullmatch(token) is None:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(token + "==")
+    except (binascii.Error, ValueError):
+        return None
+    # Canonical form only: the two spare bits of the last character must be zero.
+    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") != token:
+        return None
+    if len(raw) != _ISSUED_BYTES + _MAC_BYTES:
+        return None
+    return int.from_bytes(raw[:_ISSUED_BYTES], "big", signed=True), raw[_ISSUED_BYTES:]
 
 
 def verify_confirmation_token(
-    user: User, tool: str, arguments: Mapping[str, object], token: str
+    settings: Settings,
+    token: str,
+    *,
+    uid: str,
+    tool: str,
+    args: Mapping[str, Any],
+    now: datetime,
 ) -> None:
-    """Raise ``ToolError(confirm_required)`` unless ``token`` matches this user and arguments."""
-    raise NotImplementedError("confirmation tokens arrive with the first destructive tool")
+    """Accept ``token`` only for ``uid``, ``tool`` and exactly ``args``, within 10 minutes.
+
+    Raises ``ToolError(refused)`` with ``reason`` ``malformed``, ``not_bound`` (another user,
+    tool or arguments, or a master key rotated since) or ``expired``. It does not spend the
+    token; the caller does that with :func:`spend_confirmation_token` right before acting.
+    """
+    decoded = _decode_confirmation(token)
+    if decoded is None:
+        raise _confirmation_refused("malformed")
+    issued_at, mac = decoded
+    expected = _confirmation_mac(settings, uid=uid, tool=tool, args=args, issued_at=issued_at)
+    if not hmac.compare_digest(mac, expected):
+        raise _confirmation_refused("not_bound")
+    age = int(now.timestamp()) - issued_at
+    if not -CONFIRMATION_SKEW_SECONDS <= age <= CONFIRMATION_TTL_SECONDS:
+        raise _confirmation_refused("expired")
+
+
+def confirmation_digest(token: str) -> str:
+    """What ``confirmations`` stores for a token: SHA-256 of its decoded bytes."""
+    decoded = _decode_confirmation(token)
+    if decoded is None:
+        raise _confirmation_refused("malformed")
+    issued_at, mac = decoded
+    raw = issued_at.to_bytes(_ISSUED_BYTES, "big", signed=True) + mac
+    return hashlib.sha256(raw).hexdigest()
+
+
+def spend_confirmation_token(ledger: ConfirmationLedger, token: str, *, now: datetime) -> None:
+    """Record a verified token as used; ``refused`` (reason ``used``) the second time."""
+    if not ledger.spend_confirmation(confirmation_digest(token), now=now):
+        raise _confirmation_refused("used")
