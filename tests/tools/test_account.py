@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -218,6 +219,25 @@ async def test_disconnect_keeps_the_archive_and_forgets_the_token(fresh: Served)
     assert (await fresh.error("disconnect_remarkable"))["code"] == "not_linked"
     # The archive stays readable by its account id.
     assert (await fresh.ok("list", {"account": linked["account"]}))["items"] == []
+
+
+async def test_concurrent_connects_register_one_device(fresh: Served) -> None:
+    registrar = fresh.registrar
+
+    def slow(code: str, description: str) -> str:
+        time.sleep(0.3)  # long enough for the other call to reach its own check
+        return registrar(code, description)
+
+    fresh.services.register_device = slow
+    first, second = await asyncio.gather(
+        fresh.call("connect_remarkable", {"code": CODE}),
+        fresh.call("connect_remarkable", {"code": CODE}),
+    )
+    assert registrar.calls == ["desktop-linux"]  # exactly one device at reMarkable
+    assert sorted([first.is_error, second.is_error]) == [False, True]
+    loser = first if first.is_error else second
+    assert json.loads(loser.content[0].text)["code"] == "refused"  # type: ignore[union-attr]
+    assert len(fresh.services.store.all_accounts()) == 1
 
 
 # ---- account_status after real syncs -----------------------------------------------------------

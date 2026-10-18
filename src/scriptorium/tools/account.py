@@ -136,7 +136,12 @@ async def connect_remarkable(ctx: ToolContext, args: ConnectArgs) -> CallToolRes
     device at reMarkable. Refused if you already have a linked account, unless replace is
     true (the old archive stays readable through list(account=...)), or if that reMarkable
     account is linked to another user."""
-    payload = await asyncio.to_thread(_connect, services(ctx), ctx.user, args.code, args.replace)
+    svc = services(ctx)
+    uid = await asyncio.to_thread(svc.uid, ctx.user)
+    # One connect per user at a time: the "already linked" check, the registration, the
+    # link and the sealing run as one sequence, so a concurrent call sees the link.
+    async with svc.connect_lock(uid):
+        payload = await asyncio.to_thread(_connect, svc, ctx.user, args.code, args.replace)
     ctx.audit["acct"] = payload["account"]
     return json_result(payload, cap=RESULT_CAP_BYTES)
 

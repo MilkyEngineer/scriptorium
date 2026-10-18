@@ -68,6 +68,7 @@ class Services:
     _indexes: dict[tuple[str, str], Index] = field(default_factory=dict, repr=False)
     _users: dict[str, str] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _connect_locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
     @classmethod
     def open(cls, settings: Settings, **kwargs: Any) -> Services:
@@ -104,6 +105,17 @@ class Services:
             self._users[user.uid_hash] = row.uid
         log_event(logger, "user_seen", uid=uid_prefix(user.uid_hash))
         return row.uid
+
+    def connect_lock(self, uid: str) -> asyncio.Lock:
+        """The lock that serialises ``connect_remarkable`` for one user (event loop only).
+
+        Each call registers a device at reMarkable before the link is recorded, so two
+        concurrent calls would both register and the loser would leave an orphan device.
+        """
+        lock = self._connect_locks.get(uid)
+        if lock is None:
+            lock = self._connect_locks[uid] = asyncio.Lock()
+        return lock
 
     def index(self, uid: str, acct: str) -> Index:
         """The account's index, migrated and opened once per process."""
