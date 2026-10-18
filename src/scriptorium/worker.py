@@ -221,40 +221,29 @@ def read_heartbeat(path: Path) -> dict[str, Any]:
 # ---- pages ---------------------------------------------------------------------------------
 
 
-def _live(index: Index, uuid: str) -> bool:
-    doc = index.document(uuid)
-    return doc is not None and doc.deleted_at is None
-
-
 def refresh_document(
     paths: AccountPaths, index: Index, uuid: str, now: datetime
-) -> tuple[list[RenderSpec], int]:
+) -> list[RenderSpec]:
     """Make ``pages`` match the document's current version; returns what needs rendering.
 
-    Returns the render specs of pages with no PNG on disk, and how many page ids were left
-    out of ``pages`` because another live document already lists them (open question 8:
-    ``pages.uuid`` is a primary key, and a duplicated document can reuse page UUIDs). A page
-    left out still gets its PNG and is still readable: tools read page lists from the
-    version's blobs, not from ``pages``. A page whose PNG is already on disk (an unchanged
-    page of a copied document, or a render that finished before a restart) is marked
-    rendered without a job.
+    Every page of the version gets a row under ``(uuid, page id)``, including pages whose id
+    another document also lists (the same ``.rm`` files uploaded more than once share page
+    UUIDs, open question 8). Returns the render specs of pages with no PNG on disk. A page
+    whose PNG is already on disk (a page of a document uploaded again, or a render that
+    finished before a restart) is marked rendered without a job. Copies queue the same
+    ``render:<acct>:<page>:<hash>`` key, so one job renders the shared PNG, and finishing it
+    marks every copy's row (:meth:`Index.set_rendered`).
     """
     doc = index.document(uuid)
     if doc is None or doc.type != DOCUMENT_TYPE or doc.hash_root is None:
-        return [], 0
+        return []
     version = pg.current_version(paths, index, uuid)
     if version is None:
-        return [], 0
+        return []
     sources = pg.page_sources(paths, version)
-    rows: list[PageRow] = []
-    collisions = 0
-    for source in sources:
-        owner = index.page_by_id(source.page_id)
-        if owner is not None and owner.document != uuid and _live(index, owner.document):
-            collisions += 1
-            continue
-        rows.append(PageRow(source.page_id, uuid, source.idx, source.content_hash, now))
-    index.replace_pages(uuid, rows)
+    index.replace_pages(
+        uuid, [PageRow(s.page_id, uuid, s.idx, s.content_hash, now) for s in sources]
+    )
     listed = {row.page_id: row for row in index.pages(uuid)}
     todo: list[RenderSpec] = []
     for source in sources:
@@ -262,10 +251,10 @@ def refresh_document(
         row = listed.get(source.page_id)
         if pg.resolve_png(paths, rel).is_file():
             if row is not None and row.rendered_at is None:
-                index.set_rendered(source.page_id, rel, now, content_hash=source.content_hash)
+                index.set_rendered(uuid, source.page_id, source.content_hash, rel, now)
             continue
         todo.append(RenderSpec(uuid, source.page_id, source.content_hash, version.generation))
-    return todo, collisions
+    return todo
 
 
 def find_source(paths: AccountPaths, index: Index, spec: RenderSpec) -> pg.PageSource | None:
@@ -505,15 +494,14 @@ class Worker:
 
     def refresh(self, ctx: AccountContext, uuids: Iterable[str]) -> int:
         """Refresh the pages of ``uuids`` and queue their renders; returns jobs queued."""
-        queued = collisions = 0
+        queued = 0
         now = self.clock()
         for uuid in uuids:
             try:
-                todo, skipped = refresh_document(ctx.paths, ctx.index, uuid, now)
+                todo = refresh_document(ctx.paths, ctx.index, uuid, now)
             except ScriptoriumError:
                 log_event(logger, "pages_refresh_failed", level=logging.WARNING, acct=ctx.acct)
                 continue
-            collisions += skipped
             for spec in todo:
                 self.queue.enqueue(
                     uid=ctx.uid,
@@ -523,10 +511,6 @@ class Worker:
                     payload=spec.payload(),
                 )
                 queued += 1
-        if collisions:
-            log_event(
-                logger, "pages_id_collision", level=logging.WARNING, acct=ctx.acct, count=collisions
-            )
         return queued
 
     # ---- jobs ------------------------------------------------------------------------------
@@ -633,12 +617,15 @@ class Worker:
             await asyncio.to_thread(pg.write_png, ctx.paths, rel, data)
         size = (await asyncio.to_thread(path.stat)).st_size
         if spec.max_side is None:
+            # Marks every document listing this page version, not only spec.document: a
+            # document uploaded twice shares this PNG and this job (one dedupe key).
             await asyncio.to_thread(
                 ctx.index.set_rendered,
+                spec.document,
                 source.page_id,
+                source.content_hash,
                 rel,
                 self.clock(),
-                content_hash=source.content_hash,
             )
         return {"png": rel, "bytes": size}
 

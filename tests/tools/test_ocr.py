@@ -11,7 +11,7 @@ from scriptorium.tools.ocr import LAZY_INSTRUCTION
 from tests.cloud.fake_cloud import NOTEBOOK, PDF, fixture_documents
 from tests.cloud.scenarios import PAGE_101, PDF_PAGE
 from tests.tools.helpers import Served, meta_of, text_of
-from tests.worker.helpers import Linked
+from tests.worker.helpers import COPY_A, Linked, reupload
 
 TRANSCRIPT = "# Shopping\n\n- [ ] synthetic milk\n- [x] synthetic bread\n"
 
@@ -84,23 +84,55 @@ async def test_transcript_limits(library: Served) -> None:
     assert unknown["code"] == "not_found"
 
 
-async def test_a_page_id_shared_with_another_document_is_refused(
+async def test_a_page_id_shared_with_another_document_takes_its_own_transcript(
     linked: Linked, library: Served
 ) -> None:
-    """Open question 8: the fixture notebook's first page and the PDF's page share an id."""
+    """The fixture notebook's first page and the PDF's page share an id with other content:
+    each document's page is saved and read back on its own."""
     notebook = meta_of(await library.call("read_page", {"document": NOTEBOOK, "page": 1}))
     pdf = meta_of(await library.call("read_page", {"document": PDF, "page": 1}))
     assert notebook["page_id"] == pdf["page_id"]
     assert notebook["content_hash"] != pdf["content_hash"]
-    row = linked.index().page_by_id(notebook["page_id"])
-    assert row is not None
-    owner, other = (notebook, pdf) if row.document == NOTEBOOK else (pdf, notebook)
-    assert (await library.ok("save_transcript", _save(owner)))["saved"] is True
-    refused = await library.error("save_transcript", _save(other))
-    assert refused["code"] == "refused"
-    # The owner's transcript is untouched by the refused call.
-    assert linked.index().transcript(owner["page_id"], owner["content_hash"]) is not None
-    assert linked.index().transcript(other["page_id"], other["content_hash"]) is None
+    assert (await library.ok("save_transcript", _save(notebook)))["saved"] is True
+    assert (await library.ok("save_transcript", _save(pdf, text="# PDF page\n")))["saved"]
+    index = linked.index()
+    saved = index.transcript(NOTEBOOK, notebook["page_id"], notebook["content_hash"])
+    assert saved is not None and saved.text == TRANSCRIPT
+    saved = index.transcript(PDF, pdf["page_id"], pdf["content_hash"])
+    assert saved is not None and saved.text == "# PDF page\n"
+
+
+async def test_a_notebook_uploaded_twice_reads_and_saves_on_its_own(
+    linked: Linked, library: Served
+) -> None:
+    """Open question 8, as seen live: the same files uploaded twice share page UUIDs. Each is
+    readable page by page and takes its own transcripts, without touching the original's."""
+    linked.cloud.put_document(COPY_A, reupload(COPY_A, "Copy"))
+    await linked.sync()
+    original = meta_of(await library.call("read_page", {"document": NOTEBOOK, "page": 2}))
+    first = await library.call("read_page", {"document": COPY_A, "page": 2})
+    assert not first.is_error
+    assert LAZY_INSTRUCTION in text_of(first)
+    assert any(isinstance(block, ImageContent) for block in first.content)
+    copy = meta_of(first)
+    assert copy["document"] == COPY_A
+    assert (copy["page_id"], copy["content_hash"]) == (
+        original["page_id"],
+        original["content_hash"],
+    )
+    image = await library.call("page_image", {"document": COPY_A, "page": 2})
+    assert not image.is_error
+    assert (await library.ok("save_transcript", _save(copy)))["saved"] is True
+    read = await library.call("read_page", {"document": COPY_A, "page": 2})
+    assert any(TRANSCRIPT in text_of(read, i) for i in range(len(read.content)))
+    # The original's page has the same id and content but no transcript of its own yet.
+    still = await library.call("read_page", {"document": NOTEBOOK, "page": 2})
+    assert LAZY_INSTRUCTION in text_of(still)
+    index = linked.index()
+    assert index.transcript(NOTEBOOK, copy["page_id"], copy["content_hash"]) is None
+    # A stale hash is still refused on the copy.
+    stale = await library.error("save_transcript", _save(copy, content_hash="0" * 64))
+    assert stale["code"] == "stale_hash"
 
 
 async def test_an_old_version_has_no_transcript_to_save(linked: Linked, library: Served) -> None:

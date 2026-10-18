@@ -514,7 +514,9 @@ def test_fit_png_refuses_an_image_beyond_the_canvas_budget() -> None:
 async def test_read_document_markdown_and_pagination(library: Served, linked: Linked) -> None:
     index = linked.index()
     for n, source in enumerate(_sources(linked, NOTEBOOK), start=1):
-        index.put_transcript(source.page_id, source.content_hash, f"Line {n}\n" * 900, "m", "lazy")
+        index.put_transcript(
+            NOTEBOOK, source.page_id, source.content_hash, f"Line {n}\n" * 900, "m", "lazy"
+        )
     first = await library.call("read_document", {"document": NOTEBOOK})
     text, meta = text_of(first, 0), json.loads(text_of(first, 1))
     assert text.startswith(f"# {NOTEBOOK_NAME}\n\n## Page 1\n\nLine 1\n")

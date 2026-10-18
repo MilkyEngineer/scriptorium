@@ -296,7 +296,7 @@ def test_trash_paginates(index: Index) -> None:
 def test_resolve_path_walks_names_and_reports_duplicates(index: Index) -> None:
     index.upsert_document(folder(1, "Notes"))
     index.upsert_document(folder(2, "Projects", parent=uid(1)))
-    index.upsert_document(folder(3, "Projects", parent=uid(1)))  # duplicate folder name
+    index.upsert_document(folder(3, "Projects", parent=uid(1)))  # reupload folder name
     index.upsert_document(doc(4, "2026-10", parent=uid(2)))
     index.upsert_document(doc(5, "2026-10", parent=uid(3)))
     index.upsert_document(doc(6, "Solo", parent=uid(2)))
@@ -400,8 +400,8 @@ def pr(n: int, idx: int, h: str, **kw: Any) -> PageRow:
 def test_replace_pages_keeps_render_state_of_unchanged_pages(index: Index) -> None:
     index.upsert_document(doc(1, "A", page_count=3))
     index.replace_pages(uid(1), [pr(0, 0, "a"), pr(1, 1, "b"), pr(2, 2, "c")])
-    index.set_rendered(uid(100), "pages/a.png", T0)
-    index.set_rendered(uid(101), "pages/b.png", T0)
+    index.set_rendered(uid(1), uid(100), "a", "pages/a.png", T0)
+    index.set_rendered(uid(1), uid(101), "b", "pages/b.png", T0)
     later = T0 + timedelta(hours=1)
     # Page 0 moves to the end unchanged, page 1 changes, page 2 is removed, page 3 is new.
     index.replace_pages(
@@ -424,8 +424,8 @@ def test_replace_pages_keeps_render_state_of_unchanged_pages(index: Index) -> No
     assert (new.rendered_at, new.png_path) == (None, None)
     assert index.page(uid(1), 1) == new
     assert index.page(uid(1), 5) is None
-    with pytest.raises(NotFoundError):
-        index.set_rendered(uid(102), "x.png", T0)  # dropped from the current view
+    # Dropped from the current view: nothing to mark.
+    assert index.set_rendered(uid(1), uid(102), "c", "x.png", T0) is False
 
 
 def test_replace_pages_swaps_indices(index: Index) -> None:
@@ -456,8 +456,8 @@ def test_put_and_get_transcript(index: Index, clock: Clock) -> None:
     index.upsert_document(doc(1, "A"))
     index.replace_pages(uid(1), [pr(0, 0, "h0")])
     clock.now = T0 + timedelta(minutes=5)
-    index.put_transcript(uid(100), "h0", "first text", "model-x", "lazy")
-    got = index.transcript(uid(100), "h0")
+    index.put_transcript(uid(1), uid(100), "h0", "first text", "model-x", "lazy")
+    got = index.transcript(uid(1), uid(100), "h0")
     assert got is not None
     assert (got.text, got.model, got.mode, got.document, got.created_at) == (
         "first text",
@@ -466,14 +466,14 @@ def test_put_and_get_transcript(index: Index, clock: Clock) -> None:
         uid(1),
         clock.now,
     )
-    index.put_transcript(uid(100), "h0", "second text", "model-y", "user")
-    got = index.transcript(uid(100), "h0")
+    index.put_transcript(uid(1), uid(100), "h0", "second text", "model-y", "user")
+    got = index.transcript(uid(1), uid(100), "h0")
     assert got is not None and (got.text, got.mode) == ("second text", "user")
-    assert index.transcript(uid(100), "other") is None
+    assert index.transcript(uid(1), uid(100), "other") is None
     with pytest.raises(NotFoundError):
-        index.put_transcript(uid(999), "h", "t", "m", "lazy")
+        index.put_transcript(uid(1), uid(999), "h", "t", "m", "lazy")
     with pytest.raises(InvalidArgumentError):
-        index.put_transcript(uid(100), "h0", "t", "m", "psychic")
+        index.put_transcript(uid(1), uid(100), "h0", "t", "m", "psychic")
 
 
 def test_search_returns_the_page_ref(index: Index) -> None:
@@ -484,8 +484,8 @@ def test_search_returns_the_page_ref(index: Index) -> None:
         PageRow(page_id=uid(201), document=uid(2), idx=1, content_hash="p1"),
     ]
     index.replace_pages(uid(2), pages)
-    index.put_transcript(uid(200), "p0", "agenda and budget", "m", "lazy")
-    index.put_transcript(uid(201), "p1", "the quarterly budget review", "m", "lazy")
+    index.put_transcript(uid(2), uid(200), "p0", "agenda and budget", "m", "lazy")
+    index.put_transcript(uid(2), uid(201), "p1", "the quarterly budget review", "m", "lazy")
     hits = index.search("quarterly budget", cursor=None, limit=10).items
     assert len(hits) == 1
     hit = hits[0]
@@ -512,7 +512,7 @@ def test_search_returns_the_page_ref(index: Index) -> None:
 def test_search_quotes_operators_and_rejects_empty(index: Index) -> None:
     index.upsert_document(doc(1, "A"))
     index.replace_pages(uid(1), [pr(0, 0, "h")])
-    index.put_transcript(uid(100), "h", 'say "NEAR" OR not', "m", "lazy")
+    index.put_transcript(uid(1), uid(100), "h", 'say "NEAR" OR not', "m", "lazy")
     assert len(index.search('"NEAR" OR (', cursor=None, limit=5).items) == 1
     assert index.search("NOT AND", cursor=None, limit=5).items == []
     with pytest.raises(InvalidArgumentError):
@@ -523,7 +523,7 @@ def test_search_marks_old_versions_and_follows_renames(index: Index) -> None:
     index.upsert_document(folder(1, "Old folder"))
     index.upsert_document(doc(2, "Doc", parent=uid(1)))
     index.replace_pages(uid(2), [PageRow(uid(300), uid(2), 0, "v1")])
-    index.put_transcript(uid(300), "v1", "lighthouse", "m", "lazy")
+    index.put_transcript(uid(2), uid(300), "v1", "lighthouse", "m", "lazy")
     index.replace_pages(uid(2), [PageRow(uid(300), uid(2), 0, "v2")])
     (hit,) = index.search("lighthouse", cursor=None, limit=5).items
     assert (hit.current, hit.idx) == (False, 0)
@@ -543,7 +543,7 @@ def test_search_paginates(index: Index) -> None:
     index.upsert_document(doc(1, "A"))
     index.replace_pages(uid(1), [pr(n, n, f"h{n}") for n in range(5)])
     for n in range(5):
-        index.put_transcript(uid(100 + n), f"h{n}", "common " + "word " * n, "m", "lazy")
+        index.put_transcript(uid(1), uid(100 + n), f"h{n}", "common " + "word " * n, "m", "lazy")
     seen: list[str] = []
     cursor = None
     while True:
@@ -560,7 +560,7 @@ def test_path_walk_survives_cycles_in_cloud_metadata(index: Index) -> None:
     index.upsert_document(folder(2, "B", parent=uid(1)))
     index.upsert_document(doc(3, "C", parent=uid(1)))
     index.replace_pages(uid(3), [PageRow(uid(400), uid(3), 0, "h")])
-    index.put_transcript(uid(400), "h", "loop", "m", "lazy")
+    index.put_transcript(uid(3), uid(400), "h", "loop", "m", "lazy")
     (hit,) = index.search("loop", cursor=None, limit=5).items
     assert hit.doc_path == "B/A"
     index.upsert_document(folder(2, "B2", parent=uid(1)))  # refresh over a cycle terminates
@@ -572,11 +572,81 @@ def test_fts_index_stays_consistent(index: Index) -> None:
     index.upsert_document(doc(1, "A"))
     index.replace_pages(uid(1), [pr(0, 0, "h")])
     for text in ("one", "two", "three"):
-        index.put_transcript(uid(100), "h", text, "m", "lazy")
+        index.put_transcript(uid(1), uid(100), "h", text, "m", "lazy")
         index.upsert_document(doc(1, f"A-{text}"))
     conn = index._conn
     conn.execute("INSERT INTO transcripts_fts(transcripts_fts) VALUES ('integrity-check')")
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_v2_rekeys_a_version_1_index_by_document(tmp_path: Path) -> None:
+    """A deployed version-1 index (pages keyed by page id alone) keeps every row in V2."""
+    path = tmp_path / "index.sqlite"
+    conn = open_sqlite(path)
+    migrate(conn, ACCOUNT_STEPS[:1])
+    with conn:
+        conn.executemany(
+            "INSERT INTO documents(uuid, type, parent, name, last_modified, page_count) "
+            "VALUES (?, 'DocumentType', NULL, ?, '2026-10-01T12:00:00.000000Z', ?)",
+            [(uid(1), "Original", 2), (uid(2), "Copy", 2)],
+        )
+        conn.executemany(
+            "INSERT INTO pages(uuid, document, idx, content_hash, stable_since, rendered_at, "
+            "png_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (uid(100), uid(1), 0, "a", None, "2026-10-01T12:00:00.000000Z", "pages/a.png"),
+                (uid(101), uid(1), 1, "b", "2026-10-01T12:00:00.000000Z", None, None),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO transcripts(id, page, content_hash, document, text, model, mode, "
+            "input_tokens, created_at, doc_name, doc_path) VALUES "
+            "(7, ?, 'a', ?, 'harbour notes', 'm', 'server', 12, "
+            "'2026-10-01T12:00:00.000000Z', 'Original', '')",
+            (uid(100), uid(1)),
+        )
+    conn.close()
+
+    with Index.open(path, migrate=True) as ix:
+        assert ix.version() == len(ACCOUNT_STEPS)
+        assert ix.pages(uid(1)) == [
+            PageRow(uid(100), uid(1), 0, "a", None, T0, "pages/a.png"),
+            PageRow(uid(101), uid(1), 1, "b", T0),
+        ]
+        old = ix.transcript(uid(1), uid(100), "a")
+        assert old is not None and (old.text, old.mode, old.input_tokens) == (
+            "harbour notes",
+            "server",
+            12,
+        )
+        (hit,) = ix.search("harbour", cursor=None, limit=5).items
+        assert isinstance(hit, SearchHit) and (hit.document, hit.idx, hit.current) == (
+            uid(1),
+            0,
+            True,
+        )
+        # The copy that version 1 could not list now gets its own rows and transcript.
+        ix.replace_pages(
+            uid(2), [PageRow(uid(100), uid(2), 0, "a"), PageRow(uid(101), uid(2), 1, "b")]
+        )
+        ix.put_transcript(uid(2), uid(100), "a", "harbour copy", "m", "lazy")
+        assert len(ix.search("harbour", cursor=None, limit=5).items) == 2
+        conn = ix._conn
+        assert (
+            conn.execute("SELECT id FROM transcripts WHERE document = ?", (uid(1),)).fetchone()[0]
+            == 7
+        )
+        conn.execute("INSERT INTO transcripts_fts(transcripts_fts) VALUES ('integrity-check')")
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        plan = " ".join(
+            str(row[-1])
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM pages WHERE uuid = ? AND content_hash = ?",
+                (uid(100), "a"),
+            )
+        )
+        assert "pages_version" in plan
 
 
 # ---- sync state and transactions ------------------------------------------------------------
@@ -676,7 +746,7 @@ def test_search_falls_back_to_names_of_untranscribed_documents(index: Index) -> 
     index.upsert_document(doc(6, "Old budget"))
     index.mark_deleted(uid(6), "unknown", T0)
     index.replace_pages(uid(2), [PageRow(uid(200), uid(2), 0, "h")])
-    index.put_transcript(uid(200), "h", "the budget review", "m", "lazy")
+    index.put_transcript(uid(2), uid(200), "h", "the budget review", "m", "lazy")
 
     items = index.search("budget", cursor=None, limit=10).items
     # Page hits first, then name hits sorted by name; folders, transcribed and tombstoned
@@ -698,7 +768,7 @@ def test_search_name_hits_paginate_after_page_hits(index: Index) -> None:
     index.upsert_document(doc(1, "A"))
     index.replace_pages(uid(1), [pr(n, n, f"h{n}") for n in range(3)])
     for n in range(3):
-        index.put_transcript(uid(100 + n), f"h{n}", "common " + "word " * n, "m", "lazy")
+        index.put_transcript(uid(1), uid(100 + n), f"h{n}", "common " + "word " * n, "m", "lazy")
     for n in range(10, 15):
         index.upsert_document(doc(n, f"common {n}"))
     for limit in (1, 2, 3, 4, 8):
@@ -726,14 +796,87 @@ def test_search_refuses_bad_cursors_and_too_many_terms(index: Index) -> None:
 def test_page_by_id_and_guarded_set_rendered(index: Index) -> None:
     index.upsert_document(doc(1, "A"))
     index.replace_pages(uid(1), [pr(0, 0, "a"), pr(1, 1, "b")])
-    assert index.page_by_id(uid(101)) == index.page(uid(1), 1)
-    assert index.page_by_id(uid(199)) is None
+    assert index.page_by_id(uid(1), uid(101)) == index.page(uid(1), 1)
+    assert index.page_by_id(uid(1), uid(199)) is None
+    assert index.page_by_id(uid(2), uid(101)) is None
     # A render of an older content hash is not recorded once the page has changed.
-    assert index.set_rendered(uid(100), "pages/old.png", T0, content_hash="stale") is False
+    assert index.set_rendered(uid(1), uid(100), "stale", "pages/old.png", T0) is False
     assert index.page(uid(1), 0) == pr(0, 0, "a")
-    assert index.set_rendered(uid(100), "pages/a.png", T0, content_hash="a") is True
+    assert index.set_rendered(uid(1), uid(100), "a", "pages/a.png", T0) is True
     assert index.page(uid(1), 0) == pr(0, 0, "a", rendered_at=T0, png_path="pages/a.png")
-    assert index.set_rendered(uid(199), "pages/x.png", T0, content_hash="a") is False
+    assert index.set_rendered(uid(1), uid(199), "a", "pages/x.png", T0) is False
+
+
+def copy_of(n: int, page: PageRow) -> PageRow:
+    """``page`` as document ``uid(n)`` lists it: the same files uploaded again."""
+    return PageRow(page.page_id, uid(n), page.idx, page.content_hash)
+
+
+def test_copies_share_page_ids(index: Index) -> None:
+    """Open question 8: files uploaded twice share page UUIDs; both copies are listed."""
+    index.upsert_document(doc(1, "A"))
+    index.upsert_document(doc(2, "A copy"))
+    original = [pr(0, 0, "a"), pr(1, 1, "b")]
+    index.replace_pages(uid(1), original)
+    index.replace_pages(uid(2), [copy_of(2, p) for p in original])
+    assert [p.page_id for p in index.pages(uid(1))] == [uid(100), uid(101)]
+    assert [p.page_id for p in index.pages(uid(2))] == [uid(100), uid(101)]
+    assert index.page_by_id(uid(2), uid(100)) == copy_of(2, pr(0, 0, "a"))
+    # The copy is edited: page 0 changes there only; page 1 is removed there only.
+    index.replace_pages(uid(2), [PageRow(uid(100), uid(2), 0, "a2")])
+    assert index.pages(uid(1)) == original
+    assert [(p.page_id, p.content_hash) for p in index.pages(uid(2))] == [(uid(100), "a2")]
+
+
+def test_set_rendered_marks_every_copy_of_the_page_version(index: Index) -> None:
+    """The PNG is keyed by (page id, content hash), so one render serves every copy."""
+    index.upsert_document(doc(1, "A"))
+    index.upsert_document(doc(2, "A copy"))
+    index.upsert_document(doc(3, "A edited copy"))
+    index.replace_pages(uid(1), [pr(0, 0, "a")])
+    index.replace_pages(uid(2), [PageRow(uid(100), uid(2), 0, "a")])
+    index.replace_pages(uid(3), [PageRow(uid(100), uid(3), 0, "a3")])
+    assert index.set_rendered(uid(1), uid(100), "a", "pages/a.png", T0) is True
+    assert index.page(uid(1), 0) == pr(0, 0, "a", rendered_at=T0, png_path="pages/a.png")
+    assert index.page(uid(2), 0) == PageRow(uid(100), uid(2), 0, "a", None, T0, "pages/a.png")
+    # The edited copy has other content: its row is not this render's.
+    assert index.page(uid(3), 0) == PageRow(uid(100), uid(3), 0, "a3")
+    assert index.counts()["rendered"] == 2
+    # A job queued by the first copy can finish after that copy changed: the other copy
+    # still gets the image, and the caller learns its own row was not among those marked.
+    index.replace_pages(uid(1), [pr(0, 0, "a1")])
+    index.replace_pages(uid(2), [PageRow(uid(100), uid(2), 0, "b")])
+    index.replace_pages(uid(2), [PageRow(uid(100), uid(2), 0, "a")])
+    assert index.set_rendered(uid(1), uid(100), "a", "pages/a.png", T0) is False
+    copy = index.page(uid(2), 0)
+    assert copy is not None and copy.rendered_at == T0
+
+
+def test_copies_have_their_own_transcripts(index: Index) -> None:
+    index.upsert_document(doc(1, "Original"))
+    index.upsert_document(doc(2, "Copy"))
+    index.replace_pages(uid(1), [pr(0, 0, "h")])
+    index.replace_pages(uid(2), [PageRow(uid(100), uid(2), 0, "h")])
+    index.put_transcript(uid(1), uid(100), "h", "original words", "m", "lazy")
+    assert index.transcript(uid(2), uid(100), "h") is None
+    index.put_transcript(uid(2), uid(100), "h", "copied words", "m", "lazy")
+    original = index.transcript(uid(1), uid(100), "h")
+    copy = index.transcript(uid(2), uid(100), "h")
+    assert original is not None
+    assert (original.document, original.text) == (uid(1), "original words")
+    assert copy is not None and (copy.document, copy.text) == (uid(2), "copied words")
+    (hit,) = index.search("copied", cursor=None, limit=5).items
+    assert isinstance(hit, SearchHit)
+    assert (hit.document, hit.page_id, hit.idx, hit.current) == (uid(2), uid(100), 0, True)
+    # The copy changes: its hit is no longer current, the original's still is.
+    index.replace_pages(uid(2), [PageRow(uid(100), uid(2), 0, "h2")])
+    hits = index.search("words", cursor=None, limit=5).items
+    assert {(h.document, h.current) for h in hits if isinstance(h, SearchHit)} == {
+        (uid(1), True),
+        (uid(2), False),
+    }
+    with pytest.raises(NotFoundError):  # a page id of a document that does not list it
+        index.put_transcript(uid(3), uid(100), "h", "t", "m", "lazy")
 
 
 def test_counts(index: Index) -> None:
@@ -749,8 +892,8 @@ def test_counts(index: Index) -> None:
     index.replace_pages(
         uid(2), [PageRow(uid(100), uid(2), 0, "a"), PageRow(uid(101), uid(2), 1, "b")]
     )
-    index.set_rendered(uid(100), "pages/a.png", T0)
-    index.put_transcript(uid(100), "a", "text", "model", "lazy")
+    index.set_rendered(uid(2), uid(100), "a", "pages/a.png", T0)
+    index.put_transcript(uid(2), uid(100), "a", "text", "model", "lazy")
     assert index.counts() == {
         "documents": 2,
         "folders": 1,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import sqlite3
@@ -39,9 +38,9 @@ from scriptorium.worker import (
     jittered,
     read_heartbeat,
 )
-from tests.cloud.fake_cloud import NOTEBOOK, PAGES, PDF, TOKEN_KEY, fixture_documents, renamed
+from tests.cloud.fake_cloud import NOTEBOOK, PAGES, PDF, TOKEN_KEY, FakeCloud, fixture_documents
 from tests.cloud.scenarios import PAGE_101
-from tests.worker.helpers import FAST, T0, Linked, link
+from tests.worker.helpers import COPY_A, COPY_B, FAST, T0, Linked, link, reupload
 
 POLL = 600
 
@@ -150,11 +149,13 @@ async def test_first_poll_archives_and_renders_every_page(linked: Linked) -> Non
         sha(docs[NOTEBOOK][f"{NOTEBOOK}/{page}.rm"]) for page in PAGES
     ]
     assert all(p.rendered_at is None for p in pages)
-    # The PDF's only page reuses the notebook's first page UUID (open question 8): it is left
-    # out of `pages` while the notebook is live, but it is still rendered.
-    assert index.pages(PDF) == []
+    # The PDF's only page reuses the notebook's first page UUID with other content: a page
+    # is (document, page id), so it is listed under the PDF too.
+    (pdf_page,) = index.pages(PDF)
+    assert pdf_page.page_id == PAGES[0] and pdf_page.content_hash != pages[0].content_hash
     assert await linked.worker.drain_jobs() == 8
     assert all(p.rendered_at is not None for p in index.pages(NOTEBOOK))
+    assert all(p.rendered_at is not None for p in index.pages(PDF))
 
     files = pngs(linked)
     assert len(files) == 8
@@ -199,17 +200,69 @@ async def test_an_edited_page_gets_a_new_png_and_keeps_the_old(linked: Linked) -
 async def test_a_copied_document_needs_no_render_jobs(linked: Linked) -> None:
     """Renders are content-addressed: a copy's pages already have their PNGs."""
     loop = await linked.sync()
-    copy = "00000000-0000-4000-8000-0000000000c1"
-    files = renamed(fixture_documents()[NOTEBOOK], NOTEBOOK, copy)
-    metadata = json.loads(files[f"{copy}.metadata"])
-    metadata["visibleName"] = "Copy"
-    files[f"{copy}.metadata"] = json.dumps(metadata).encode()
-    linked.cloud.put_document(copy, files)
+    linked.cloud.put_document(COPY_A, reupload(COPY_A, "Copy"))
     before = pngs(linked)
     assert await loop.poll_once(linked.context()) == POLL
-    assert linked.context().index.document(copy) is not None
+    index = linked.context().index
+    assert index.document(COPY_A) is not None
     assert await linked.worker.drain_jobs() == 0
     assert pngs(linked) == before
+    # The copy keeps the notebook's page UUIDs and still gets every page row, rendered.
+    original, copy = index.pages(NOTEBOOK), index.pages(COPY_A)
+    assert [p.page_id for p in copy] == [p.page_id for p in original] == list(PAGES)
+    assert [(p.content_hash, p.png_path) for p in copy] == [
+        (p.content_hash, p.png_path) for p in original
+    ]
+    assert all(p.rendered_at is not None for p in copy)
+
+
+async def test_notebooks_uploaded_twice_share_page_ids_and_renders(tmp_path: Path) -> None:
+    """Open question 8, as seen live: the same files uploaded again share page UUIDs. Every
+    copy gets its page rows, one render job runs per page version, and it marks every
+    copy's row rendered, whichever copy queued it."""
+    cloud = FakeCloud()
+    docs = fixture_documents()
+    docs[COPY_A] = reupload(COPY_A, "Copy A")
+    docs[COPY_B] = reupload(COPY_B, "Copy B")
+    cloud.put_documents(docs)
+    linked = link(tmp_path, cloud=cloud)
+    try:
+        loop = linked.loop()
+        ctx = linked.context()
+        assert await loop.poll_once(ctx) == POLL
+        index = ctx.index
+        notebooks = (NOTEBOOK, COPY_A, COPY_B)
+        for uuid in notebooks:
+            pages = index.pages(uuid)
+            assert [p.page_id for p in pages] == list(PAGES), uuid
+            assert all(p.rendered_at is None for p in pages)
+        assert index.counts()["pages"] == 3 * 7 + 1
+        # One job per page version: 7 shared by the three notebooks, 1 for the PDF.
+        jobs = linked.queue.counts(linked.uid, acct=linked.acct)
+        assert sum(jobs["render"].values()) == 8
+        assert await linked.worker.drain_jobs() == 8
+        for uuid in notebooks:
+            for page in index.pages(uuid):
+                assert page.rendered_at is not None, (uuid, page.idx)
+                assert page.png_path == pg.png_relpath(page.page_id, page.content_hash)
+                assert pg.resolve_png(linked.paths, page.png_path).is_file()
+        assert index.counts()["rendered"] == 3 * 7 + 1
+        # Editing one copy changes only that copy's page; the others keep their render.
+        new_rm = docs[NOTEBOOK][f"{NOTEBOOK}/{PAGES[3]}.rm"]
+        cloud.set_file(COPY_B, f"{COPY_B}/{PAGES[0]}.rm", new_rm)
+        assert await loop.poll_once(ctx) == POLL
+        edited = index.page(COPY_B, 0)
+        assert edited is not None and edited.content_hash == sha(new_rm)
+        assert edited.rendered_at is None
+        for uuid in (NOTEBOOK, COPY_A):
+            kept = index.page(uuid, 0)
+            assert kept is not None and kept.content_hash != sha(new_rm)
+            assert kept.rendered_at is not None
+        assert await linked.worker.drain_jobs() == 1
+        edited = index.page(COPY_B, 0)
+        assert edited is not None and edited.rendered_at is not None
+    finally:
+        linked.close()
 
 
 async def test_token_rejected_three_times_then_polling_stops(linked: Linked) -> None:

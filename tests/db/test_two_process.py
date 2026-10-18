@@ -34,7 +34,9 @@ def test_writer_and_reader_processes_see_no_busy_errors(tmp_path: Path) -> None:
                 DocumentRow(uuid, "DocumentType", None, f"doc {n}", t0, page_count=1)
             )
             index.replace_pages(uuid, [PageRow(writer.page_uuid(n, 0), uuid, 0, "seed")])
-            index.put_transcript(writer.page_uuid(n, 0), "seed", f"seed text {n}", "m", "lazy")
+            index.put_transcript(
+                uuid, writer.page_uuid(n, 0), "seed", f"seed text {n}", "m", "lazy"
+            )
 
     summary_path = tmp_path / "writer.json"
     child = subprocess.Popen(  # noqa: S603 - fixed argv, our own script

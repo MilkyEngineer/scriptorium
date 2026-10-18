@@ -2,8 +2,10 @@
 
 In lazy mode the user's own Claude session transcribes: ``read_page`` returns the page image
 with :data:`LAZY_INSTRUCTION`, and ``save_transcript`` stores the result keyed by
-``(page uuid, content_hash)``. A transcript is accepted only for the page's *current* hash
-(``stale_hash`` otherwise), so a page edited since it was read is never mislabelled.
+``(document, page uuid, content_hash)``: documents uploaded from the same files share page
+UUIDs, so each document's page has its own transcript. A transcript is accepted only for the
+page's *current* hash (``stale_hash`` otherwise), so a page edited since it was read is never
+mislabelled.
 Transcripts are note content: they are stored, returned to their owner, and never logged
 or audited (the audit row carries only their byte count).
 """
@@ -90,22 +92,16 @@ def _save(account: Account, doc: DocumentRow, args: SaveTranscriptArgs) -> str:
             "Call read_page again and transcribe the current image.",
         )
     index = account.index
-    row = index.page_by_id(source.page_id)
-    if row is None or (row.document == doc.uuid and row.content_hash != source.content_hash):
+    row = index.page_by_id(doc.uuid, source.page_id)
+    if row is None or row.content_hash != source.content_hash:
         raise ToolError(
             ErrorCode.NOT_FOUND,
             "This page is not indexed yet.",
             "The worker indexes new pages right after each sync; try again in a minute.",
         )
-    if row.content_hash != source.content_hash:
-        # Another live document lists the same page id (open question 8): a transcript is
-        # keyed by (page id, hash), so only an identical page can share one.
-        raise ToolError(
-            ErrorCode.REFUSED,
-            "This page shares its id with a page of another document.",
-            "Its transcript cannot be saved in this release.",
-        )
-    index.put_transcript(source.page_id, source.content_hash, args.text, args.model, LAZY_MODE)
+    index.put_transcript(
+        doc.uuid, source.page_id, source.content_hash, args.text, args.model, LAZY_MODE
+    )
     return source.page_id
 
 

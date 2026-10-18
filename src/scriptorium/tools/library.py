@@ -232,7 +232,7 @@ async def read_page(ctx: ToolContext, args: ReadPageArgs) -> CallToolResult:
     ctx.audit["generation"] = pages.version.generation
     ref = page_ref(doc, pages, source)
     transcript = await asyncio.to_thread(
-        account.index.transcript, source.page_id, source.content_hash
+        account.index.transcript, doc.uuid, source.page_id, source.content_hash
     )
     if transcript is not None:
         text, truncated = cap_text(transcript.text, RESULT_CAP_BYTES - _META_ROOM)
@@ -306,7 +306,7 @@ def _markdown(
     number = start
     while number <= last:
         source = pages.sources[number - 1]
-        row = account.index.transcript(source.page_id, source.content_hash)
+        row = account.index.transcript(doc.uuid, source.page_id, source.content_hash)
         if row is None:
             body = (
                 "_Not transcribed yet: read_page returns its image to transcribe._"

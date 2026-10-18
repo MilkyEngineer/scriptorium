@@ -15,6 +15,11 @@ Conventions shared by every table:
   desynchronise the full-text index. ``doc_name`` and ``doc_path`` are denormalised from
   ``documents`` so the FTS triggers always delete exactly the values they indexed; the index
   module refreshes them when a document is renamed or moved.
+- A page is identified by ``(document, page uuid)``, never by its UUID alone: page UUIDs
+  collide whenever the same ``.rm`` files are uploaded more than once (open question 8,
+  answered by a live library in V2; Scriptorium's own push and restore do this), so two
+  documents can list the same page id with the same or different content. Transcripts are
+  keyed the same way, plus the content hash.
 """
 
 from __future__ import annotations
@@ -122,5 +127,74 @@ CREATE TABLE sync_state(
 """,
 )
 
-ACCOUNT_STEPS: Final[tuple[Step, ...]] = (V1,)
+V2: Final = Step(
+    name="pages and transcripts keyed by document",
+    # SQLite cannot change a table's key in place, so both tables are rebuilt (create the new
+    # table, copy, drop the old, rename) inside the runner's transaction. V1's keys are
+    # narrower than V2's, so every row carries over unchanged. Transcript ids are copied as
+    # they are: they are the FTS external-content rowids, so the full-text index stays in
+    # step without a rebuild. The triggers are dropped with the old table and recreated.
+    sql="""
+CREATE TABLE pages_v2(
+    uuid          TEXT NOT NULL,
+    document      TEXT NOT NULL REFERENCES documents(uuid) DEFERRABLE INITIALLY DEFERRED,
+    idx           INTEGER NOT NULL,
+    content_hash  TEXT NOT NULL,
+    stable_since  TEXT,
+    rendered_at   TEXT,
+    png_path      TEXT,
+    PRIMARY KEY (document, uuid),
+    UNIQUE (document, idx)
+) WITHOUT ROWID;
+INSERT INTO pages_v2(uuid, document, idx, content_hash, stable_since, rendered_at, png_path)
+    SELECT uuid, document, idx, content_hash, stable_since, rendered_at, png_path FROM pages;
+DROP TABLE pages;
+ALTER TABLE pages_v2 RENAME TO pages;
+-- set_rendered marks one page version on every document that lists it (copies share a PNG).
+CREATE INDEX pages_version ON pages(uuid, content_hash);
+
+DROP TRIGGER transcripts_ai;
+DROP TRIGGER transcripts_ad;
+DROP TRIGGER transcripts_au;
+CREATE TABLE transcripts_v2(
+    id             INTEGER PRIMARY KEY,
+    page           TEXT NOT NULL,
+    content_hash   TEXT NOT NULL,
+    document       TEXT NOT NULL,
+    text           TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    mode           TEXT NOT NULL CHECK (mode IN ('user', 'server', 'lazy')),
+    input_tokens   INTEGER,
+    output_tokens  INTEGER,
+    cost_usd       REAL,
+    created_at     TEXT NOT NULL,
+    doc_name       TEXT NOT NULL,
+    doc_path       TEXT NOT NULL,
+    UNIQUE (document, page, content_hash)
+);
+INSERT INTO transcripts_v2(id, page, content_hash, document, text, model, mode, input_tokens,
+                           output_tokens, cost_usd, created_at, doc_name, doc_path)
+    SELECT id, page, content_hash, document, text, model, mode, input_tokens, output_tokens,
+           cost_usd, created_at, doc_name, doc_path FROM transcripts;
+DROP TABLE transcripts;
+ALTER TABLE transcripts_v2 RENAME TO transcripts;
+-- No transcripts_document index any more: the UNIQUE key starts with document and serves it.
+CREATE TRIGGER transcripts_ai AFTER INSERT ON transcripts BEGIN
+    INSERT INTO transcripts_fts(rowid, text, doc_name, doc_path)
+    VALUES (new.id, new.text, new.doc_name, new.doc_path);
+END;
+CREATE TRIGGER transcripts_ad AFTER DELETE ON transcripts BEGIN
+    INSERT INTO transcripts_fts(transcripts_fts, rowid, text, doc_name, doc_path)
+    VALUES ('delete', old.id, old.text, old.doc_name, old.doc_path);
+END;
+CREATE TRIGGER transcripts_au AFTER UPDATE OF text, doc_name, doc_path ON transcripts BEGIN
+    INSERT INTO transcripts_fts(transcripts_fts, rowid, text, doc_name, doc_path)
+    VALUES ('delete', old.id, old.text, old.doc_name, old.doc_path);
+    INSERT INTO transcripts_fts(rowid, text, doc_name, doc_path)
+    VALUES (new.id, new.text, new.doc_name, new.doc_path);
+END;
+""",
+)
+
+ACCOUNT_STEPS: Final[tuple[Step, ...]] = (V1, V2)
 """Append-only. ``len(ACCOUNT_STEPS)`` is the per-account schema version."""

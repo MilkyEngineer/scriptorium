@@ -7,6 +7,7 @@ render pool (threads instead of spawned processes, for speed). The user is the t
 
 from __future__ import annotations
 
+import json
 import random
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -32,7 +33,7 @@ from scriptorium.users.store import (
     global_db_path,
 )
 from scriptorium.worker import AccountContext, AccountLoop, Timing, Worker
-from tests.cloud.fake_cloud import DEVICE_TOKEN, FakeCloud, fixture_documents
+from tests.cloud.fake_cloud import DEVICE_TOKEN, NOTEBOOK, FakeCloud, fixture_documents, renamed
 from tests.conftest import ADMIN_SUB, ALLOWED_SUB, ISSUER, make_settings
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
@@ -81,6 +82,19 @@ def make_user(sub: str = ALLOWED_SUB, *, admin: bool = False) -> User:
 
 
 ADMIN = make_user(ADMIN_SUB, admin=True)
+COPY_A = "00000000-0000-4000-8000-0000000000c1"
+COPY_B = "00000000-0000-4000-8000-0000000000c2"
+
+
+def reupload(uuid: str, name: str) -> dict[str, bytes]:
+    """The fixture notebook's files uploaded again: a new document UUID and name, the same
+    page UUIDs and page files (open question 8, seen on a live library; push and restore do
+    this). A copy made on the tablet mints fresh page UUIDs instead."""
+    files = renamed(fixture_documents()[NOTEBOOK], NOTEBOOK, uuid)
+    metadata = json.loads(files[f"{uuid}.metadata"])
+    metadata["visibleName"] = name
+    files[f"{uuid}.metadata"] = json.dumps(metadata).encode()
+    return files
 
 
 @dataclass

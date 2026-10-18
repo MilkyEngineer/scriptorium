@@ -10,6 +10,11 @@ Conventions:
 - ``DocumentRow.parent`` is ``None`` for the root, ``"trash"`` for the top of the trash, or
   the parent folder's UUID. ``""`` (the cloud's spelling of the root) is stored as ``None``.
 - Page indices are 0-based; tools convert (§11.0).
+- A page is ``(document, page_id)``: uploading the same notebook files more than once
+  (open question 8; push and restore do it) makes documents that share page UUIDs, so a page
+  id alone does not name a page. Transcripts are keyed by
+  ``(document, page_id, content_hash)``. The archive PNG is keyed by ``(page_id,
+  content_hash)`` only, because identical content renders identically, so copies share it.
 - Every timestamp in and out is a timezone-aware ``datetime``; naive values are refused.
 - Cursors are opaque URL-safe base64 of the last returned row's sort key, never offsets, so a
   page boundary does not move when rows are inserted before it.
@@ -111,7 +116,7 @@ class HistoryRow:
 
 @dataclass(frozen=True, slots=True)
 class PageRow:
-    page_id: str  # the page UUID from the document's .content
+    page_id: str  # the page UUID from the document's .content (copies share it)
     document: str
     idx: int  # 0-based
     content_hash: str
@@ -603,12 +608,14 @@ class Index:
     def replace_pages(self, uuid: str, pages: Sequence[PageRow]) -> None:
         """Make ``pages`` the document's page list.
 
-        Pages are matched by ``page_id``. A page whose ``content_hash`` is unchanged keeps its
-        stored ``stable_since``, ``rendered_at`` and ``png_path`` (only its index may move). A
-        new or changed page takes ``stable_since`` from the argument and ``rendered_at = NULL``
-        (it needs rendering); a changed page keeps its old ``png_path`` as the last good image
-        unless the argument gives one. Pages no longer listed are dropped from the current view
-        (their transcripts and the archive's files are untouched).
+        Pages are matched by ``page_id`` within the document; another document listing the
+        same page ids (the same files uploaded twice) is not affected. A page whose ``content_hash``
+        is unchanged keeps its stored ``stable_since``, ``rendered_at`` and ``png_path`` (only
+        its index may move). A new or changed page takes ``stable_since`` from the argument
+        and ``rendered_at = NULL`` (it needs rendering); a changed page keeps its old
+        ``png_path`` as the last good image unless the argument gives one. Pages no longer
+        listed are dropped from the current view (their transcripts and the archive's files
+        are untouched).
         """
         ids = [p.page_id for p in pages]
         if len(set(ids)) != len(ids):
@@ -616,7 +623,7 @@ class Index:
         if len({p.idx for p in pages}) != len(pages) or any(p.idx < 0 for p in pages):
             raise InvalidArgumentError("Page indices must be distinct and non-negative.")
         if any(p.document != uuid for p in pages):
-            raise InvalidArgumentError("A page belongs to another document.")
+            raise InvalidArgumentError("A page row names a different document from uuid.")
         keep = set(ids)
         with self.transaction():
             existing = {
@@ -626,8 +633,8 @@ class Index:
                 )
             }
             self._conn.executemany(
-                "DELETE FROM pages WHERE uuid = ?",
-                [(pid,) for pid in existing if pid not in keep],
+                "DELETE FROM pages WHERE document = ? AND uuid = ?",
+                [(uuid, pid) for pid in existing if pid not in keep],
             )
             # Park current indices out of the way so moves cannot hit UNIQUE(document, idx).
             self._conn.execute("UPDATE pages SET idx = -1 - idx WHERE document = ?", (uuid,))
@@ -635,14 +642,15 @@ class Index:
                 old = existing.get(p.page_id)
                 if old is not None and old["content_hash"] == p.content_hash:
                     self._conn.execute(
-                        "UPDATE pages SET idx = ? WHERE uuid = ?", (p.idx, p.page_id)
+                        "UPDATE pages SET idx = ? WHERE document = ? AND uuid = ?",
+                        (p.idx, uuid, p.page_id),
                     )
                     continue
                 self._conn.execute(
                     "INSERT INTO pages(uuid, document, idx, content_hash, stable_since, "
                     "rendered_at, png_path) VALUES (?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(uuid) DO UPDATE SET document = excluded.document, "
-                    "idx = excluded.idx, content_hash = excluded.content_hash, "
+                    "ON CONFLICT(document, uuid) DO UPDATE SET idx = excluded.idx, "
+                    "content_hash = excluded.content_hash, "
                     "stable_since = excluded.stable_since, rendered_at = NULL, "
                     "png_path = coalesce(excluded.png_path, pages.png_path)",
                     (
@@ -699,40 +707,47 @@ class Index:
             "transcripts": int(transcripts["n"]),
         }
 
-    def page_by_id(self, page_id: str) -> PageRow | None:
-        """The current page with this page UUID, whichever document lists it."""
+    def page_by_id(self, document: str, page_id: str) -> PageRow | None:
+        """The current page ``page_id`` of ``document`` (another document may share the id)."""
         with self._lock:
-            row = self._conn.execute("SELECT * FROM pages WHERE uuid = ?", (page_id,)).fetchone()
+            row = self._conn.execute(
+                "SELECT * FROM pages WHERE document = ? AND uuid = ?", (document, page_id)
+            ).fetchone()
         return None if row is None else _page(row)
 
     def set_rendered(
-        self, page_id: str, png_path: str, at: datetime, *, content_hash: str | None = None
+        self, document: str, page_id: str, content_hash: str, png_path: str, at: datetime
     ) -> bool:
-        """Record the page's rendered image.
+        """Record the archive PNG of page version ``(page_id, content_hash)``.
 
-        With ``content_hash``, only while the page still has that hash: a render that finishes
-        after the page changed again is not recorded (returns False). Without it, an unknown
-        page is ``not_found``.
+        The PNG is keyed by the page version, not the document, so it is recorded on every
+        document whose page ``page_id`` currently has ``content_hash`` (documents uploaded
+        from the same files share one render and one render job). Rows whose page has moved
+        on to another hash are left alone: a render that finishes after the page changed
+        again is not recorded. Returns whether ``document``'s own page was one of the rows
+        marked.
         """
-        sql = "UPDATE pages SET rendered_at = ?, png_path = ? WHERE uuid = ?"
-        args: tuple[str, ...] = (to_db_time(at), png_path, page_id)
-        if content_hash is not None:
-            sql += " AND content_hash = ?"
-            args += (content_hash,)
         with self.transaction():
-            cur = self._conn.execute(sql, args)
-            if cur.rowcount == 0 and content_hash is None:
-                raise NotFoundError("Page not found.")
-        return cur.rowcount > 0
+            own = self._conn.execute(
+                "SELECT 1 FROM pages WHERE document = ? AND uuid = ? AND content_hash = ?",
+                (document, page_id, content_hash),
+            ).fetchone()
+            self._conn.execute(
+                "UPDATE pages SET rendered_at = ?, png_path = ? "
+                "WHERE uuid = ? AND content_hash = ?",
+                (to_db_time(at), png_path, page_id, content_hash),
+            )
+        return own is not None
 
     # ---- transcripts --------------------------------------------------------------------
 
     def put_transcript(
-        self, page_id: str, content_hash: str, text: str, model: str, mode: str
+        self, document: str, page_id: str, content_hash: str, text: str, model: str, mode: str
     ) -> None:
-        """Store (or replace) the transcript of one version of a page.
+        """Store (or replace) the transcript of one version of ``document``'s page ``page_id``.
 
-        The page must be in the index (``not_found`` otherwise). Whether ``content_hash`` is the
+        The document's page must be in the index (``not_found`` otherwise); a copy of the
+        page in another document has its own transcript. Whether ``content_hash`` is the
         page's *current* hash is the caller's check (``save_transcript`` answers ``stale_hash``);
         a transcript of an older version is still valid for that version.
         """
@@ -740,17 +755,16 @@ class Index:
             raise InvalidArgumentError("Unknown transcript mode.")
         with self.transaction():
             row = self._conn.execute(
-                "SELECT document FROM pages WHERE uuid = ?", (page_id,)
+                "SELECT 1 FROM pages WHERE document = ? AND uuid = ?", (document, page_id)
             ).fetchone()
             if row is None:
                 raise NotFoundError("Page not found.")
-            document = row["document"]
             name, path = self._name_and_path(document)
             self._conn.execute(
                 "INSERT INTO transcripts(page, content_hash, document, text, model, mode, "
                 "created_at, doc_name, doc_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(page, content_hash) DO UPDATE SET document = excluded.document, "
-                "text = excluded.text, model = excluded.model, mode = excluded.mode, "
+                "ON CONFLICT(document, page, content_hash) DO UPDATE SET text = excluded.text, "
+                "model = excluded.model, mode = excluded.mode, "
                 "created_at = excluded.created_at, doc_name = excluded.doc_name, "
                 "doc_path = excluded.doc_path, input_tokens = NULL, output_tokens = NULL, "
                 "cost_usd = NULL",
@@ -767,11 +781,12 @@ class Index:
                 ),
             )
 
-    def transcript(self, page_id: str, content_hash: str) -> TranscriptRow | None:
+    def transcript(self, document: str, page_id: str, content_hash: str) -> TranscriptRow | None:
+        """The transcript of ``document``'s page ``page_id`` at ``content_hash``, if any."""
         with self._lock:
             r = self._conn.execute(
-                "SELECT * FROM transcripts WHERE page = ? AND content_hash = ?",
-                (page_id, content_hash),
+                "SELECT * FROM transcripts WHERE document = ? AND page = ? AND content_hash = ?",
+                (document, page_id, content_hash),
             ).fetchone()
         if r is None:
             return None
@@ -846,7 +861,7 @@ class Index:
                 "p.idx AS idx, p.content_hash AS current_hash, transcripts_fts.rank AS rank, "
                 "snippet(transcripts_fts, 0, '', '', '…', 16) AS snippet "
                 "FROM transcripts_fts JOIN transcripts t ON t.id = transcripts_fts.rowid "
-                "LEFT JOIN pages p ON p.uuid = t.page "
+                "LEFT JOIN pages p ON p.document = t.document AND p.uuid = t.page "
                 f"WHERE {where} ORDER BY transcripts_fts.rank, t.id LIMIT ?",  # fixed clauses
                 (*params, limit),
             ).fetchall()
