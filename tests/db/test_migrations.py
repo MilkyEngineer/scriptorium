@@ -17,7 +17,12 @@ from scriptorium.db.migrations import (
     split_statements,
 )
 from scriptorium.db.schema_account import ACCOUNT_STEPS
-from scriptorium.db.schema_global import GLOBAL_STEPS, OCR_V1, SCRIPTORIUM_STEPS
+from scriptorium.db.schema_global import (
+    GLOBAL_STEPS,
+    OCR_V1,
+    PRIORITY_CONFIRMATIONS,
+    SCRIPTORIUM_STEPS,
+)
 from scriptorium.db.schema_jobs import JOBS_STEPS
 from scriptorium.errors import ScriptoriumError
 from tests.db.sqlite_support import requires_fts5
@@ -226,9 +231,10 @@ def test_scriptorium_steps_create_every_global_table(conn: sqlite3.Connection) -
     m1 = len(GLOBAL_STEPS) + len(JOBS_STEPS)
     assert SCRIPTORIUM_STEPS[len(GLOBAL_STEPS) : m1] == JOBS_STEPS
     assert SCRIPTORIUM_STEPS[m1] == OCR_V1
+    assert SCRIPTORIUM_STEPS[m1 + 1] == PRIORITY_CONFIRMATIONS
     assert migrate(conn, SCRIPTORIUM_STEPS) == len(SCRIPTORIUM_STEPS)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert {"users", "accounts", "audit", "jobs", "ocr_spend"} <= tables
+    assert {"users", "accounts", "audit", "jobs", "ocr_spend", "confirmations"} <= tables
     check_version(conn, SCRIPTORIUM_STEPS)
     with pytest.raises(SchemaMismatch):
         check_version(conn, JOBS_STEPS)  # a part of the sequence is never a valid target
@@ -244,6 +250,8 @@ def test_jobs_steps_compose_after_other_steps(conn: sqlite3.Connection) -> None:
 
 @pytest.mark.parametrize("start", _prefixes(SCRIPTORIUM_STEPS))
 def test_scriptorium_schema_from_each_prior_version(tmp_path: Path, start: int) -> None:
+    """Every step appended to scriptorium.sqlite upgrades a file left at any earlier version
+    to the same schema a fresh file gets, keeping its rows."""
     fresh = open_sqlite(tmp_path / "fresh.sqlite")
     stepped = open_sqlite(tmp_path / "stepped.sqlite")
     try:
@@ -251,6 +259,7 @@ def test_scriptorium_schema_from_each_prior_version(tmp_path: Path, start: int) 
         migrate(stepped, SCRIPTORIUM_STEPS[:start])
         migrate(stepped, SCRIPTORIUM_STEPS)
         assert schema_of(stepped) == schema_of(fresh)
+        assert fresh.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         fresh.close()
         stepped.close()
@@ -277,3 +286,20 @@ def test_ocr_step_keeps_m1_users(conn: sqlite3.Connection) -> None:
             "INSERT INTO ocr_spend (uid, mode, model, input_tokens, output_tokens, cost_usd, at) "
             "VALUES ('0123456789abcdef', 'lazy', 'm', 1, 1, 0.0, 'x')"
         )
+
+
+def test_m2_step_adds_priority_confirmations_and_removed_at(conn: sqlite3.Connection) -> None:
+    before = SCRIPTORIUM_STEPS[: SCRIPTORIUM_STEPS.index(PRIORITY_CONFIRMATIONS)]
+    migrate(conn, before)
+    conn.execute(
+        "INSERT INTO jobs(uid, kind, dedupe_key, max_attempts, next_run_at, created_at, "
+        "updated_at) VALUES ('0123456789abcdef', 'render', 'k', 5, 't', 't', 't')"
+    )
+    migrate(conn, SCRIPTORIUM_STEPS)
+    assert conn.execute("SELECT priority FROM jobs").fetchone()[0] == 0  # existing rows: 0
+    accounts = {r[1] for r in conn.execute("PRAGMA table_info(accounts)")}
+    assert "removed_at" in accounts
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(confirmations)")}
+    assert columns == {"sha256", "used_at"}
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO confirmations VALUES ('short', 't')")

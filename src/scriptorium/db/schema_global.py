@@ -93,5 +93,33 @@ CREATE INDEX ocr_spend_by_at ON ocr_spend (at);
 GLOBAL_STEPS: Final[tuple[Step, ...]] = (V1,)
 """The M1 users/accounts/audit part of the sequence; read-only history."""
 
-SCRIPTORIUM_STEPS: Final[tuple[Step, ...]] = (*GLOBAL_STEPS, *JOBS_STEPS, OCR_V1)
+PRIORITY_CONFIRMATIONS: Final = Step(
+    name="jobs.priority, confirmations, accounts.removed_at",
+    sql="""
+-- §6.2 (M2): 0 normal, -1 for renders of tombstoned, trashed or excluded documents. The
+-- lease query orders runnable jobs by priority, then arrival.
+ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX jobs_lease_order ON jobs (priority DESC, created_at, id)
+    WHERE state IN ('queued', 'failed');
+
+-- §11.0: spent confirmation tokens (SHA-256 of the decoded token), so one executes once.
+CREATE TABLE confirmations (
+    sha256  TEXT PRIMARY KEY CHECK (length(sha256) = 64),
+    used_at TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE INDEX confirmations_by_used_at ON confirmations (used_at);
+
+-- disconnect_remarkable(keep_archive=false) moved the account directory to
+-- users/<uid>/removed/<acct>-<ts>/ at this time, and the account is never used again.
+ALTER TABLE accounts ADD COLUMN removed_at TEXT;
+""",
+)
+"""M2 workstream I: job priority, spent confirmation tokens, removed accounts."""
+
+SCRIPTORIUM_STEPS: Final[tuple[Step, ...]] = (
+    *GLOBAL_STEPS,
+    *JOBS_STEPS,
+    OCR_V1,
+    PRIORITY_CONFIRMATIONS,
+)
 """The whole ``scriptorium.sqlite`` sequence. Append-only; ``len`` is the file's version."""

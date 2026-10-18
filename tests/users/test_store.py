@@ -317,7 +317,8 @@ def test_one_active_account_per_user_is_enforced_by_the_schema(db: Path, gs: Glo
     conn = sqlite3.connect(db)
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
-            "INSERT INTO accounts VALUES (?, ?, NULL, 1, '2026-01-01T00:00:00Z', 'd')",
+            "INSERT INTO accounts (acct, uid, rm_account_identity, active, linked_at, "
+            "device_desc) VALUES (?, ?, NULL, 1, '2026-01-01T00:00:00Z', 'd')",
             (new_ulid(), uid),
         )
     conn.close()
