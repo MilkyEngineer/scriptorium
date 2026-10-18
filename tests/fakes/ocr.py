@@ -257,6 +257,8 @@ class SpendRow:
     output_tokens: int
     cost_usd: float
     at: datetime
+    batch_id: str | None = None
+    custom_id: str | None = None
 
 
 @dataclass
@@ -279,10 +281,22 @@ class FakeSpendLedger:
         output_tokens: int,
         cost_usd: float,
         at: datetime,
-    ) -> None:
+        batch_id: str | None = None,
+        custom_id: str | None = None,
+    ) -> bool:
+        """As the real ledger: a batch item (``batch_id`` and ``custom_id``) is kept once."""
         assert mode in ("user", "server")
+        assert (batch_id is None) == (custom_id is None)
+        row = SpendRow(
+            uid, mode, model, input_tokens, output_tokens, cost_usd, at, batch_id, custom_id
+        )
         with self._lock:
-            self.rows.append(SpendRow(uid, mode, model, input_tokens, output_tokens, cost_usd, at))
+            if batch_id is not None and any(
+                (r.uid, r.batch_id, r.custom_id) == (uid, batch_id, custom_id) for r in self.rows
+            ):
+                return False
+            self.rows.append(row)
+        return True
 
     def month(self, *, uid: str | None, mode: Mode | None, at: datetime) -> Spend:
         with self._lock:

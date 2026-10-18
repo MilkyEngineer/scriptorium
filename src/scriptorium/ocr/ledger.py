@@ -12,7 +12,8 @@ The check happens before a call and the row is written after it, so concurrent c
 overshoot a cap by at most one page each: the worker bounds OCR concurrency (§7).
 
 Rows hold counts and money only, never content; they stay when a transcript is replaced or a
-key is cleared.
+key is cleared. A Message Batches item's row also names the batch and the item's custom id,
+unique per user, so reading a batch's results twice never bills an item twice.
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ __all__ = ["BATCH_DISCOUNT", "Allowance", "Degraded", "Spend", "SpendLedger", "c
 #: The Message Batches API bills every token at half the list price.
 BATCH_DISCOUNT: Final = 0.5
 _MODEL_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,99}")
+_BATCH_ID_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_CUSTOM_ID_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _KEY_MODES: Final = ("user", "server")
 
 Degraded = Literal[False, "global", "user", "own"]
@@ -152,8 +155,15 @@ class SpendLedger:
         output_tokens: int,
         cost_usd: float,
         at: datetime,
-    ) -> None:
-        """Append one page's spend. ``mode`` is ``user`` or ``server``: lazy mode costs nothing."""
+        batch_id: str | None = None,
+        custom_id: str | None = None,
+    ) -> bool:
+        """Append one page's spend. ``mode`` is ``user`` or ``server``: lazy mode costs nothing.
+
+        A batch item names its ``batch_id`` and ``custom_id`` (both or neither): it is recorded
+        once, so collecting a batch's results again never bills an item twice. Returns False
+        when that item was recorded already, True when a row was added.
+        """
         if not isinstance(uid, str) or not UID_RE.fullmatch(uid):
             raise InvalidArgumentError("user id is malformed")
         if mode not in _KEY_MODES:
@@ -168,12 +178,33 @@ class SpendLedger:
             or cost_usd < 0
         ):
             raise InvalidArgumentError("cost must be a non-negative number of USD")
+        if (batch_id is None) != (custom_id is None):
+            raise InvalidArgumentError("a batch item names its batch and its custom id")
+        if batch_id is not None and not (
+            isinstance(batch_id, str)
+            and _BATCH_ID_RE.fullmatch(batch_id)
+            and isinstance(custom_id, str)
+            and _CUSTOM_ID_RE.fullmatch(custom_id)
+        ):
+            raise InvalidArgumentError("batch or custom id is malformed")
         with self._connect() as conn, immediate(conn):
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO ocr_spend (uid, mode, model, input_tokens, output_tokens, cost_usd, "
-                "at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (uid, mode, model, input_tokens, output_tokens, float(cost_usd), to_db_time(at)),
+                "at, batch_id, custom_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (uid, batch_id, custom_id) WHERE batch_id IS NOT NULL DO NOTHING",
+                (
+                    uid,
+                    mode,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    float(cost_usd),
+                    to_db_time(at),
+                    batch_id,
+                    custom_id,
+                ),
             )
+            return cur.rowcount == 1
 
     def month(self, *, uid: str | None, mode: Mode | None, at: datetime) -> Spend:
         """Spend in the UTC calendar month of ``at``; ``uid=None`` is everyone, ``mode=None``

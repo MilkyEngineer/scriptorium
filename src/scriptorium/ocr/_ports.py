@@ -70,7 +70,9 @@ class SpendLedgerLike(Protocol):
         output_tokens: int,
         cost_usd: float,
         at: datetime,
-    ) -> None: ...
+        batch_id: str | None = None,
+        custom_id: str | None = None,
+    ) -> bool: ...
     def month(self, *, uid: str | None, mode: Mode | None, at: datetime) -> Spend: ...
     def allowance(
         self,

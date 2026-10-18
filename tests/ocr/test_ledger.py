@@ -132,6 +132,11 @@ def test_month_sums_one_utc_calendar_month(ledger: SpendLedger, alice: str, bob:
         {"cost_usd": math.nan},
         {"cost_usd": math.inf},
         {"at": datetime(2026, 10, 1)},
+        {"batch_id": "msgbatch_01"},
+        {"custom_id": "p0"},
+        {"batch_id": "msgbatch 01", "custom_id": "p0"},
+        {"batch_id": "msgbatch_01", "custom_id": "p" * 65},
+        {"batch_id": "msgbatch_01", "custom_id": ""},
     ],
 )
 def test_record_validates(ledger: SpendLedger, alice: str, change: dict[str, object]) -> None:
@@ -148,6 +153,31 @@ def test_record_validates(ledger: SpendLedger, alice: str, change: dict[str, obj
     with pytest.raises(InvalidArgumentError):
         ledger.record(**row)  # type: ignore[arg-type]
     assert ledger.month(uid=None, mode=None, at=OCT).pages == 0
+
+
+def test_a_batch_item_is_recorded_once(ledger: SpendLedger, alice: str, bob: str) -> None:
+    row: dict[str, object] = {
+        "mode": "server",
+        "model": "claude-sonnet-5-5",
+        "input_tokens": 2300,
+        "output_tokens": 150,
+        "cost_usd": 0.003,
+        "at": OCT,
+    }
+
+    def record(uid: str, *item: str) -> bool:
+        ids = dict(zip(("batch_id", "custom_id"), item, strict=False))
+        return ledger.record(uid=uid, **row, **ids)  # type: ignore[arg-type]
+
+    assert record(alice, "msgbatch_01", "p0") is True
+    assert record(alice, "msgbatch_01", "p0") is False  # the results were read again
+    assert record(alice, "msgbatch_01", "p1") is True
+    assert record(alice, "msgbatch_02", "p0") is True
+    assert record(bob, "msgbatch_01", "p0") is True
+    # Single calls carry no item and are never merged.
+    assert record(alice) is True and record(alice) is True
+    assert ledger.month(uid=alice, mode="server", at=OCT).pages == 5
+    assert ledger.month(uid=bob, mode="server", at=OCT).pages == 1
 
 
 def test_open_without_migrate_needs_the_current_schema(tmp_path: Path) -> None:

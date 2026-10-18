@@ -19,6 +19,7 @@ from scriptorium.db.migrations import (
 from scriptorium.db.schema_account import ACCOUNT_STEPS
 from scriptorium.db.schema_global import (
     GLOBAL_STEPS,
+    OCR_SPEND_BATCH_ITEMS,
     OCR_V1,
     PRIORITY_CONFIRMATIONS,
     SCRIPTORIUM_STEPS,
@@ -232,6 +233,7 @@ def test_scriptorium_steps_create_every_global_table(conn: sqlite3.Connection) -
     assert SCRIPTORIUM_STEPS[len(GLOBAL_STEPS) : m1] == JOBS_STEPS
     assert SCRIPTORIUM_STEPS[m1] == OCR_V1
     assert SCRIPTORIUM_STEPS[m1 + 1] == PRIORITY_CONFIRMATIONS
+    assert SCRIPTORIUM_STEPS[m1 + 2] == OCR_SPEND_BATCH_ITEMS
     assert migrate(conn, SCRIPTORIUM_STEPS) == len(SCRIPTORIUM_STEPS)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"users", "accounts", "audit", "jobs", "ocr_spend", "confirmations"} <= tables
@@ -303,3 +305,28 @@ def test_m2_step_adds_priority_confirmations_and_removed_at(conn: sqlite3.Connec
     assert columns == {"sha256", "used_at"}
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("INSERT INTO confirmations VALUES ('short', 't')")
+
+
+def test_batch_item_step_keeps_spend_and_makes_each_item_unique(conn: sqlite3.Connection) -> None:
+    migrate(conn, SCRIPTORIUM_STEPS[: SCRIPTORIUM_STEPS.index(OCR_SPEND_BATCH_ITEMS)])
+    single = (
+        "INSERT INTO ocr_spend (uid, mode, model, input_tokens, output_tokens, cost_usd, at) "
+        "VALUES ('0123456789abcdef', 'server', 'm', 1, 1, 0.01, 't')"
+    )
+    conn.execute(single)
+    migrate(conn, SCRIPTORIUM_STEPS)
+    row = conn.execute("SELECT cost_usd, batch_id, custom_id FROM ocr_spend").fetchone()
+    assert tuple(row) == (0.01, None, None)  # existing rows: single calls
+    conn.execute(single)  # single calls are never merged
+    item = (
+        "INSERT INTO ocr_spend (uid, mode, model, input_tokens, output_tokens, cost_usd, at, "
+        "batch_id, custom_id) VALUES ('0123456789abcdef', 'server', 'm', 1, 1, 0.0, 't', "
+        "'msgbatch_01', {cid})"
+    )
+    conn.execute(item.format(cid="'p0'"))
+    conn.execute(item.format(cid="'p1'"))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(item.format(cid="'p0'"))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(item.format(cid="''"))
+    assert conn.execute("SELECT count(*) FROM ocr_spend").fetchone()[0] == 4

@@ -29,10 +29,12 @@
   version, token counts and cost. A refusal dies at once with its reason code
   (``key_<reason>`` when the key, not the page, was refused).
 - **An ``ocr_batch`` job** polls its batch with the queue's backoff and, once it has ended,
-  streams the results through :func:`~scriptorium.ocr.batches.collect`, records the spend at
-  the batch price, stores what came back with the prompt version recorded at submission,
-  records a ``dead`` ``ocr`` job for a page the API refused for good, and falls back to
-  single ``ocr`` jobs for the rest.
+  streams the results through :func:`~scriptorium.ocr.batches.collect`, records the spend of
+  every item the API billed at the batch price (once per batch and custom id, so a stream
+  that fails half-way and is read again bills nothing twice; also when a transcript arrived
+  meanwhile), stores what came back with the prompt version recorded at submission, records
+  a ``dead`` ``ocr`` job for a page the API refused for good (once), and falls back to single
+  ``ocr`` jobs for the rest.
 
 Transcripts are note content: they go from the client to the index and nowhere else. Logs,
 job payloads, job results and job errors carry identifiers, counts, costs and reason codes.
@@ -281,8 +283,8 @@ class OcrRunner:
         t = outcome.transcription
         cost = 0.0
         if t is not None:
-            cost = await asyncio.to_thread(
-                self._record, job.uid, mode, t.input_tokens, t.output_tokens, t.model, False
+            cost, _ = await asyncio.to_thread(
+                self._record, job.uid, mode, t.input_tokens, t.output_tokens, t.model
             )
         if outcome.error == "too_large":
             raise JobFailure("too_large", final=True)
@@ -307,7 +309,6 @@ class OcrRunner:
                 exc.input_tokens,
                 exc.output_tokens,
                 self.worker.settings.ocr_model,
-                False,
             )
         if not exc.about_key:
             return exc.reason
@@ -324,14 +325,18 @@ class OcrRunner:
         input_tokens: int,
         output_tokens: int,
         model: object,
-        batch: bool,
-    ) -> float:
-        """Record one page's spend at F's price (half for a batch); returns its cost."""
+        item: tuple[str, str] | None = None,
+    ) -> tuple[float, bool]:
+        """Record one page's spend at F's price; its cost, and whether a row was added.
+
+        ``item`` is a batch item's ``(batch_id, custom_id)``: half price, and recorded once
+        however many times the batch's results are read.
+        """
         ports = self.ports
         assert ports is not None
         worker = self.worker
-        cost = cost_usd(worker.settings, input_tokens, output_tokens, batch=batch)
-        ports.ledger.record(
+        cost = cost_usd(worker.settings, input_tokens, output_tokens, batch=item is not None)
+        added = ports.ledger.record(
             uid=uid,
             mode=mode,
             model=safe_model(model),
@@ -339,8 +344,10 @@ class OcrRunner:
             output_tokens=output_tokens,
             cost_usd=cost,
             at=worker.clock(),
+            batch_id=None if item is None else item[0],
+            custom_id=None if item is None else item[1],
         )
-        return cost
+        return cost, added
 
     @staticmethod
     def _store(
@@ -473,16 +480,18 @@ class OcrRunner:
         results = client.batch_results(bspec.batch_id)
         for outcome in batches.collect(results, bspec.items, tally=tally):
             spec, t = outcome.spec, outcome.transcription
+            item = (bspec.batch_id, outcome.custom_id)
             if t is not None:
+                # The API billed it: recorded whatever happens to the transcript, and once,
+                # however many runs of this job read the results.
+                page_cost, added = self._record(
+                    job.uid, bspec.mode, t.input_tokens, t.output_tokens, t.model, item
+                )
+                cost += page_cost if added else 0.0
                 if ctx.index.transcript(spec.document, spec.page, spec.hash) is not None:
-                    # Stored by an earlier run of this job (its spend is recorded) or by a
-                    # lazy save; either way it is not replaced or counted again.
+                    # Stored by an earlier run of this job or by a lazy save: kept as it is.
                     counts["exists"] += 1
                     continue
-                page_cost = self._record(
-                    job.uid, bspec.mode, t.input_tokens, t.output_tokens, t.model, True
-                )
-                cost += page_cost
                 if outcome.error is None:
                     stored = self._store(ctx, spec, bspec.mode, t, bspec.prompt_version, page_cost)
                     counts["stored" if stored else "stale"] += 1
@@ -492,7 +501,8 @@ class OcrRunner:
                     fall_back.append(spec)
                 continue
             if outcome.billed != (0, 0):
-                cost += self._record(job.uid, bspec.mode, *outcome.billed, model, True)
+                page_cost, added = self._record(job.uid, bspec.mode, *outcome.billed, model, item)
+                cost += page_cost if added else 0.0
             error = outcome.error or "item_error"
             if error in KEY_REASONS:
                 refused_key = error
@@ -543,7 +553,9 @@ class OcrRunner:
         """A ``dead`` ``ocr`` job for each page the API refused for good inside the batch.
 
         The page version then has a finished job like any refused page, so the scan does
-        not send it again; ``transcribe`` can still re-run it on request.
+        not send it again; ``transcribe`` can still re-run it on request. A page whose latest
+        job already died for the same reason (the results are being read again) is left as
+        it is, so re-reading never spends the page's re-runs.
         """
         queue = self.worker.queue
         settled = 0
@@ -556,6 +568,8 @@ class OcrRunner:
                 latest = family[-1]
                 if latest.state not in ("done", "dead", "cancelled"):
                     continue  # a job for the page is already under way; let it finish
+                if latest.state == "dead" and latest.error == reason:
+                    continue  # settled by an earlier read of these results
                 key = rerun_key(latest.dedupe_key, latest.id)
             queue.record_dead(
                 uid=ctx.uid,

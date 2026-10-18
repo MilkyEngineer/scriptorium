@@ -10,6 +10,7 @@ until it stops changing.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -21,12 +22,18 @@ from typing import Any
 
 import pytest
 
-from scriptorium.jobs.kinds import KEY_ERROR_PREFIX, OCR_KINDS, RERUN_CAP, OcrSpec
+from scriptorium.jobs.kinds import (
+    KEY_ERROR_PREFIX,
+    OCR_KINDS,
+    RERUN_CAP,
+    OcrSpec,
+    parse_ocr_batch_payload,
+)
 from scriptorium.jobs.queue import JobRow, deferral_reason, is_deferred
 from scriptorium.library import pages as pg
 from scriptorium.ocr import runner as runner_mod
 from scriptorium.ocr._ports import build_ocr_ports
-from scriptorium.ocr.client import OcrItemError
+from scriptorium.ocr.client import OcrItemError, Transcription
 from scriptorium.ocr.debounce import STATE_OCR_POLL_AT
 from scriptorium.ocr.errors import OcrRefused, OcrUnavailable
 from scriptorium.ocr.ledger import SpendLedger, cost_usd, month_bounds
@@ -801,6 +808,90 @@ async def test_a_page_refused_in_a_batch_is_not_sent_again(batching: Harness) ->
     assert h.client.pages_sent() == 7 and h.client.count("transcribe") == 0
     (dead,) = h.jobs()
     assert (dead.state, dead.error, dead.payload["page"]) == ("dead", "refused", PAGES[3])
+
+
+async def test_reading_a_batch_again_after_a_failed_stream_bills_each_item_once(
+    batching: Harness,
+) -> None:
+    """Review scenario A: a result stream that failed half-way was read again from the start,
+    and every billed item without a stored transcript was recorded again on each read."""
+    h = batching
+    await h.poll(2)
+    (batch_id,) = h.client.batches
+    batch = h.client.batches[batch_id]
+    cids = batch.custom_ids
+    results: dict[str, Transcription | OcrItemError] = {
+        cid: canned(default_text(batch.pngs[cid]), batch=True) for cid in cids
+    }
+    results[cids[1]] = canned("x" * (31 * 1024), batch=True)  # billed, too large to store
+    results[cids[2]] = OcrItemError("refused", False, 1800, 9)  # billed, refused for good
+    h.client.finish_batch(batch_id, results=results)
+    real = h.client.batch_results
+    failures = [3]
+
+    def failing_stream(bid: str) -> Iterator[tuple[str, Transcription | OcrItemError]]:
+        for n, entry in enumerate(real(bid), start=1):
+            yield entry
+            if n == 3 and failures[0]:
+                failures[0] -= 1
+                raise OcrUnavailable("stream_failed")
+
+    h.client.batch_results = failing_stream  # type: ignore[method-assign]
+    for _ in range(4):
+        h.linked.clock.now += timedelta(hours=2)
+        await h.linked.worker.drain_jobs(kinds=OCR_KINDS)
+    (job,) = h.jobs("ocr_batch")
+    assert job.state == "done" and failures == [0]
+    # One spend row per item, at the batch price, however many reads.
+    assert sorted((r.batch_id, r.custom_id) for r in h.ledger.rows) == sorted(
+        (batch_id, cid) for cid in cids
+    )
+    (refused,) = [r for r in h.ledger.rows if r.custom_id == cids[2]]
+    assert refused.cost_usd == pytest.approx(cost_usd(h.linked.settings, 1800, 9, batch=True))
+    dead = sorted((j.payload["page"], j.error) for j in h.jobs())
+    assert dead == sorted([(PAGES[1], "too_large"), (PAGES[2], "refused")])
+    assert h.after_keys() == [] and set(h.transcribed()) == set(PAGES) - {PAGES[1], PAGES[2]}
+    # Reading the results once more (a lost lease, a crash before completion) adds nothing.
+    bspec = parse_ocr_batch_payload(job.payload)
+    runner = h.linked.worker.ocr_runner
+    again = await asyncio.to_thread(runner._collect, h.linked.context(), job, bspec, h.client)
+    assert (again["cost_usd"], again["failed"], again["fallback"]) == (0, 0, 0)
+    assert len(h.ledger.rows) == len(cids) and len(h.jobs()) == 2 and h.after_keys() == []
+    # The refused pages' re-runs are all still there for the user.
+    rerun, how = h.enqueue(h.spec(1), retry_failed=True)
+    assert rerun is not None and how == "rerun"
+
+
+async def test_a_batch_item_billed_after_a_lazy_save_is_still_recorded(batching: Harness) -> None:
+    """Review scenario B: an item whose page was saved lazily before the results were read
+    was billed by the API but never recorded."""
+    h = batching
+    await h.poll(2)
+    (batch_id,) = h.client.batches
+    index = h.linked.index()
+    page = index.page(NOTEBOOK, 0)
+    assert page is not None
+    index.put_transcript(
+        NOTEBOOK,
+        page.page_id,
+        page.content_hash,
+        "saved by the user's own session",
+        DEFAULT_MODEL,
+        "lazy",
+        prompt_version="v1",
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=0.0,
+    )
+    await _until_ended(h, batch_id)
+    (job,) = h.jobs("ocr_batch")
+    assert job.result is not None
+    assert (job.result["stored"], job.result["exists"]) == (len(PAGES) - 1, 1)
+    half = cost_usd(h.linked.settings, 2300, 150, batch=True)
+    assert len(h.ledger.rows) == len(PAGES)
+    assert job.result["cost_usd"] == pytest.approx(len(PAGES) * half, abs=1e-6)
+    kept = index.transcript(NOTEBOOK, page.page_id, page.content_hash)
+    assert kept is not None and kept.mode == "lazy"
 
 
 async def test_prompt_version_is_the_one_the_batch_was_sent_with(batching: Harness) -> None:

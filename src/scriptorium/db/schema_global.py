@@ -116,10 +116,27 @@ ALTER TABLE accounts ADD COLUMN removed_at TEXT;
 )
 """M2 workstream I: job priority, spent confirmation tokens, removed accounts."""
 
+OCR_SPEND_BATCH_ITEMS: Final = Step(
+    name="ocr_spend batch items",
+    sql="""
+-- A batch item's spend is recorded once, however many times its ocr_batch job reads the
+-- results (a stream that fails half-way is read again from the start): rows for batch items
+-- carry the batch id and the item's custom id, unique per user. NULL for single calls.
+ALTER TABLE ocr_spend ADD COLUMN batch_id TEXT
+    CHECK (batch_id IS NULL OR length(batch_id) BETWEEN 1 AND 128);
+ALTER TABLE ocr_spend ADD COLUMN custom_id TEXT
+    CHECK (custom_id IS NULL OR length(custom_id) BETWEEN 1 AND 64);
+CREATE UNIQUE INDEX ocr_spend_batch_item ON ocr_spend (uid, batch_id, custom_id)
+    WHERE batch_id IS NOT NULL;
+""",
+)
+"""M2 review: a batch item's spend is recorded once (``SpendLedger.record`` with ids)."""
+
 SCRIPTORIUM_STEPS: Final[tuple[Step, ...]] = (
     *GLOBAL_STEPS,
     *JOBS_STEPS,
     OCR_V1,
     PRIORITY_CONFIRMATIONS,
+    OCR_SPEND_BATCH_ITEMS,
 )
 """The whole ``scriptorium.sqlite`` sequence. Append-only; ``len`` is the file's version."""
