@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from scriptorium.auth.oidc import User
 from scriptorium.cloud.client import CloudClient
@@ -31,9 +31,12 @@ from scriptorium.library.index import Index
 from scriptorium.logging import log_event, uid_prefix
 from scriptorium.users.store import GlobalStore, account_paths, global_db_path
 
-__all__ = ["Services", "identity_of"]
+__all__ = ["IMAGE_SLOTS", "Services", "identity_of"]
 
 logger = logging.getLogger(__name__)
+
+IMAGE_SLOTS: Final = 2
+"""Page images the server downscales at once (per process)."""
 
 
 def identity_of(device_token: str) -> str | None:
@@ -60,6 +63,8 @@ class Services:
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     poll_interval_s: float = 0.25
     """How often a tool waiting for a render looks for its PNG."""
+    image_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(IMAGE_SLOTS))
+    """Bounds the server's own PNG decoding (downscales), which can take ~200 MB a page."""
     _indexes: dict[tuple[str, str], Index] = field(default_factory=dict, repr=False)
     _users: dict[str, str] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)

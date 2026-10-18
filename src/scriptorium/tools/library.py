@@ -45,7 +45,7 @@ from scriptorium.tools._library import (
     Pages,
     display_name,
     document_item,
-    fit_png,
+    downscaled,
     load_pages,
     page_png,
     page_ref,
@@ -60,6 +60,7 @@ from scriptorium.tools.ocr import LAZY_INSTRUCTION, OLD_VERSION_NOTE
 
 PNG: Final = "image/png"
 PAGE_IMAGE_SIDE: Final = 1024
+SCALE_STEP: Final = 0.25
 """``page_image(scale=1)``: longest side 1024 px, about 200 KB for a handwritten page (S6)."""
 MODEL_IMAGE_SIDE: Final = 2576
 """The Claude API's longest image side; ``read_page`` downscales taller pages to it (§8.3)."""
@@ -247,7 +248,7 @@ async def read_page(ctx: ToolContext, args: ReadPageArgs) -> CallToolResult:
         ctx.audit["bytes"] = len(text.encode("utf-8"))
         return CallToolResult(content=[TextContent(text=json_text(meta)), TextContent(text=text)])
     png = await page_png(ctx, account, source, pages.version.generation)
-    png = await asyncio.to_thread(fit_png, png, MODEL_IMAGE_SIDE)
+    png = await downscaled(ctx, account, source, png, MODEL_IMAGE_SIDE)
     note = LAZY_INSTRUCTION if pages.current else OLD_VERSION_NOTE
     meta = {**ref, "transcript": None}
     ctx.audit["bytes"] = len(png)
@@ -392,22 +393,22 @@ class PageImageArgs(ToolArgs):
         default=1.0,
         ge=0.25,
         le=2.0,
-        description="1 gives a longest side of 1024 px (about 200 KB); 0.25-2.",
+        description=(
+            "1 gives a longest side of 1024 px (about 200 KB); 0.25-2, in steps of 0.25 "
+            "(other values are rounded to the nearest step)."
+        ),
     )
     account: str | None = _account_field()
 
 
-def _variant(account: Account, source: pg.PageSource, base: bytes, side: int) -> bytes:
-    """The archive PNG downscaled to longest side ``side``, cached next to it."""
-    rel = pg.png_relpath(source.page_id, source.content_hash, max_side=side)
-    path = pg.resolve_png(account.paths, rel)
-    try:
-        return path.read_bytes()
-    except FileNotFoundError:
-        pass
-    data = fit_png(base, side)
-    pg.write_png(account.paths, rel, data)
-    return data
+def image_side(scale: float) -> int:
+    """The longest side for ``scale``, snapped to a step of 0.25 (256 px).
+
+    Every size is a cached file or a worker job per page version, so only the eight steps
+    exist: one user cannot fill the disk or the render queue with sizes (§8.3).
+    """
+    steps = min(max(round(scale / SCALE_STEP), 1), round(2 / SCALE_STEP))
+    return round(PAGE_IMAGE_SIDE * SCALE_STEP) * steps
 
 
 async def page_image(ctx: ToolContext, args: PageImageArgs) -> CallToolResult:
@@ -420,13 +421,10 @@ async def page_image(ctx: ToolContext, args: PageImageArgs) -> CallToolResult:
     pages = await asyncio.to_thread(load_pages, account, doc, None)
     source = pick_page(pages, args.page)
     generation = pages.version.generation
-    side = round(PAGE_IMAGE_SIDE * args.scale)
+    side = image_side(args.scale)
     base = await page_png(ctx, account, source, generation)
-    longest = max(pg.png_size(base))
-    if longest == side:
-        data = base
-    elif longest > side:
-        data = await asyncio.to_thread(_variant, account, source, base, side)
+    if max(pg.png_size(base)) >= side:
+        data = await downscaled(ctx, account, source, base, side)
     else:
         data = await page_png(ctx, account, source, generation, max_side=side)
     width, height = pg.png_size(data)

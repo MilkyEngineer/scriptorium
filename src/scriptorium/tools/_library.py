@@ -55,6 +55,7 @@ __all__ = [
     "Pages",
     "display_name",
     "document_item",
+    "downscaled",
     "fit_png",
     "iso_or_none",
     "load_pages",
@@ -366,12 +367,48 @@ async def page_png(
 
 
 def fit_png(data: bytes, max_side: int) -> bytes:
-    """``data`` with its longest side at most ``max_side`` (Lanczos, deterministic)."""
+    """``data`` with its longest side at most ``max_side`` (Lanczos, deterministic).
+
+    Refuses (``refused``) a PNG larger than the renderer's canvas budget before decoding
+    it: the worker never writes one, so it is not ours to decode in the server process.
+    """
     width, height = pg.png_size(data)
     if max(width, height) <= max_side:
         return data
+    if width * height > render.MAX_CANVAS_PIXELS:
+        raise ToolError(
+            ErrorCode.REFUSED,
+            "This page image is too large to scale on the server.",
+            "Use read_page for its text instead.",
+        )
     result = render.RenderResult(data, width, height, (0.0, 0.0, 0.0, 0.0))
     return render.page_image_bytes(result, max_side_px=max_side)
+
+
+def _cached_variant(account: Account, source: pg.PageSource, base: bytes, side: int) -> bytes:
+    rel = pg.png_relpath(source.page_id, source.content_hash, max_side=side)
+    path = pg.resolve_png(account.paths, rel)
+    data = _read_png(path)
+    if data is not None:
+        return data
+    data = fit_png(base, side)
+    pg.write_png(account.paths, rel, data)
+    return data
+
+
+async def downscaled(
+    ctx: ToolContext, account: Account, source: pg.PageSource, base: bytes, side: int
+) -> bytes:
+    """``base`` (the page's archive PNG) with its longest side at most ``side``.
+
+    A smaller copy is made once per page version and size and cached next to the archive PNG
+    (``<hash>.<side>px.png``); callers pass a size from a short fixed list, so the cache stays
+    bounded. Decoding runs in a thread, at most ``IMAGE_SLOTS`` at a time per process.
+    """
+    if max(pg.png_size(base)) <= side:
+        return base
+    async with services(ctx).image_slots:
+        return await asyncio.to_thread(_cached_variant, account, source, base, side)
 
 
 def page_ref(doc: DocumentRow, pages: Pages, source: pg.PageSource) -> dict[str, object]:

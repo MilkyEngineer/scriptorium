@@ -13,8 +13,9 @@ import pytest
 
 from scriptorium.jobs.kinds import render_key
 from scriptorium.library import pages as pg
+from scriptorium.tools._conventions import ErrorCode, ToolError
 from scriptorium.tools._library import fit_png
-from scriptorium.tools.library import MODEL_IMAGE_SIDE, PAGE_IMAGE_SIDE
+from scriptorium.tools.library import MODEL_IMAGE_SIDE, PAGE_IMAGE_SIDE, image_side
 from scriptorium.tools.ocr import LAZY_INSTRUCTION
 from scriptorium.users.store import global_db_path
 from tests.cloud.fake_cloud import NOTEBOOK, PAGES, PDF, fixture_documents, renamed
@@ -412,6 +413,38 @@ async def test_page_image_scale_bounds(library: Served) -> None:
     for scale in (0.1, 3):
         error = await library.error("page_image", {"document": NOTEBOOK, "page": 1, "scale": scale})
         assert error["code"] == "invalid_argument"
+
+
+def test_image_sizes_come_from_eight_steps() -> None:
+    assert image_side(1) == 1024
+    assert image_side(0.25) == 256 and image_side(2) == 2048
+    assert image_side(1.0001) == image_side(0.9) == 1024
+    assert image_side(0.3) == 256 and image_side(1.9) == 2048
+    sides = {image_side(0.25 + n / 1000) for n in range(1751)}
+    assert sides == {256 * n for n in range(1, 9)}
+
+
+async def test_many_scales_make_few_cached_variants(library: Served, linked: Linked) -> None:
+    """A client cannot fill the disk with sizes: scales snap to steps of 0.25 (§8.3)."""
+    source = _sources(linked, NOTEBOOK)[1]
+    archive = max(pg.png_size(_archive_png(linked, source)))
+    for n in range(40):
+        scale = 0.25 + n * 0.031  # 0.25 .. 1.459
+        if image_side(scale) > archive:
+            continue
+        result = await library.call("page_image", {"document": NOTEBOOK, "page": 2, "scale": scale})
+        assert max(pg.png_size(image_of(result))) == image_side(scale)
+    folder = pg.resolve_png(linked.paths, pg.png_relpath(source.page_id, source.content_hash))
+    variants = sorted(p.name for p in folder.parent.glob(f"{source.content_hash}.*px.png"))
+    assert 1 <= len(variants) <= 6  # 256 .. 1536 px, whatever the scales asked for
+
+
+def test_fit_png_refuses_an_image_beyond_the_canvas_budget() -> None:
+    header = b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR"
+    huge = header + (10_000).to_bytes(4, "big") + (10_000).to_bytes(4, "big") + bytes(5)
+    with pytest.raises(ToolError) as caught:
+        fit_png(huge, 1024)  # refused from the header, before anything is decoded
+    assert caught.value.code == ErrorCode.REFUSED
 
 
 # ---- read_document -----------------------------------------------------------------------------
