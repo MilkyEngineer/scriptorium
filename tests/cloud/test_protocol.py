@@ -36,6 +36,25 @@ def test_schema_3_and_4_parse() -> None:
     assert [(e.id, e.subfiles) for e in four] == [(DOC, 3)]
 
 
+def test_a_schema_4_document_index_names_its_own_document() -> None:
+    """Documents uploaded by the desktop app arrive as schema 4 with ``0:<uuid>:n:size``
+    as the header (seen live 2026-10-18); the root uses ``0:.:n:size``."""
+    raw = body("4", f"0:{DOC}:1:10", f"{H1}:0:{DOC}.metadata:0:10")
+    assert [e.id for e in parse_index(raw, max_entries=10, what="x", owner=DOC)] == [
+        f"{DOC}.metadata"
+    ]
+    with pytest.raises(CloudProtocolError):
+        parse_index(raw, max_entries=10, what="x")  # the root accepts only "."
+    other = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+    with pytest.raises(CloudProtocolError):
+        parse_index(
+            body("4", f"0:{other}:1:10", f"{H1}:0:{DOC}.metadata:0:10"),
+            max_entries=10,
+            what="x",
+            owner=DOC,
+        )
+
+
 @pytest.mark.parametrize(
     "raw",
     [

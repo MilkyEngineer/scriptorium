@@ -48,7 +48,11 @@ _ENTRY_RE: Final = re.compile(
     r"(?P<hash>[0-9A-Fa-f]{64}):(?P<type>[0-9A-Fa-f]{1,8}):(?P<id>[^:\s]{1,256})"
     r":(?P<subfiles>[0-9]{1,9}):(?P<size>[0-9]{1,15})"
 )
-_SCHEMA4_HEADER_RE: Final = re.compile(r"0:\.:(?P<count>[0-9]{1,9}):(?P<size>[0-9]{1,15})")
+#: Schema 4 puts a header line after the version: ``0:<name>:<count>:<size>``, where ``name``
+#: is ``.`` for the root and the document's own UUID for a document index.
+_SCHEMA4_HEADER_RE: Final = re.compile(
+    r"0:(?P<name>\.|[0-9a-f-]{36}):(?P<count>[0-9]{1,9}):(?P<size>[0-9]{1,15})"
+)
 
 
 def is_uuid(value: str) -> bool:
@@ -120,8 +124,14 @@ class DocumentIndex:
     skipped: int = 0
 
 
-def parse_index(body: bytes, *, max_entries: int, what: str) -> list[IndexEntry]:
-    """Parse a schema 3 or 4 index; raise on anything malformed."""
+def parse_index(
+    body: bytes, *, max_entries: int, what: str, owner: str | None = None
+) -> list[IndexEntry]:
+    """Parse a schema 3 or 4 index; raise on anything malformed.
+
+    ``owner`` is the document UUID a document index belongs to: its schema 4 header must name
+    either that UUID or ``.``. The root passes nothing, so only ``.`` is accepted there.
+    """
     if len(body) > MAX_INDEX_BYTES:
         raise ResponseTooLargeError(f"{what} is larger than {MAX_INDEX_BYTES} bytes")
     try:
@@ -139,6 +149,8 @@ def parse_index(body: bytes, *, max_entries: int, what: str) -> list[IndexEntry]
         header = _SCHEMA4_HEADER_RE.fullmatch(rest[0]) if rest else None
         if header is None:
             raise CloudProtocolError(f"{what} has a malformed schema 4 header")
+        if header["name"] not in (".", owner):
+            raise CloudProtocolError(f"{what} has a schema 4 header for another document")
         declared = int(header["count"])
         rest = rest[1:]
     if len(rest) > max_entries:
@@ -221,7 +233,7 @@ def is_document_file(uuid: str, name: str) -> bool:
 
 def parse_document_index(body: bytes, *, uuid: str, hash: str, max_files: int) -> DocumentIndex:
     hash = hash.lower()
-    entries = parse_index(body, max_entries=max_files, what="document index")
+    entries = parse_index(body, max_entries=max_files, what="document index", owner=uuid)
     if not matches_address(body, entries, hash):
         raise CloudProtocolError("document index does not match its hash")
     files = {e.id: BlobRef(e.hash, e.size) for e in entries if is_document_file(uuid, e.id)}
