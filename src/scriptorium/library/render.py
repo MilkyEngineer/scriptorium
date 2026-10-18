@@ -32,6 +32,7 @@ paper size; the fork is pinned by tag, and the goldens catch any drift.
 from __future__ import annotations
 
 import io
+import logging
 import math
 import multiprocessing
 import struct
@@ -218,11 +219,26 @@ def page_image_bytes(result: RenderResult, *, max_side_px: int = 1024) -> bytes:
 # --------------------------------------------------------------------------- process pool
 
 
-def render_pool(max_workers: int) -> ProcessPoolExecutor:
+def _init_render_child(log_level: str) -> None:
+    """Pool initializer: the parent's JSON logging, with the renderers held to errors.
+
+    A spawned child starts with Python's default logging, which would print library warnings
+    as raw, unbounded text. The fork's renderer warns with details of the page it failed on
+    (an SVG of typed text), so in a child nothing below an error is logged from it or rmscene.
+    """
+    from scriptorium.logging import configure_logging
+
+    configure_logging(log_level)
+    for name in ("remarkable_mcp", "rmscene"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
+def render_pool(max_workers: int, *, log_level: str = "info") -> ProcessPoolExecutor:
     """Return a process pool configured for rendering; the caller owns and shuts it down.
 
     Workers start with ``spawn`` (the server and worker are threaded, and forking a threaded
-    process is unsafe) and are recycled every :data:`MAX_TASKS_PER_CHILD` tasks.
+    process is unsafe), log through :func:`scriptorium.logging.configure_logging` at
+    ``log_level``, and are recycled every :data:`MAX_TASKS_PER_CHILD` tasks.
     """
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1")
@@ -230,6 +246,8 @@ def render_pool(max_workers: int) -> ProcessPoolExecutor:
         max_workers=max_workers,
         mp_context=multiprocessing.get_context("spawn"),
         max_tasks_per_child=MAX_TASKS_PER_CHILD,
+        initializer=_init_render_child,
+        initargs=(log_level,),
     )
 
 

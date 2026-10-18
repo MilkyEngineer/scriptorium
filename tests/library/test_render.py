@@ -404,6 +404,28 @@ def test_rendering_works_through_the_process_pool() -> None:
         assert max(_pixels(small.result(timeout=120)).size) == 512
 
 
+def _child_logging() -> tuple[str, int, int]:
+    """Runs in a pool child: how its logging is set up."""
+    import logging
+
+    handlers = logging.getLogger().handlers
+    formatter = type(handlers[0].formatter).__name__ if handlers else ""
+    return (
+        formatter,
+        logging.getLogger("rmscene").getEffectiveLevel(),
+        logging.getLogger("remarkable_mcp.extract").getEffectiveLevel(),
+    )
+
+
+def test_pool_children_log_json_and_hold_renderers_to_errors() -> None:
+    import logging
+
+    with render_pool(1, log_level="debug") as pool:
+        formatter, rmscene, fork = pool.submit(_child_logging).result(timeout=120)
+    assert formatter == "JsonFormatter"
+    assert rmscene == logging.ERROR and fork == logging.ERROR
+
+
 def test_render_in_pool_runs_only_render_functions() -> None:
     with render_pool(1) as pool, pytest.raises(ValueError):
         render_in_pool(pool, print, "x")  # type: ignore[arg-type]

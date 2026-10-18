@@ -313,7 +313,9 @@ class Worker:
 
     def executor(self) -> Executor:
         if self.render_executor is None:
-            self.render_executor = render.render_pool(self.settings.render_workers)
+            self.render_executor = render.render_pool(
+                self.settings.render_workers, log_level=self.settings.log_level
+            )
         return self.render_executor
 
     async def run(self, stop: asyncio.Event) -> None:
