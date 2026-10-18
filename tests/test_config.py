@@ -408,3 +408,148 @@ def test_poll_budgets_and_watchdog(env: pytest.MonkeyPatch) -> None:
     env.setenv("SCRIPTORIUM_POLL_TIMEOUT_SECONDS", "300")
     with pytest.raises(ConfigError, match="POLL_TIMEOUT_SECONDS"):
         load_settings()
+
+
+# ---- OCR (§8) -------------------------------------------------------------------------------
+
+FAKE_KEY = "sk-ant-test-" + "x" * 40  # the shape of a key; never a real one
+
+
+def test_ocr_defaults(env: pytest.MonkeyPatch) -> None:
+    settings = load_settings()
+    assert settings.anthropic_api_key is None
+    assert settings.server_key_users == ()
+    assert settings.ocr_model == "claude-sonnet-5-5"
+    assert (settings.ocr_monthly_cap_usd, settings.ocr_user_monthly_cap_usd) == (20.0, 10.0)
+    # The list price of claude-sonnet-5-5 (USD per million tokens).
+    assert (settings.ocr_price_in_per_mtok, settings.ocr_price_out_per_mtok) == (2.0, 10.0)
+    assert settings.ocr_max_tokens == 4096
+
+
+def test_api_key_from_environment_and_file(env: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    env.setenv("SCRIPTORIUM_ANTHROPIC_API_KEY", f"  {FAKE_KEY}\n")
+    key = load_settings().anthropic_api_key
+    assert key is not None and key.get_secret_value() == FAKE_KEY
+    env.delenv("SCRIPTORIUM_ANTHROPIC_API_KEY")
+    secret = tmp_path / "anthropic"
+    secret.write_text(FAKE_KEY + "\n")
+    env.setenv("SCRIPTORIUM_ANTHROPIC_API_KEY_FILE", str(secret))
+    key = load_settings().anthropic_api_key
+    assert key is not None and key.get_secret_value() == FAKE_KEY
+
+
+def test_api_key_and_server_key_users_stay_out_of_repr(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_ANTHROPIC_API_KEY", FAKE_KEY)
+    env.setenv("SCRIPTORIUM_SERVER_KEY_USERS", "friend@example.org")
+    settings = load_settings()
+    text = repr(settings) + str(settings)
+    assert FAKE_KEY[:12] not in text  # not even a prefix
+    assert "x" * 40 not in text
+    assert "friend@example.org" not in text
+
+
+def test_blank_api_key_means_unset(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_ANTHROPIC_API_KEY", "")
+    assert load_settings().anthropic_api_key is None
+    env.setenv("SCRIPTORIUM_ANTHROPIC_API_KEY", "   ")
+    assert load_settings().anthropic_api_key is None
+
+
+@pytest.mark.parametrize(
+    "bad", ["short-key", "sk-ant-" + "y" * 30 + " tail", "sk-ant-" + "z" * 30 + '"', "k" * 513]
+)
+def test_malformed_api_key_refused_without_echo(env: pytest.MonkeyPatch, bad: str) -> None:
+    env.setenv("SCRIPTORIUM_ANTHROPIC_API_KEY", bad)
+    with pytest.raises(ConfigError, match="SCRIPTORIUM_ANTHROPIC_API_KEY") as info:
+        load_settings()
+    assert bad not in str(info.value)
+    assert bad[:12] not in str(info.value)
+    with pytest.raises(ValueError) as direct:
+        Settings()
+    assert bad[:12] not in str(direct.value)
+
+
+def test_server_key_users_csv(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_SERVER_KEY_USERS", " sub-1, friend@example.org,0123456789abcdef ,")
+    assert load_settings().server_key_users == ("sub-1", "friend@example.org", "0123456789abcdef")
+    env.setenv("SCRIPTORIUM_SERVER_KEY_USERS", "*")
+    assert load_settings().server_key_users == ("*",)
+
+
+@pytest.mark.parametrize("bad", ['sub"1', "sub'1", "a\\b", "x" * 321, "bell\x07"])
+def test_server_key_users_rejects_odd_entries(env: pytest.MonkeyPatch, bad: str) -> None:
+    env.setenv("SCRIPTORIUM_SERVER_KEY_USERS", bad)
+    with pytest.raises(ConfigError, match="SCRIPTORIUM_SERVER_KEY_USERS") as info:
+        load_settings()
+    assert bad not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("model", "prices"),
+    [
+        ("claude-opus-5-5", (4.0, 20.0)),
+        ("claude-haiku-5-5", (0.10, 0.50)),
+        ("claude-fable-5-1", (10.0, 50.0)),
+    ],
+)
+def test_prices_follow_the_model(
+    env: pytest.MonkeyPatch, model: str, prices: tuple[float, float]
+) -> None:
+    env.setenv("SCRIPTORIUM_OCR_MODEL", model)
+    settings = load_settings()
+    assert (settings.ocr_price_in_per_mtok, settings.ocr_price_out_per_mtok) == prices
+
+
+def test_prices_are_overridable(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_OCR_PRICE_IN_PER_MTOK", "2.5")
+    settings = load_settings()
+    assert (settings.ocr_price_in_per_mtok, settings.ocr_price_out_per_mtok) == (2.5, 10.0)
+    env.setenv("SCRIPTORIUM_OCR_PRICE_OUT_PER_MTOK", "12")
+    assert load_settings().ocr_price_out_per_mtok == 12.0
+    env.setenv("SCRIPTORIUM_OCR_PRICE_IN_PER_MTOK", "")  # blank: back to the list price
+    assert load_settings().ocr_price_in_per_mtok == 2.0
+
+
+def test_unknown_model_needs_both_prices(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_OCR_MODEL", "claude-future-9")
+    with pytest.raises(ConfigError, match="SCRIPTORIUM_OCR_PRICE_IN_PER_MTOK"):
+        load_settings()
+    env.setenv("SCRIPTORIUM_OCR_PRICE_IN_PER_MTOK", "3")
+    with pytest.raises(ConfigError, match="no built-in list price"):
+        load_settings()
+    env.setenv("SCRIPTORIUM_OCR_PRICE_OUT_PER_MTOK", "15")
+    settings = load_settings()
+    assert (settings.ocr_model, settings.ocr_price_in_per_mtok) == ("claude-future-9", 3.0)
+
+
+def test_blank_model_means_default(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_OCR_MODEL", "")
+    assert load_settings().ocr_model == "claude-sonnet-5-5"
+
+
+@pytest.mark.parametrize("bad", ["claude sonnet", "-leading", "a/b", "x" * 101])
+def test_model_name_validated(env: pytest.MonkeyPatch, bad: str) -> None:
+    env.setenv("SCRIPTORIUM_OCR_MODEL", bad)
+    env.setenv("SCRIPTORIUM_OCR_PRICE_IN_PER_MTOK", "1")
+    env.setenv("SCRIPTORIUM_OCR_PRICE_OUT_PER_MTOK", "1")
+    with pytest.raises(ConfigError, match="SCRIPTORIUM_OCR_MODEL"):
+        load_settings()
+
+
+def test_ocr_bounds(env: pytest.MonkeyPatch) -> None:
+    env.setenv("SCRIPTORIUM_OCR_MONTHLY_CAP_USD", "0")
+    env.setenv("SCRIPTORIUM_OCR_USER_MONTHLY_CAP_USD", "0")
+    settings = load_settings()
+    assert (settings.ocr_monthly_cap_usd, settings.ocr_user_monthly_cap_usd) == (0.0, 0.0)
+    for name, bad in (
+        ("OCR_MONTHLY_CAP_USD", "-1"),
+        ("OCR_USER_MONTHLY_CAP_USD", "-0.01"),
+        ("OCR_PRICE_IN_PER_MTOK", "0"),
+        ("OCR_PRICE_OUT_PER_MTOK", "-3"),
+        ("OCR_MAX_TOKENS", "100"),
+        ("OCR_MAX_TOKENS", "64000"),
+    ):
+        env.setenv(f"SCRIPTORIUM_{name}", bad)
+        with pytest.raises(ConfigError, match=name):
+            load_settings()
+        env.delenv(f"SCRIPTORIUM_{name}")

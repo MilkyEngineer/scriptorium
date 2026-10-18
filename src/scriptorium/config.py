@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
@@ -38,6 +40,29 @@ _MAX_SECRET_FILE_BYTES = 64 * 1024
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 LogLevel = Literal["debug", "info", "warning", "error"]
+
+DEFAULT_OCR_MODEL: Final = "claude-sonnet-5-5"
+#: List prices in USD per million input / output tokens of the Claude API, first-party
+#: (checked 2026-10-18). They are the defaults of OCR_PRICE_IN_PER_MTOK and
+#: OCR_PRICE_OUT_PER_MTOK for these models; any other OCR_MODEL must set both, so spend is
+#: never counted at a price nobody chose (§8.1). Thinking tokens bill as output tokens.
+OCR_LIST_PRICES: Final[Mapping[str, tuple[float, float]]] = {
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-fable-5-1": (10.00, 50.00),
+}
+#: The shape of a Claude API key: what the API accepts in ``x-api-key``. Nothing else (no
+#: whitespace, quotes or control characters) can reach a request header.
+API_KEY_RE: Final = re.compile(r"[A-Za-z0-9_-]{20,512}")
+_MODEL_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,99}")
+_SERVER_KEY_USER_MAX: Final = 320
+_OCR_BLANK_IS_UNSET: Final = (
+    "anthropic_api_key",
+    "ocr_model",
+    "ocr_price_in_per_mtok",
+    "ocr_price_out_per_mtok",
+)
 
 
 class ConfigError(Exception):
@@ -226,6 +251,53 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---- OCR (§8) -------------------------------------------------------------------------
+    anthropic_api_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "The server-wide Claude API key (§8.1 `server` mode). Only users in "
+            "SERVER_KEY_USERS or granted by admin_allow_server_key may use it."
+        ),
+    )
+    # repr=False: the list may hold email addresses, which must never reach a log.
+    server_key_users: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=(),
+        repr=False,
+        description=(
+            "Users allowed the server key: 16-character uids, `sub` values or verified emails; "
+            "`*` admits everyone and is logged as a warning at start."
+        ),
+    )
+    ocr_model: str = Field(default=DEFAULT_OCR_MODEL, description="Model that transcribes.")
+    ocr_monthly_cap_usd: float = Field(
+        default=20.0,
+        ge=0,
+        le=1_000_000,
+        description="Global monthly cap on server-key spend, every user and call type (§8.1).",
+    )
+    ocr_user_monthly_cap_usd: float = Field(
+        default=10.0,
+        ge=0,
+        le=1_000_000,
+        description="Per-user monthly cap on server-key spend (§8.1).",
+    )
+    ocr_price_in_per_mtok: float = Field(
+        gt=0,
+        le=10_000,
+        description="USD per million input tokens; defaults to the list price of OCR_MODEL.",
+    )
+    ocr_price_out_per_mtok: float = Field(
+        gt=0,
+        le=10_000,
+        description=(
+            "USD per million output tokens, thinking included; defaults to the list price of "
+            "OCR_MODEL."
+        ),
+    )
+    ocr_max_tokens: int = Field(
+        default=4096, ge=256, le=32_000, description="Output budget of one page (§8.2)."
+    )
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -238,10 +310,76 @@ class Settings(BaseSettings):
         # No dotenv: compose's env_file injects the environment instead.
         return (init_settings, env_settings, _FileEnvSource(settings_cls))
 
-    @field_validator("trusted_proxies", "oidc_allowed_users", "oidc_required_scopes", mode="before")
+    @field_validator(
+        "trusted_proxies",
+        "oidc_allowed_users",
+        "oidc_required_scopes",
+        "server_key_users",
+        mode="before",
+    )
     @classmethod
     def _csv(cls, value: object) -> object:
         return _split_csv(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ocr_defaults(cls, data: Any) -> Any:
+        """Blank OCR variables count as unset; unset prices take the model's list price."""
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for name in _OCR_BLANK_IS_UNSET:
+            value = data.get(name)
+            if isinstance(value, str) and not value.strip():
+                del data[name]  # compose passes unset variables through as ""
+        model = data.get("ocr_model", DEFAULT_OCR_MODEL)
+        prices = OCR_LIST_PRICES.get(model) if isinstance(model, str) else None
+        missing = [n for n in ("ocr_price_in_per_mtok", "ocr_price_out_per_mtok") if n not in data]
+        if missing and prices is None:
+            raise ValueError(
+                f"{env_name('ocr_model')} has no built-in list price; set "
+                f"{env_name('ocr_price_in_per_mtok')} and {env_name('ocr_price_out_per_mtok')} "
+                "so OCR spend is counted at a price you chose (§8.1)."
+            )
+        if prices is not None:
+            data.setdefault("ocr_price_in_per_mtok", prices[0])
+            data.setdefault("ocr_price_out_per_mtok", prices[1])
+        return data
+
+    @field_validator("anthropic_api_key")
+    @classmethod
+    def _api_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        key = value.get_secret_value().strip()
+        if not key:
+            return None
+        if not API_KEY_RE.fullmatch(key):
+            # Never echo it: the message would carry the secret into a log.
+            raise ValueError("is not a Claude API key (20-512 letters, digits, '-' or '_')")
+        return SecretStr(key)
+
+    @field_validator("server_key_users")
+    @classmethod
+    def _server_key_users(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for entry in value:
+            if (
+                len(entry) > _SERVER_KEY_USER_MAX
+                or not entry.isprintable()
+                or any(c.isspace() or c in "\"'\\" for c in entry)
+            ):
+                raise ValueError(
+                    "each entry must be `*`, a uid, a `sub` or an email: printable, without "
+                    f"spaces or quotes, at most {_SERVER_KEY_USER_MAX} characters"
+                )
+        return value
+
+    @field_validator("ocr_model")
+    @classmethod
+    def _ocr_model(cls, value: str) -> str:
+        if not _MODEL_RE.fullmatch(value):
+            raise ValueError("must be a Claude model id such as claude-sonnet-5-5")
+        return value
 
     @field_validator("log_level", mode="before")
     @classmethod
