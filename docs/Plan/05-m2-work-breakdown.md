@@ -215,6 +215,9 @@ Everything in `04-m1-work-breakdown.md` §4 applies. In addition:
 
 - **H merged 2026-10-18 (`e352ac5`)**, 1411 tests. Deviations accepted and recorded in Architecture §6.1/§11.2: `page=''` for document tags; the 100-tag bound counts page tags; `folder` is a UUID subtree; `doc_tags` on transcripts feeds the FTS. Follow-up for the review wave: a page tag on an untranscribed notebook is findable by neither text nor filter; let document hits in the name fallback match page tags too.
 
+- **F merged 2026-10-18 (`c89dc64`)**, 1618 tests, `anthropic` 1.x added (MIT, licence-check passed). Deviations accepted and recorded in Architecture §4.4/§6.2/§8/§11/§12: `cost_usd(..., batch=)` at half price; `allowance(..., mode=)`; `OcrRefused` carries tokens; own-cap-reached falls through to a permitted server key; `key_unreadable` fails closed; key checks rate-limited; `users.server_key_email_sha256`; `account_status.user`. The security plugin reviewed only 5 of 13 commits (hourly limit); the coordinator read the client, modes and key tools by hand; the adversarial review covers the rest.
+- **G rebased onto H**, gate green (1485 tests); wiring onto F pending (`build_ocr_ports`, fakes reconciliation, `batch=`/`mode=`/`check_png`).
+
 ## 6. Order of work and what the operator provides
 
 1. Coordinator: Architecture edits for the seams above (§6.1 `settings`, `tags`, `excluded_at`, `prompt_version`; §6.2 `ocr_spend`, `users.ocr_cap_usd`, `jobs.priority`, `confirmations`; §7 scope, wake-up, priority; §11 signatures; §12 `OCR_MAX_TOKENS`, `OCR_BATCH_MIN`, `OCR_USER_CONCURRENCY`, `NOTIFICATIONS`, `NOTIFY_MIN_GAP_SECONDS`), then spawn F, H, I (wave 1) and G against fakes.
