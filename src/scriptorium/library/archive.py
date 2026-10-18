@@ -27,11 +27,17 @@ forward (idempotently) before the next change to that document and by
 between its old entries leaving and the new ones arriving, never a mix of two versions after
 recovery.
 
-One writer per account: the worker. Methods are thread-safe within one :class:`Archive`.
+**Durability.** Content is fsynced before it is linked or renamed into place, and every
+directory a change creates is fsynced into its parent before the change's journal is written.
+
+One writer per account: the worker. Methods are thread-safe within one :class:`Archive`, and
+every change also holds an exclusive ``flock`` on ``<account>/.archive.lock`` (POSIX), so a
+second process or a second :class:`Archive` on the same account waits instead of interleaving.
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -41,9 +47,10 @@ import re
 import secrets
 import shutil
 import stat
+import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -62,6 +69,9 @@ from scriptorium.library.layout import (
 from scriptorium.logging import log_event
 from scriptorium.users.store import AccountPaths
 
+if sys.platform != "win32":
+    import fcntl
+
 __all__ = ["HOLDING_DIR", "Archive", "Committed", "Staging"]
 
 log = logging.getLogger(__name__)
@@ -71,6 +81,7 @@ HOLDING_DIR: Final = ".holding"
 _INCOMING: Final = ".incoming"
 _JOURNAL: Final = ".journal"
 _TREE: Final = "tree"
+_LOCK_FILE: Final = ".archive.lock"
 _JOURNAL_VERSION: Final = 1
 _JOB_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _JOURNAL_NAME_RE: Final = re.compile(r"([0-9a-f-]{36})\.[0-9]{20}\.[0-9a-f]{8}\.json")
@@ -200,10 +211,13 @@ class Archive:
         self._lock = threading.RLock()
         self._active: set[str] = set()
         self._inflight: set[str] = set()
+        self._lock_fd: int | None = None
+        self._lock_depth = 0
         for directory in (paths.root, paths.blobs, paths.library, paths.tombstones):
-            self._fs.mkdir(directory)
-        self._fs.mkdir(paths.staging)
+            self._mkdir_durable(directory)
+        self._mkdir_durable(paths.staging)
         self._root = resolve_inside(paths.root, paths.root)
+        self._lock_path = self._root / _LOCK_FILE
         self._blobs = self._subdir(paths.blobs)
         self._lib = self._subdir(paths.library)
         self._tomb = self._subdir(paths.tombstones)
@@ -223,6 +237,46 @@ class Archive:
             raise RefusedError("an archive directory is not a plain directory in the account")
         return real
 
+    @contextlib.contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """This instance's lock plus an exclusive ``flock`` on the account (re-entrant).
+
+        Every change holds it, so a second worker process, or a second :class:`Archive` on
+        the same account, waits rather than recovering or sweeping a change in flight.
+        """
+        with self._lock:
+            if self._lock_depth == 0:
+                flags = os.O_RDWR | os.O_CREAT | _NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                fd = os.open(self._lock_path, flags, 0o600)
+                try:
+                    if sys.platform != "win32":
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                self._lock_fd = fd
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+                if self._lock_depth == 0 and self._lock_fd is not None:
+                    fd, self._lock_fd = self._lock_fd, None
+                    os.close(fd)  # closing the descriptor releases the flock
+
+    def _mkdir_durable(self, path: Path) -> None:
+        """``mkdir -p``, then fsync the parent of every directory it created."""
+        created: list[Path] = []
+        probe = path
+        while not os.path.lexists(probe):
+            created.append(probe)
+            probe = probe.parent
+        if not created:
+            return
+        self._fs.mkdir(path)
+        for directory in reversed(created):  # outermost first
+            self._fs.fsync_dir(directory.parent)
+
     # ---- staging and blobs ---------------------------------------------------------------
 
     def stage(self, uuid: str, job: str) -> Staging:
@@ -231,7 +285,7 @@ class Archive:
         if not isinstance(job, str) or _JOB_RE.fullmatch(job) is None:
             raise RefusedError("job identifier is malformed")
         name = f"{uuid}.{job}"
-        with self._lock:
+        with self._exclusive():
             if name in self._active:
                 raise RefusedError("this document is already being staged by this job")
             path = self._staging / name
@@ -316,8 +370,9 @@ class Archive:
         The new tree is prepared in the staging directory from hardlinks to the blobs (copies
         where hardlinks fail), fsynced, and swapped in by a journalled sequence of renames:
         the previous entries of the document move to
-        ``library/.holding/<uuid>/<generation>/``; nothing is unlinked. Every name must be an
-        allowlisted name of ``staged.uuid`` and every blob must already be stored.
+        ``library/.holding/<uuid>/<generation>/``; nothing is unlinked. Every name must be a
+        file name of ``staged.uuid`` (``<uuid>.<ext>`` or ``<uuid>/<page>.rm``) and every blob
+        must already be stored.
         """
         uuid = staged.uuid
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
@@ -327,11 +382,11 @@ class Archive:
             raise RefusedError("a commit needs at least one file")
         blobs: dict[str, Path] = {}
         for name, sha in files.items():
-            if not belongs_to(name, uuid):
+            if name == uuid or not belongs_to(name, uuid):  # the bare <uuid> is a directory
                 raise RefusedError("file name is not on the allowlist for this document")
             _require_sha(sha)
             blobs[name] = self._existing_blob(sha)
-        with self._lock:
+        with self._exclusive():
             self._check_staging(staged)
             self._recover(uuid)
             tree = staged.path / _TREE
@@ -342,6 +397,8 @@ class Archive:
                     self._fs.mkdir(dst.parent)
                 self._place_blob(blobs[name], dst)
             self._fsync_tree(tree)
+            self._fs.fsync_dir(staged.path)  # the tree must survive until its plan is applied
+            self._fs.fsync_dir(self._staging)
 
             old = self._present(self._lib, uuid)
             moves: list[_Move] = []
@@ -351,12 +408,13 @@ class Archive:
                 moves += [_Move(self._lib / e, held / e, "hold") for e in old]
             top_level = sorted({name.split("/", 1)[0] for name in files})
             moves += [_Move(tree / e, self._lib / e, "place") for e in top_level]
+            self._require_sources(moves)
             # Set before the journal can exist: from then on the tree must outlive a failure.
             journal = staged._pending = self._journal_path_for(uuid)
             self._write_journal(
                 journal, uuid, "commit", moves, [], generation=generation, hash_root=hash_root
             )
-            self._apply(journal, moves, [])
+            self._apply(journal, moves, [], live=True)
             staged._pending = None
             staged.committed = True
         return Committed(
@@ -394,7 +452,7 @@ class Archive:
         holds an older tombstone, that one moves to ``library/.holding/<uuid>/tombstone/``.
         """
         _require_uuid(uuid)
-        with self._lock:
+        with self._exclusive():
             self._recover(uuid)
             old = self._present(self._lib, uuid)
             if not old:
@@ -408,11 +466,12 @@ class Archive:
                     held = self._claim_holding(uuid, "tombstone")
                     moves += [_Move(tdir / e, held / e, "hold") for e in existing]
             else:
-                self._fs.mkdir(tdir)
+                self._mkdir_durable(tdir)
             moves += [_Move(self._lib / e, tdir / e, "place") for e in old]
+            self._require_sources(moves)
             journal = self._journal_path_for(uuid)
             self._write_journal(journal, uuid, "tombstone", moves, [])
-            self._apply(journal, moves, [])
+            self._apply(journal, moves, [], live=True)
 
     def untombstone(self, uuid: str) -> None:
         """Move ``tombstones/<uuid>/`` back into the library; never unlinks.
@@ -422,7 +481,7 @@ class Archive:
         ``library/.holding/<uuid>/tombstone/`` instead, so two versions never mix.
         """
         _require_uuid(uuid)
-        with self._lock:
+        with self._exclusive():
             self._recover(uuid)
             tdir = self._tomb / uuid
             if not os.path.lexists(tdir):
@@ -437,9 +496,10 @@ class Archive:
                 moves = [_Move(tdir / e, held / e, "hold") for e in entries]
             else:
                 moves = [_Move(tdir / e, self._lib / e, "place") for e in entries]
+            self._require_sources(moves)
             journal = self._journal_path_for(uuid)
             self._write_journal(journal, uuid, "untombstone", moves, [tdir])
-            self._apply(journal, moves, [tdir])
+            self._apply(journal, moves, [tdir], live=True)
 
     # ---- reading -------------------------------------------------------------------------
 
@@ -481,7 +541,7 @@ class Archive:
         staging directories, and logged. Only ``staging/`` is ever deleted from, and never a
         directory or partial blob that this instance is using.
         """
-        with self._lock:
+        with self._exclusive():
             stuck = self._recover_all()
             removed = 0
             for name in sorted(os.listdir(self._staging)):
@@ -512,7 +572,7 @@ class Archive:
             raise RefusedError("this staging directory was already committed")
 
     def _release(self, staged: Staging) -> None:
-        with self._lock:
+        with self._exclusive():
             if staged._archive is not self or staged.name not in self._active:
                 return
             self._active.discard(staged.name)
@@ -549,7 +609,7 @@ class Archive:
         """Create and return a fresh ``library/.holding/<uuid>/<label>[.n]/``."""
         base = self._lib / HOLDING_DIR / uuid
         resolve_inside(self._lib, base)  # before mkdir: a planted symlink must not be followed
-        self._fs.mkdir(base)
+        self._mkdir_durable(base)
         resolve_inside(self._lib, base)
         for n in range(_MAX_HOLDING_SUFFIX):
             candidate = base / (label if n == 0 else f"{label}.{n}")
@@ -578,7 +638,7 @@ class Archive:
     ) -> None:
         """Write the plan to ``path`` atomically (temp file, fsync, rename, dir fsync)."""
         directory = path.parent
-        self._fs.mkdir(directory)
+        self._mkdir_durable(directory)
         doc = {
             "v": _JOURNAL_VERSION,
             "op": op,
@@ -600,8 +660,22 @@ class Archive:
     def _rel(self, path: Path) -> str:
         return path.relative_to(self._root).as_posix()
 
-    def _apply(self, journal: Path, moves: Sequence[_Move], rmdirs: Sequence[Path]) -> None:
-        """Make every move of a plan (idempotently), then retire the journal."""
+    @staticmethod
+    def _require_sources(moves: Sequence[_Move]) -> None:
+        """Before a plan is journalled: everything it moves must still be there."""
+        if not all(os.path.lexists(move.src) for move in moves):
+            raise RefusedError("the archive changed while a change was being planned")
+
+    def _apply(
+        self, journal: Path, moves: Sequence[_Move], rmdirs: Sequence[Path], *, live: bool
+    ) -> None:
+        """Make every move of a plan (idempotently), then retire the journal.
+
+        ``live`` is the change being made now: a source that has vanished means something
+        outside this archive interfered, so it raises and the journal stays for recovery
+        rather than report success. In recovery (``live=False``) a missing source is a move
+        that cannot be made any more; it is logged and the rest of the plan goes ahead.
+        """
         touched: set[Path] = set()
         for move in moves:
             src_there, dst_there = os.path.lexists(move.src), os.path.lexists(move.dst)
@@ -610,9 +684,11 @@ class Archive:
             if dst_there:
                 raise RefusedError("archive change conflicts with what is on disk")
             if not src_there:
+                if live:
+                    raise RefusedError("an entry vanished while the archive was changing it")
                 log_event(log, "archive_journal_source_missing", level=logging.WARNING)
                 continue
-            self._fs.mkdir(move.dst.parent)
+            self._mkdir_durable(move.dst.parent)
             self._fs.rename(move.src, move.dst)
             touched.update((move.src.parent, move.dst.parent))
         for directory in rmdirs:
@@ -650,7 +726,7 @@ class Archive:
         """Roll forward every pending plan of ``uuid``; raises if one cannot be applied."""
         for path, _ in self._journals(uuid):
             moves, rmdirs = self._load_journal(path, uuid)
-            self._apply(path, moves, rmdirs)
+            self._apply(path, moves, rmdirs, live=False)
             log_event(log, "archive_journal_recovered", count=len(moves))
 
     def _recover_all(self) -> set[str]:
@@ -661,7 +737,7 @@ class Archive:
                 continue
             try:
                 moves, rmdirs = self._load_journal(path, uuid)
-                self._apply(path, moves, rmdirs)
+                self._apply(path, moves, rmdirs, live=False)
             except (RefusedError, OSError, ValueError):
                 stuck.add(uuid)
                 log_event(log, "archive_journal_stuck", level=logging.ERROR, exc_info=True)

@@ -28,6 +28,9 @@ from scriptorium.library import archive as archive_mod
 from scriptorium.library.archive import HOLDING_DIR, Archive, Committed
 from scriptorium.users.store import AccountPaths, account_paths
 
+if sys.platform != "win32":
+    import fcntl
+
 UID = "0123456789abcdef"
 ACCT = "01J9Z8Y7X6W5V4T3S2R1Q0P0N0"
 DOC = "00000000-0000-4000-8000-0000000000d1"
@@ -112,6 +115,10 @@ class RecordingFs(archive_mod._Fs):
     def rmdir(self, path: Path) -> None:
         self._note("rmdir", path)
         super().rmdir(path)
+
+    def fsync_dir(self, path: Path) -> None:
+        self._note("fsync_dir", path)
+        super().fsync_dir(path)
 
 
 def _under(path: str, roots: list[str]) -> bool:
@@ -390,6 +397,7 @@ def test_commit_two_documents_do_not_touch_each_other(
     ("files", "generation", "hash_root"),
     [
         ({"../x": "a" * 64}, 1, HASH_ROOT),
+        ({DOC: "a" * 64}, 1, HASH_ROOT),  # the bare <uuid> is the page directory, not a file
         ({f"{DOC2}.content": "a" * 64}, 1, HASH_ROOT),  # another document's file
         ({f"{DOC}.txt": "a" * 64}, 1, HASH_ROOT),
         ({f"{DOC}/../{DOC2}.content": "a" * 64}, 1, HASH_ROOT),
@@ -443,6 +451,112 @@ def test_commit_copies_when_hardlinks_fail(
     for name, path in archive.current_files(DOC).items():
         assert os.stat(path).st_ino != os.stat(archive.blob_path(sha(V1[name]))).st_ino
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o400
+
+
+def test_commit_refuses_when_a_source_vanished_before_the_plan(
+    archive: Archive, paths: AccountPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit(archive, V1, 1)
+    mapping = store(archive, V2)
+    staged = archive.stage(DOC, "j")
+    claim = archive._claim_holding
+
+    def claim_then_interfere(uuid: str, label: str) -> Path:
+        held = claim(uuid, label)
+        (staged.path / "tree" / f"{DOC}.content").unlink()  # something outside the archive
+        return held
+
+    monkeypatch.setattr(archive, "_claim_holding", claim_then_interfere)
+    with staged, pytest.raises(RefusedError):
+        archive.commit(staged, mapping, 2, HASH_ROOT)
+    assert tree(paths.library) == V1  # nothing was journalled or moved
+    assert os.listdir(paths.staging / ".journal") == []
+    assert not staged.path.exists()
+
+
+def test_a_source_vanishing_mid_swap_fails_the_commit_and_recovery_finishes(
+    archive: Archive, rec: RecordingFs, paths: AccountPaths
+) -> None:
+    commit(archive, V1, 1)
+    mapping = store(archive, V2)
+    staged = archive.stage(DOC, "j")
+    victim = staged.path / "tree" / f"{DOC}.content"
+
+    def interfere(op: str, _src: Path, dst: Path | None) -> bool:
+        if op == "rename" and dst is not None and HOLDING_DIR in str(dst) and victim.exists():
+            victim.unlink()  # something outside the archive, after the plan was journalled
+        return False
+
+    rec.crash_when = interfere
+    with staged, pytest.raises(RefusedError):
+        archive.commit(staged, mapping, 2, HASH_ROOT)  # the caller must not record success
+    rec.crash_when = None
+    assert len(os.listdir(paths.staging / ".journal")) == 1  # kept for recovery
+    assert staged.path.exists()  # with the tree it still needs
+
+    Archive(paths).sweep_staging()
+    assert tree(paths.library) == {k: v for k, v in V2.items() if k != f"{DOC}.content"}
+    assert holding(paths, "2") == V1
+    assert os.listdir(paths.staging / ".journal") == []
+
+
+def test_new_directories_are_fsynced_into_their_parents(
+    archive: Archive, rec: RecordingFs, paths: AccountPaths
+) -> None:
+    commit(archive, V1, 1)  # creates the journal directory
+    commit(archive, V2, 2)  # creates library/.holding/<uuid>/2
+    archive.tombstone(DOC)  # creates tombstones/<uuid>
+    staging = os.path.realpath(paths.staging)
+    journals = os.path.join(staging, ".journal") + os.sep
+    incoming = os.path.join(staging, ".incoming")
+    calls = rec.calls
+    checked = 0
+    for i, (op, path, _other, _existed) in enumerate(calls):
+        if op != "mkdir" or path == incoming:  # partial blobs need no durable directory
+            continue
+        # Durable before the next plan becomes binding (its journal renamed into place).
+        end = next(
+            (
+                j
+                for j in range(i + 1, len(calls))
+                if calls[j][0] == "rename" and (calls[j][2] or "").startswith(journals)
+            ),
+            len(calls),
+        )
+        synced = {c[1] for c in calls[i + 1 : end] if c[0] == "fsync_dir"}
+        assert os.path.dirname(path) in synced, path
+        checked += 1
+    assert checked >= 6
+    synced_all = {c[1] for c in calls if c[0] == "fsync_dir"}
+    library = os.path.realpath(paths.library)
+    for directory in (library, os.path.join(library, HOLDING_DIR), staging):
+        assert directory in synced_all, directory
+    assert os.path.realpath(paths.tombstones) in synced_all
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX")
+def test_changes_wait_for_another_writer_on_the_account(
+    archive: Archive, paths: AccountPaths
+) -> None:
+    commit(archive, V1, 1)
+    done = threading.Event()
+
+    def tombstone() -> None:
+        archive.tombstone(DOC)
+        done.set()
+
+    fd = os.open(paths.root / ".archive.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # another worker is mid-change on this account
+        worker = threading.Thread(target=tombstone)
+        worker.start()
+        assert not done.wait(0.3)
+        assert tree(paths.library) == V1
+    finally:
+        os.close(fd)
+    assert done.wait(10)
+    worker.join()
+    assert tree(paths.tombstones / DOC) == V1
 
 
 # ---- staging --------------------------------------------------------------------------------
