@@ -99,7 +99,7 @@ from scriptorium.cloud.sync import SyncOnce, SyncReport, SyncSettings
 from scriptorium.config import Settings
 from scriptorium.db.connect import to_db_time, utc_now
 from scriptorium.db.migrations import SchemaMismatch
-from scriptorium.errors import ScriptoriumError
+from scriptorium.errors import NotFoundError, ScriptoriumError
 from scriptorium.jobs.kinds import (
     GONE_RESULT,
     OCR,
@@ -555,8 +555,16 @@ class Worker:
             log_event(logger, "account_loop_start", acct=acct)
 
     def context(self, uid: str, acct: str) -> AccountContext:
-        """The account's paths and index; raises ``SchemaMismatch`` until it is migrated."""
+        """The account's paths and index; raises ``SchemaMismatch`` until it is migrated.
+
+        Raises :class:`NotFoundError` for an account that is unknown or was removed
+        (``disconnect_remarkable(keep_archive=false)`` moved its directory), and forgets its
+        cached context: a job that starts late is never handed the moved index."""
         key = (uid, acct)
+        row = self.store.account(uid, acct)
+        if row is None or row.removed_at is not None:
+            self.forget_context(uid, acct)
+            raise NotFoundError("The account was removed.")
         with self._contexts_lock:
             ctx = self._contexts.get(key)
             if ctx is None:
@@ -565,6 +573,22 @@ class Worker:
                 ctx = AccountContext(uid, acct, paths, index)
                 self._contexts[key] = ctx
             return ctx
+
+    def forget_context(self, uid: str, acct: str) -> None:
+        """Close and drop the account's cached context (its account was removed)."""
+        with self._contexts_lock:
+            ctx = self._contexts.pop((uid, acct), None)
+        if ctx is not None:
+            ctx.index.close()
+            log_event(logger, "account_context_closed", acct=acct)
+
+    def forget_if_removed(self, uid: str, acct: str) -> bool:
+        """:meth:`forget_context` if the account is unknown or removed; True if it was."""
+        row = self.store.account(uid, acct)
+        if row is not None and row.removed_at is None:
+            return False
+        self.forget_context(uid, acct)
+        return True
 
     def device_token(self, uid: str, acct: str) -> str | None:
         value = SecretBox(self.settings, uid).open(device_token_name(acct))
@@ -749,7 +773,10 @@ class Worker:
         if await asyncio.to_thread(self._account_gone, job):
             return dict(GONE_RESULT)
         assert job.acct is not None
-        ctx = await asyncio.to_thread(self.context, job.uid, job.acct)
+        try:
+            ctx = await asyncio.to_thread(self.context, job.uid, job.acct)
+        except NotFoundError:  # removed since the check above
+            return dict(GONE_RESULT)
         source = await asyncio.to_thread(find_source, ctx.paths, ctx.index, spec)
         if source is None:
             return dict(GONE_RESULT)
@@ -956,6 +983,20 @@ class AccountLoop:
                 delay = backoff_delay(self.worker.settings.poll_seconds, self.backoffs, None)
             self._ended_at = asyncio.get_running_loop().time()
             await self.pause(stop, delay)
+        await self._release()
+
+    async def _release(self) -> None:
+        """The loop stopped (the supervisor no longer lists the account): if the account was
+        removed, close and drop its cached context so nothing later uses the moved index.
+        A poll the watchdog abandoned may still be using it: then it is left to ``close``."""
+        if self._inflight is not None and not self._inflight.done():
+            return
+        try:
+            await asyncio.to_thread(self.worker.forget_if_removed, self.uid, self.acct)
+        except Exception:
+            log_event(
+                logger, "account_release_failed", level=logging.ERROR, exc_info=True, acct=self.acct
+            )
 
     async def pause(self, stop: asyncio.Event, delay: float) -> None:
         """Wait ``delay`` seconds before the next poll, or less after a :meth:`poke`."""
@@ -979,6 +1020,9 @@ class AccountLoop:
             except SchemaMismatch:
                 log_event(logger, "account_waiting_for_schema", acct=self.acct)
                 await _wait(stop, self.worker.timing.schema_wait_s)
+            except NotFoundError:  # removed before its loop started
+                log_event(logger, "account_start_skipped", acct=self.acct, reason="removed")
+                return None
         return None
 
     def start(self, ctx: AccountContext) -> None:

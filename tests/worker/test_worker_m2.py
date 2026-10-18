@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ import pytest
 from scriptorium.accounts import STATE_LAST_POLL_OUTCOME, poll_lock
 from scriptorium.cloud.client import CloudClient
 from scriptorium.cloud.sync import SyncReport
+from scriptorium.errors import NotFoundError
 from scriptorium.jobs.kinds import GONE_RESULT, RenderSpec
 from scriptorium.jobs.queue import PRIORITY_LOW, PRIORITY_NORMAL, JobQueue
 from scriptorium.library import pages as pg
@@ -235,6 +237,53 @@ async def test_a_render_that_loses_the_race_with_a_removal_recreates_nothing(
     done = linked.queue.get(mover[0], linked.uid)
     assert done is not None and (done.state, done.result) == ("done", dict(GONE_RESULT))
     assert not any(moved.glob("pages/*/*.png"))
+
+
+def test_the_context_of_a_removed_account_is_refused_and_closed(linked: Linked) -> None:
+    ctx = linked.context()
+    assert linked.worker.context(linked.uid, linked.acct) is ctx  # cached
+    linked.store.mark_removed(linked.uid, linked.acct, at=T0)
+
+    with pytest.raises(NotFoundError):
+        linked.worker.context(linked.uid, linked.acct)
+
+    assert (linked.uid, linked.acct) not in linked.worker._contexts
+    with pytest.raises(sqlite3.ProgrammingError):  # the moved index is closed
+        ctx.index.document(NOTEBOOK)
+
+
+async def test_a_stopped_loop_of_a_removed_account_closes_its_context(linked: Linked) -> None:
+    loop = AccountLoop(linked.worker, linked.row)
+    stop = asyncio.Event()
+    task = asyncio.create_task(loop.run(stop))
+    for _ in range(500):
+        if loop.archive is not None and linked.cloud.requests:
+            break
+        await asyncio.sleep(0.01)
+    assert loop.archive is not None
+    ctx = linked.worker._contexts[(linked.uid, linked.acct)]
+
+    linked.store.mark_removed(linked.uid, linked.acct, at=T0)
+    stop.set()  # what the supervisor does once active_accounts no longer lists it
+    await asyncio.wait_for(task, 10)
+
+    assert (linked.uid, linked.acct) not in linked.worker._contexts
+    with pytest.raises(sqlite3.ProgrammingError):
+        ctx.index.document(NOTEBOOK)
+
+
+async def test_a_stopped_loop_of_a_kept_account_keeps_its_context(linked: Linked) -> None:
+    loop = AccountLoop(linked.worker, linked.row)
+    stop = asyncio.Event()
+    task = asyncio.create_task(loop.run(stop))
+    for _ in range(500):
+        if loop.archive is not None:
+            break
+        await asyncio.sleep(0.01)
+    stop.set()  # e.g. deactivated by connect_remarkable(replace=true): still readable
+    await asyncio.wait_for(task, 10)
+
+    assert linked.worker.context(linked.uid, linked.acct).index.document(NOTEBOOK) is not None
 
 
 async def test_a_poll_does_nothing_once_the_directory_has_moved(
