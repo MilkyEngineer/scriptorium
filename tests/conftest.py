@@ -46,6 +46,21 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_claude_api(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches the Claude API (M2 breakdown §4): the anthropic SDK's transport is
+    httpx2's, which refuses here. Only tests marked ``live_ocr`` (tests/live, behind
+    SCRIPTORIUM_LIVE_OCR_TEST=1) may use it; mocked transports are unaffected."""
+    if request.node.get_closest_marker("live_ocr") is not None:
+        return
+    import httpx2
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("a test tried to reach the network through httpx2")
+
+    monkeypatch.setattr(httpx2.HTTPTransport, "handle_request", refuse)
+
+
 def make_settings(**overrides: Any) -> Settings:
     values: dict[str, Any] = {
         "public_url": PUBLIC_URL,

@@ -74,3 +74,6 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 filterwarnings = ["error::DeprecationWarning:scriptorium.*"]
+markers = [
+    "live_ocr: calls the real Claude API; tests/live only, behind SCRIPTORIUM_LIVE_OCR_TEST=1",
+]

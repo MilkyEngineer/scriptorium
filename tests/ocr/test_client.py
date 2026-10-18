@@ -604,3 +604,18 @@ def test_only_the_client_imports_the_sdk() -> None:
         )
     )
     assert importers == ["ocr/client.py"]
+
+
+# ---- the test suite's own guard -------------------------------------------------------------
+
+
+def test_no_test_can_reach_the_claude_api() -> None:
+    """tests/conftest.py refuses httpx2's network transport outside tests/live (§4)."""
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    with pytest.raises(AssertionError, match="network"):
+        httpx2.HTTPTransport().handle_request(request)
+    # A real client without a mocked transport fails before anything leaves the machine.
+    client = OcrClient(SecretStr(KEY), model=MODEL, max_tokens=1024, sleep=lambda _s: None)
+    with client, pytest.raises(OcrUnavailable) as caught:
+        client.validate_key()
+    assert caught.value.reason == "connection"
