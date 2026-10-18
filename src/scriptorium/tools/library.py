@@ -285,15 +285,17 @@ def _hit_item(hit: SearchHit | DocumentHit) -> dict[str, object]:
 
 
 async def search(ctx: ToolContext, args: SearchArgs) -> CallToolResult:
-    """Search your reMarkable library: the transcripts of transcribed pages, document names,
-    folder paths and tag names, every word of query must match. Page results come first,
+    """Search your reMarkable library: the transcripts of transcribed pages together with their
+    document's name, folder path and the tags of the document and page (not of its folders),
+    every word of query must match. Page results come first,
     best match first, each with its document, 1-based page number (null if the page is no
     longer in the document), a snippet, its tags, folder_tags (the tags of every folder above
     the document), and current (false when the snippet is from an older version of the
     page); read_page fetches the full text. Documents with no transcribed page are found by
-    name or tag and follow as document results. folder limits the search to everything below
-    a folder; tags keeps results tagged with any of the given names, on the page, its
-    document or a folder above it. Use next_cursor to continue."""
+    their name or their own tags only, not by folder path or folder tags, and follow as
+    document results. folder limits the search to everything below a folder; tags keeps
+    results tagged with any of the given names, on the page, its document or a folder above
+    it: a folder's tag name filters but is not searchable text. Use next_cursor to continue."""
     account = await use_account(ctx, args.account)
     folder: str | None = None
     if args.folder is not None:
