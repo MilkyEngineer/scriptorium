@@ -33,6 +33,8 @@ ALLOWED_FIELDS: Final = frozenset(
         "host",  # URL host only
         "version",
         "count",
+        "tombstoned",  # documents moved to tombstones/ in this poll (a count, never UUIDs)
+        "untombstoned",
     }
 )
 UID_PREFIX_LEN: Final = 12

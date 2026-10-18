@@ -831,6 +831,8 @@ class AccountLoop:
             outcome=report.outcome,
             reason=report.reason if report.outcome != "anomaly" else report.anomaly,
             count=len(report.committed),
+            tombstoned=len(report.tombstoned),
+            untombstoned=len(report.untombstoned),
             bytes=report.bytes_downloaded,
             duration_ms=round((worker.monotonic() - started) * 1000, 1),
         )

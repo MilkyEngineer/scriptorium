@@ -801,6 +801,8 @@ class SyncOnce:
             outcome=outcome,
             reason=reason,
             count=len(run.committed),
+            tombstoned=len(run.tombstoned),
+            untombstoned=len(run.untombstoned),
             bytes=run.bytes_downloaded,
             duration_ms=round((self._monotonic() - run.started_mono) * 1000, 1),
         )
