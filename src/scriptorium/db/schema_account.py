@@ -263,5 +263,16 @@ END;
 """,
 )
 
-ACCOUNT_STEPS: Final[tuple[Step, ...]] = (V1, V2, V3, V4)
+V5: Final = Step(
+    name="account index v5: transcript prompt version",
+    # Workstream G's step. V4 (tags) is workstream H's: at integration the sequence is
+    # (V1, V2, V3, V4, V5), whichever branch merges first.
+    sql="""
+-- The version of ocr/prompt.md a server-side transcript was made with (§8.2); NULL for
+-- transcripts saved by the client in lazy mode and for every transcript before M2.
+ALTER TABLE transcripts ADD COLUMN prompt_version TEXT;
+""",
+)
+
+ACCOUNT_STEPS: Final[tuple[Step, ...]] = (V1, V2, V3, V4, V5)
 """Append-only. ``len(ACCOUNT_STEPS)`` is the per-account schema version."""

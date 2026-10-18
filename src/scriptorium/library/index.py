@@ -140,6 +140,7 @@ class TranscriptRow:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None
+    prompt_version: str | None = None  # ocr/prompt.md version (server-side OCR, M2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -914,17 +915,35 @@ class Index:
     # ---- transcripts --------------------------------------------------------------------
 
     def put_transcript(
-        self, document: str, page_id: str, content_hash: str, text: str, model: str, mode: str
+        self,
+        document: str,
+        page_id: str,
+        content_hash: str,
+        text: str,
+        model: str,
+        mode: str,
+        *,
+        prompt_version: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         """Store (or replace) the transcript of one version of ``document``'s page ``page_id``.
 
         The document's page must be in the index (``not_found`` otherwise); a copy of the
         page in another document has its own transcript. Whether ``content_hash`` is the
         page's *current* hash is the caller's check (``save_transcript`` answers ``stale_hash``);
-        a transcript of an older version is still valid for that version.
+        a transcript of an older version is still valid for that version. Server-side OCR
+        records the prompt version, the token counts and the cost (§6.1, §8.2); a replacement
+        takes the new values (``None`` where the new transcript has none).
         """
         if mode not in TRANSCRIPT_MODES:
             raise InvalidArgumentError("Unknown transcript mode.")
+        for count in (input_tokens, output_tokens):
+            if count is not None and (type(count) is not int or count < 0):
+                raise InvalidArgumentError("Token counts are non-negative integers.")
+        if cost_usd is not None and not 0 <= cost_usd < float("inf"):
+            raise InvalidArgumentError("A cost is a non-negative amount.")
         with self.transaction():
             row = self._conn.execute(
                 "SELECT 1 FROM pages WHERE document = ? AND uuid = ?", (document, page_id)
@@ -936,12 +955,15 @@ class Index:
             tags_text = _tags_text(on_document.get("", set()) | on_document.get(page_id, set()))
             self._conn.execute(
                 "INSERT INTO transcripts(page, content_hash, document, text, model, mode, "
-                "created_at, doc_name, doc_path, doc_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "created_at, doc_name, doc_path, doc_tags, prompt_version, input_tokens, "
+                "output_tokens, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(document, page, content_hash) DO UPDATE SET text = excluded.text, "
                 "model = excluded.model, mode = excluded.mode, "
                 "created_at = excluded.created_at, doc_name = excluded.doc_name, "
                 "doc_path = excluded.doc_path, doc_tags = excluded.doc_tags, "
-                "input_tokens = NULL, output_tokens = NULL, cost_usd = NULL",
+                "prompt_version = excluded.prompt_version, "
+                "input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens, "
+                "cost_usd = excluded.cost_usd",
                 (
                     page_id,
                     content_hash,
@@ -953,6 +975,10 @@ class Index:
                     name,
                     path,
                     tags_text,
+                    prompt_version,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
                 ),
             )
 
@@ -976,7 +1002,51 @@ class Index:
             input_tokens=r["input_tokens"],
             output_tokens=r["output_tokens"],
             cost_usd=r["cost_usd"],
+            prompt_version=r["prompt_version"],
         )
+
+    def pages_without_transcript(
+        self, *, folders: Sequence[str], recursive: bool = True, limit: int
+    ) -> list[PageRow]:
+        """Current pages under ``folders`` with no transcript of their current version.
+
+        ``folders`` are folder (``CollectionType``) UUIDs; with ``recursive`` every document
+        below them counts, otherwise only their direct children. Only live documents: not
+        tombstoned, not in the trash, not excluded from the sync scope. A page copied into
+        another document is listed under each document (transcripts are per document).
+        Sorted by document UUID and page index; at most ``limit`` rows. Parent links come
+        from cloud metadata, so the walk tolerates cycles (``UNION`` visits a folder once).
+        """
+        _check_limit(limit)
+        roots = sorted(set(folders))
+        if not roots:
+            return []
+        marks = ", ".join("?" * len(roots))
+        # A folder that is itself in the trash is not live; nor is anything below it.
+        start = (
+            f"SELECT uuid FROM documents WHERE uuid IN ({marks}) "  # noqa: S608 - placeholders
+            "AND type = 'CollectionType' AND deleted_at IS NULL AND parent IS NOT 'trash'"
+        )
+        if recursive:
+            tree = (
+                f"WITH RECURSIVE tree(uuid) AS ({start} "  # noqa: S608 - fixed clauses
+                "UNION SELECT d.uuid FROM documents d JOIN tree ON d.parent = tree.uuid "
+                "WHERE d.type = 'CollectionType' AND d.deleted_at IS NULL) "
+            )
+        else:
+            tree = f"WITH tree(uuid) AS ({start}) "
+        sql = (
+            tree  # noqa: S608 - fixed clauses, values bound
+            + "SELECT p.* FROM pages p JOIN documents d ON d.uuid = p.document "
+            "WHERE d.parent IN (SELECT uuid FROM tree) AND d.type = 'DocumentType' "
+            "AND d.deleted_at IS NULL AND d.excluded_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.document = p.document "
+            "AND t.page = p.uuid AND t.content_hash = p.content_hash) "
+            "ORDER BY p.document, p.idx LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, (*roots, limit)).fetchall()
+        return [_page(r) for r in rows]
 
     def search(
         self,

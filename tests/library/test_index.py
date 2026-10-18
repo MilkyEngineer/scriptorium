@@ -920,3 +920,126 @@ def test_counts(index: Index) -> None:
         "rendered": 1,
         "transcripts": 1,
     }
+
+
+# ---- server-side OCR (M2) -----------------------------------------------------------------
+
+
+def test_put_transcript_records_prompt_version_tokens_and_cost(index: Index) -> None:
+    index.upsert_document(doc(1, "A"))
+    index.replace_pages(uid(1), [pr(0, 0, "h0")])
+    index.put_transcript(
+        uid(1),
+        uid(100),
+        "h0",
+        "text",
+        "model-x",
+        "server",
+        prompt_version="3",
+        input_tokens=1200,
+        output_tokens=80,
+        cost_usd=0.0042,
+    )
+    got = index.transcript(uid(1), uid(100), "h0")
+    assert got is not None
+    assert (got.prompt_version, got.input_tokens, got.output_tokens, got.cost_usd) == (
+        "3",
+        1200,
+        80,
+        0.0042,
+    )
+    # A replacement takes the new values, including "none" from a lazy save.
+    index.put_transcript(uid(1), uid(100), "h0", "again", "model-y", "lazy")
+    got = index.transcript(uid(1), uid(100), "h0")
+    assert got is not None
+    assert (got.prompt_version, got.input_tokens, got.output_tokens, got.cost_usd) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    bad: dict[str, Any]
+    for bad in (
+        {"input_tokens": -1},
+        {"output_tokens": 1.5},
+        {"input_tokens": True},
+        {"cost_usd": -0.01},
+        {"cost_usd": float("nan")},
+        {"cost_usd": float("inf")},
+    ):
+        with pytest.raises(InvalidArgumentError):
+            index.put_transcript(uid(1), uid(100), "h0", "t", "m", "user", **bad)
+
+
+def _ocr_tree(index: Index) -> None:
+    """Folder 1 > folder 2 > doc 21; folder 1 > doc 11 (2 pages); folder 3 > doc 31."""
+    index.upsert_document(folder(1, "Inbox"))
+    index.upsert_document(folder(2, "Sub", parent=uid(1)))
+    index.upsert_document(folder(3, "Other"))
+    for n, parent, count in ((11, 1, 2), (21, 2, 1), (31, 3, 1)):
+        index.upsert_document(doc(n, f"D{n}", parent=uid(parent)))
+        index.replace_pages(
+            uid(n),
+            [PageRow(uid(1000 + n * 10 + i), uid(n), i, f"h{n}-{i}") for i in range(count)],
+        )
+
+
+def _ids(rows: list[PageRow]) -> list[tuple[str, int]]:
+    return [(r.document, r.idx) for r in rows]
+
+
+def test_pages_without_transcript_walks_folders(index: Index) -> None:
+    _ocr_tree(index)
+    assert _ids(index.pages_without_transcript(folders=[uid(1)], limit=10)) == [
+        (uid(11), 0),
+        (uid(11), 1),
+        (uid(21), 0),
+    ]
+    direct = index.pages_without_transcript(folders=[uid(1)], recursive=False, limit=10)
+    assert _ids(direct) == [(uid(11), 0), (uid(11), 1)]
+    assert _ids(index.pages_without_transcript(folders=[uid(3), uid(2)], limit=10)) == [
+        (uid(21), 0),
+        (uid(31), 0),
+    ]
+    assert _ids(index.pages_without_transcript(folders=[uid(1)], limit=1)) == [(uid(11), 0)]
+    assert index.pages_without_transcript(folders=[], limit=10) == []
+    # A document UUID or an unknown UUID is not a folder.
+    assert index.pages_without_transcript(folders=[uid(11), uid(99)], limit=10) == []
+    with pytest.raises(InvalidArgumentError):
+        index.pages_without_transcript(folders=[uid(1)], limit=0)
+
+
+def test_pages_without_transcript_tolerates_parent_cycles(index: Index) -> None:
+    index.upsert_document(folder(1, "A", parent=uid(2)))
+    index.upsert_document(folder(2, "B", parent=uid(1)))
+    index.upsert_document(doc(3, "D", parent=uid(2)))
+    index.replace_pages(uid(3), [PageRow(uid(300), uid(3), 0, "h")])
+    assert _ids(index.pages_without_transcript(folders=[uid(1)], limit=10)) == [(uid(3), 0)]
+
+
+def test_pages_without_transcript_skips_transcribed_and_dead_pages(index: Index) -> None:
+    _ocr_tree(index)
+    index.put_transcript(uid(11), uid(1110), "h11-0", "t", "m", "server")
+    assert _ids(index.pages_without_transcript(folders=[uid(1)], limit=10)) == [
+        (uid(11), 1),
+        (uid(21), 0),
+    ]
+    # A transcript of an older version does not count once the page changes.
+    index.replace_pages(
+        uid(11),
+        [PageRow(uid(1110), uid(11), 0, "new"), PageRow(uid(1111), uid(11), 1, "h11-1")],
+    )
+    assert (uid(11), 0) in _ids(index.pages_without_transcript(folders=[uid(1)], limit=10))
+    index.mark_deleted(uid(21), "user", T0)
+    with index.transaction():
+        index._conn.execute("UPDATE documents SET excluded_at = ? WHERE uuid = ?", ("x", uid(11)))
+    assert index.pages_without_transcript(folders=[uid(1)], limit=10) == []
+    # A folder in the trash is not live, nor is anything below it.
+    assert index.pages_without_transcript(folders=[uid(3)], limit=10) != []
+    index.upsert_document(folder(3, "Other", parent="trash"))
+    assert index.pages_without_transcript(folders=[uid(3)], limit=10) == []
+
+
+def test_transcripts_have_a_prompt_version_column(index: Index) -> None:
+    columns = {r[1] for r in index._conn.execute("PRAGMA table_info(transcripts)")}
+    assert "prompt_version" in columns
