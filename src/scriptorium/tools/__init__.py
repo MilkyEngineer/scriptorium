@@ -12,14 +12,17 @@ from __future__ import annotations
 import inspect
 import re
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from dataclasses import dataclass
-from typing import Any, Final, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from mcp_types import CallToolResult, Tool, ToolAnnotations
 
 from scriptorium.auth.oidc import User
 from scriptorium.config import Settings
 from scriptorium.tools._conventions import ToolArgs
+
+if TYPE_CHECKING:
+    from scriptorium.tools._services import Services
 
 TOOL_NAME_RE: Final = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 ADMIN_PREFIX: Final = "admin_"
@@ -35,11 +38,19 @@ class DownloadMinter(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ToolContext:
-    """What a tool handler may use. The user comes from the bearer token only."""
+    """What a tool handler may use. The user comes from the bearer token only.
+
+    ``services`` is the server's handle on ``/data`` (None when the app was built without
+    one, as for the spike tools alone). ``audit`` collects the non-content identifiers of
+    this call for its audit row (§6.2: only ``AUDIT_IDENTIFIER_KEYS``); the server writes
+    the row after the tool returns, whatever the outcome.
+    """
 
     user: User
     settings: Settings
     downloads: DownloadMinter
+    services: Services | None = None
+    audit: dict[str, Any] = field(default_factory=dict)
 
     def download_url(self, token: str) -> str:
         return f"{self.settings.public_origin}/dl/{token}"
