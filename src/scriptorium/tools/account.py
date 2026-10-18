@@ -38,11 +38,9 @@ from scriptorium.cloud.sync import (
 )
 from scriptorium.config import API_KEY_RE
 from scriptorium.db.connect import from_db_time
-from scriptorium.errors import RefusedError, ScriptoriumError
+from scriptorium.errors import RefusedError
 from scriptorium.ocr.errors import OcrRefused, OcrUnavailable
-from scriptorium.ocr.ledger import month_bounds
-from scriptorium.ocr.modes import USER_KEY_SECRET, read_user_key, server_key_permitted
-from scriptorium.ocr.modes import resolve as resolve_mode
+from scriptorium.ocr.modes import USER_KEY_SECRET
 from scriptorium.ocr.pipeline import (
     AUTO_OCR_KEY,
     AUTO_OCR_MAX_FOLDERS,
@@ -77,34 +75,15 @@ from scriptorium.tools._library import (
     state_of,
     use_account,
 )
+from scriptorium.tools._ocr import account_ocr, forget_key_refusals, ocr_mode, ocr_summary
 from scriptorium.tools._services import KEY_CHECK_WINDOW_S, Services
-from scriptorium.tools.ocr import ocr_mode, ocr_queue
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import worker_heartbeat_path
 from scriptorium.worker import HEARTBEAT_STALE_SECONDS, heartbeat_age, read_heartbeat
 
 DEVICES_URL: Final = "https://my.remarkable.com/"
 CONSOLE_URL: Final = "https://console.anthropic.com/settings/keys"
-OCR_LAZY_NOTE: Final = (
-    "Pages are transcribed by your own Claude session: read_page returns a page's image "
-    "with instructions, and save_transcript stores the result. With your own Claude API key "
-    "(or the server's, if the operator allows it) pages are transcribed in the background."
-)
-OCR_SERVER_NOTE: Final = (
-    "Pages are transcribed in the background; read_page waits briefly for a page's "
-    "transcript and otherwise answers pending. ocr_status shows the queue and the spend."
-)
 MAX_OWN_CAP_USD: Final = 100_000.0
-
-
-def _ocr_summary(svc: Services, account: Account | None, uid: str) -> dict[str, object]:
-    """F's key/cap summary plus G's queue numbers (Architecture §11.1 ``account_status.ocr``)."""
-    summary = ocr_summary(svc, uid)
-    if summary.get("mode") in SERVER_MODES:
-        summary["note"] = OCR_SERVER_NOTE
-    if account is not None:
-        summary["queue"] = ocr_queue(svc, account)
-    return summary
 
 
 # ---- connect_remarkable ----------------------------------------------------------------------
@@ -243,100 +222,6 @@ async def disconnect_remarkable(ctx: ToolContext, args: DisconnectArgs) -> CallT
 # ---- OCR: the user's own Claude API key ----------------------------------------------------
 
 
-def _usd(value: float | None) -> float | None:
-    return None if value is None else round(value, 4)
-
-
-def _ocr_note(reason: str, resets: str, cap_usd: float | None) -> str:
-    day = resets[:10]
-    if reason == "user_key":
-        cap = f", up to ${cap_usd:g} a month" if cap_usd is not None else ""
-        return f"Pages are transcribed in the background with your own Claude API key{cap}."
-    if reason == "server_key":
-        return (
-            "Pages are transcribed in the background with this server's Claude API key, "
-            "within a monthly allowance per user."
-        )
-    if reason == "key_unreadable":
-        return (
-            "Your stored Claude API key cannot be decrypted on this server, so nothing is "
-            "transcribed in the background. Store it again with set_claude_api_key, or remove "
-            "it with clear_claude_api_key."
-        )
-    more = {
-        "no_key": "To transcribe in the background, store your own key with set_claude_api_key.",
-        "server_key_not_allowed": "This server has a Claude API key an administrator can let "
-        "you use (they need your user id from account_status); or store your own key with "
-        "set_claude_api_key.",
-        "cap_reached_global": f"This server's monthly OCR budget is spent until {day} (UTC); "
-        "your own key (set_claude_api_key) is not affected by it.",
-        "cap_reached_user": f"Your monthly allowance on this server's key is spent until {day} "
-        "(UTC); your own key (set_claude_api_key) is not affected by it.",
-        "user_cap_reached": f"The monthly cap you set on your own key is spent until {day} "
-        "(UTC); call set_claude_api_key again with a higher monthly_cap_usd to raise it.",
-    }
-    return f"{OCR_LAZY_NOTE} {more[reason]}" if reason in more else OCR_LAZY_NOTE
-
-
-def ocr_summary(svc: Services, uid: str) -> dict[str, object]:
-    """``account_status.ocr`` (§8.1, §11.1): the mode and why, this UTC month's spend, and the
-    caps that apply to this user. Says whether a key is stored, never anything about it."""
-    settings, store, ledger = svc.settings, svc.store, svc.ledger
-    now = svc.clock()
-    start, end = month_bounds(now)
-    box = SecretBox(settings, uid)
-    try:
-        has_key = read_user_key(box) is not None  # presence only; the key is dropped here
-        resolution = resolve_mode(settings, store, box, ledger, uid, now)
-        mode, reason = resolution.mode, str(resolution.reason)
-        del resolution
-    except ScriptoriumError as exc:
-        if exc.code != "internal":
-            raise
-        # resolve_mode() fails closed rather than spend the server key for this user (§8.1).
-        mode, reason, has_key = "lazy", "key_unreadable", True
-    own = ledger.month(uid=uid, mode="user", at=now)
-    server = ledger.month(uid=uid, mode="server", at=now)
-    allowance = ledger.allowance(settings, store, uid, now)
-    row = store.user(uid)
-    own_cap = row.ocr_cap_usd if row is not None else None
-    permitted = (
-        settings.anthropic_api_key is not None
-        and row is not None
-        and server_key_permitted(settings, row)
-    )
-    return {
-        "mode": mode,
-        "reason": reason,
-        "own_key_stored": has_key,
-        "month": start.strftime("%Y-%m"),
-        "resets_at": iso_utc(end),
-        "spend_this_month": {
-            "usd": _usd(own.cost_usd + server.cost_usd),
-            "pages": own.pages + server.pages,
-            "own_key": {"usd": _usd(own.cost_usd), "pages": own.pages},
-            "server_key": {"usd": _usd(server.cost_usd), "pages": server.pages},
-        },
-        "caps": {
-            "own_key": (
-                {"monthly_cap_usd": own_cap, "remaining_usd": _usd(allowance.own_remaining_usd)}
-                if has_key
-                else None
-            ),
-            "server_key": (
-                {
-                    "monthly_cap_usd": settings.ocr_user_monthly_cap_usd,
-                    "remaining_usd": _usd(allowance.user_remaining_usd),
-                    "server_budget_spent": allowance.global_remaining_usd <= 0,
-                }
-                if permitted
-                else None
-            ),
-        },
-        "note": _ocr_note(reason, iso_utc(end), own_cap),
-    }
-
-
 class SetKeyArgs(ToolArgs):
     # A rejected key must not reach an error string, even one that is never sent anywhere.
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -410,6 +295,7 @@ def _set_key(svc: Services, user: User, key: SecretStr, cap_usd: float | None) -
     # without the cap its owner asked for would spend more than they allowed.
     svc.store.set_user_ocr_cap(uid, cap_usd)
     SecretBox(svc.settings, uid).seal(USER_KEY_SECRET, key.get_secret_value().encode("ascii"))
+    forget_key_refusals(svc, uid)  # the worker may try the new key at once
     cap = f" up to ${cap_usd:g} a month" if cap_usd is not None else ""
     return {
         "stored": True,
@@ -441,6 +327,7 @@ def _clear_key(svc: Services, user: User) -> dict[str, object]:
     uid = svc.uid(user)
     SecretBox(svc.settings, uid).forget(USER_KEY_SECRET)
     svc.store.set_user_ocr_cap(uid, None)
+    forget_key_refusals(svc, uid)
     return {
         "cleared": True,
         "ocr": ocr_summary(svc, uid),
@@ -600,7 +487,7 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
         },
         "library": counts,
         "jobs": {"pending": pending, "dead": dead},
-        "ocr": _ocr_summary(svc, account, account.uid),
+        "ocr": account_ocr(svc, account, account.uid),
         "quota": None,
         "worker": worker,
     }
@@ -618,7 +505,7 @@ def _account_status(svc: Services, user: User, acct: str | None) -> dict[str, ob
                 f"No reMarkable account is linked. Get a one-time code from {CONNECT_URL} "
                 "and call connect_remarkable with it."
             ),
-            "ocr": _ocr_summary(svc, None, uid),
+            "ocr": account_ocr(svc, None, uid),
         }
     account = open_account(svc, user, acct)
     payload = {"user": uid, **_status(svc, account)}

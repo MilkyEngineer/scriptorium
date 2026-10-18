@@ -32,7 +32,7 @@ from scriptorium.db.connect import utc_now
 from scriptorium.jobs.queue import JobQueue
 from scriptorium.library.index import Index
 from scriptorium.logging import log_event, uid_prefix
-from scriptorium.ocr._ports import OcrPorts
+from scriptorium.ocr._ports import OcrPorts, build_ocr_ports
 from scriptorium.ocr.client import OcrClient, client_for
 from scriptorium.ocr.ledger import SpendLedger
 from scriptorium.ocr.modes import listed_email_digest
@@ -72,14 +72,16 @@ class Services:
     identify: Callable[[str], str | None] = identity_of
     clock: Callable[[], datetime] = utc_now
     ocr: OcrPorts | None = None
-    """F's OCR seams (``build_ocr_ports``); None: lazy mode only, as in M1."""
+    """The OCR seams; None (the default) binds F's modules over :attr:`ledger` and
+    :attr:`ocr_client` (``build_ocr_ports``). Tests pass their own."""
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     poll_interval_s: float = 0.25
     """How often a tool waiting for a render looks for its PNG."""
     image_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(IMAGE_SLOTS))
     """Bounds the server's own PNG decoding (downscales), which can take ~200 MB a page."""
     ocr_client: Callable[[Settings, SecretStr], OcrClient] = client_for
-    """Builds the Claude API client for a key (``set_claude_api_key`` validates with it)."""
+    """Builds the Claude API client for a key (``set_claude_api_key`` validates with it, and
+    the OCR ports use it)."""
     monotonic: Callable[[], float] = time.monotonic
     _indexes: dict[tuple[str, str], Index] = field(default_factory=dict, repr=False)
     _users: dict[str, tuple[str, str | None]] = field(default_factory=dict, repr=False)
@@ -87,6 +89,16 @@ class Services:
     _key_checks: dict[str, list[float]] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _connect_locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.ocr is None:
+            self.ocr = build_ocr_ports(self.ledger, client=self.ocr_client)
+
+    @property
+    def ports(self) -> OcrPorts:
+        """The OCR seams of this process (one ledger, one client factory)."""
+        assert self.ocr is not None  # set in __post_init__
+        return self.ocr
 
     @classmethod
     def open(cls, settings: Settings, **kwargs: Any) -> Services:

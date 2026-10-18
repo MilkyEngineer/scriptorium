@@ -15,9 +15,10 @@ A batch result is untrusted input. :func:`collect` accepts only custom ids that 
 job's own item list, each once; a result stream longer than the item list is cut off; token
 counts must be sane integers; a transcript is bounded at
 :data:`~scriptorium.ocr.pipeline.TRANSCRIPT_MAX_BYTES`; an item error's reason is reduced to
-a short ``[a-z_]`` code. Every item named in the job ends in exactly one :class:`Outcome`
-(``missing`` when the stream never mentioned it), so the caller can fall back to a single
-``ocr`` job for whatever did not come back as a transcript.
+a short ``[a-z_]`` code and keeps F's ``retryable`` flag and the tokens it was billed for.
+Every item named in the job ends in exactly one :class:`Outcome` (``missing`` when the stream
+never mentioned it), so the caller can fall back to a single ``ocr`` job for whatever did not
+come back as a transcript and may succeed on another try.
 """
 
 from __future__ import annotations
@@ -26,12 +27,15 @@ import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Final, Literal
+from typing import Final, Literal
 
 from scriptorium.errors import InvalidArgumentError
 from scriptorium.jobs.kinds import BATCH_ID_RE, MAX_BATCH_ITEMS, OcrSpec
-from scriptorium.ocr._ports import BatchStatusLike, OcrClientLike, PromptLike, TranscriptionLike
+from scriptorium.ocr._ports import OcrClientLike
+from scriptorium.ocr.client import BatchItem, BatchStatus, Transcription, check_png
+from scriptorium.ocr.errors import OcrRefused
 from scriptorium.ocr.pipeline import TRANSCRIPT_MAX_BYTES
+from scriptorium.ocr.prompt import Prompt
 
 __all__ = [
     "BATCH_FIRST_POLL",
@@ -43,6 +47,7 @@ __all__ = [
     "Tally",
     "collect",
     "custom_id",
+    "fits",
     "judge",
     "plan",
     "poll_state",
@@ -70,6 +75,15 @@ def custom_id(n: int) -> str:
     return f"p{n}"
 
 
+def fits(png: bytes) -> str | None:
+    """None when the API takes ``png`` as it is, else F's refusal code (``check_png``)."""
+    try:
+        check_png(png)
+    except OcrRefused as exc:
+        return exc.reason
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class Planned:
     """One page for a batch: its job spec and its OCR image."""
@@ -90,21 +104,16 @@ def plan(pages: Sequence[Planned]) -> dict[str, Planned]:
     return out
 
 
-def submit(
-    client: OcrClientLike,
-    prompt: PromptLike,
-    planned: Mapping[str, Planned],
-    batch_item: Any,
-) -> str:
+def submit(client: OcrClientLike, prompt: Prompt, planned: Mapping[str, Planned]) -> str:
     """Submit ``planned`` as one batch; the batch id, checked before it is used in a key."""
-    items = [batch_item(cid, page.png) for cid, page in planned.items()]
+    items = [BatchItem(cid, page.png) for cid, page in planned.items()]
     batch_id = client.submit_batch(items, prompt)
     if not isinstance(batch_id, str) or not BATCH_ID_RE.fullmatch(batch_id):
         raise InvalidArgumentError("the batch id returned is malformed")
     return batch_id
 
 
-def poll_state(status: BatchStatusLike) -> Literal["wait", "collect", "unknown"]:
+def poll_state(status: BatchStatus) -> Literal["wait", "collect", "unknown"]:
     """``collect`` once the batch has ended or expired, ``wait`` while it runs."""
     state = getattr(status, "state", None)
     if state in WAIT_STATES:
@@ -121,13 +130,16 @@ class Outcome:
     ``transcription`` is set whenever the API billed the item (its token counts are sane),
     including a transcript too large to store; ``error`` is None when ``transcription``
     can be stored, otherwise a reason code (``too_large``, ``missing``, ``bad_result``, or
-    the item error's own code).
+    the item error's own code). For an item error, ``retryable`` is F's verdict (whether
+    sending the page again may help) and ``billed`` the tokens it cost (a model refusal).
     """
 
     custom_id: str
     spec: OcrSpec
-    transcription: TranscriptionLike | None
+    transcription: Transcription | None
     error: str | None
+    retryable: bool = True
+    billed: tuple[int, int] = (0, 0)
 
 
 @dataclass
@@ -150,11 +162,19 @@ def _reason(result: object) -> str:
     return "item_error"
 
 
-def judge(cid: str, spec: OcrSpec, result: object, transcription_type: type[Any]) -> Outcome:
+def judge(cid: str, spec: OcrSpec, result: object) -> Outcome:
     """The :class:`Outcome` of one result (a batch item's, or a single call's)."""
-    if not isinstance(result, transcription_type):
+    if not isinstance(result, Transcription):
         if hasattr(result, "reason"):
-            return Outcome(cid, spec, None, _reason(result))
+            retryable = getattr(result, "retryable", True)
+            tokens_in = getattr(result, "input_tokens", 0)
+            tokens_out = getattr(result, "output_tokens", 0)
+            billed = (
+                (tokens_in, tokens_out)
+                if _sane_count(tokens_in) and _sane_count(tokens_out)
+                else (0, 0)
+            )
+            return Outcome(cid, spec, None, _reason(result), retryable is not False, billed)
         return Outcome(cid, spec, None, "bad_result")
     tokens_in = getattr(result, "input_tokens", None)
     tokens_out = getattr(result, "output_tokens", None)
@@ -172,7 +192,6 @@ def collect(
     results: Iterable[object],
     items: Mapping[str, OcrSpec],
     *,
-    transcription_type: type[Any],
     tally: Tally,
 ) -> Iterator[Outcome]:
     """One :class:`Outcome` per item of ``items``, as the stream delivers them.
@@ -200,7 +219,7 @@ def collect(
             tally.duplicates += 1
             continue
         seen.add(cid)
-        yield judge(cid, items[cid], result, transcription_type)
+        yield judge(cid, items[cid], result)
     for cid in sorted(items):
         if cid not in seen:
             yield Outcome(cid, items[cid], None, "missing")

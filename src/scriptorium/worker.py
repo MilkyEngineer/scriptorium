@@ -28,9 +28,9 @@ One process, one asyncio loop, four kinds of task:
   in its own loop, at most :data:`~scriptorium.ocr.runner.OCR_SLOTS` at a time and at most
   ``OCR_USER_CONCURRENCY`` leased ``ocr`` jobs per user, so one user's backlog cannot hold
   every slot. Claude calls run in the OCR threads while the lease is heartbeated. After each
-  ``ok`` or ``partial`` poll the account loop runs the auto-OCR scan. Without OCR ports
-  (``Worker.ocr`` None, the M1 configuration) every OCR job is ``deferred`` and the scan
-  queues nothing.
+  ``ok`` or ``partial`` poll the account loop runs the auto-OCR scan. :meth:`Worker.open`
+  binds F's OCR modules over one ``SpendLedger``; a Worker built without OCR ports
+  (``Worker.ocr`` None, tests only) defers every OCR job and its scan queues nothing.
 - **Housekeeping.** ``requeue_expired`` at start and every minute; at start, dead render
   jobs that died of their run rather than their page are revived once
   (``JobQueue.revive_dead_renders``); the liveness file
@@ -95,7 +95,8 @@ from scriptorium.library import render
 from scriptorium.library.archive import Archive
 from scriptorium.library.index import Index, PageRow
 from scriptorium.logging import log_event
-from scriptorium.ocr._ports import OcrPorts
+from scriptorium.ocr._ports import OcrPorts, build_ocr_ports
+from scriptorium.ocr.ledger import SpendLedger
 from scriptorium.ocr.runner import OCR_SLOTS, JobFailure, OcrRunner
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import (
@@ -326,7 +327,8 @@ class Worker:
     client_factory: ClientFactory | None = None
     render_executor: Executor | None = None
     ocr: OcrPorts | None = None
-    """F's OCR seams (``build_ocr_ports``); None runs OCR as in M1 (lazy only)."""
+    """The OCR seams (:meth:`open` binds F's modules); None, for tests and tooling that build
+    a Worker directly, defers every OCR job and skips the scan."""
     clock: Callable[[], datetime] = utc_now
     monotonic: Callable[[], float] = time.monotonic
     timing: Timing = field(default_factory=Timing)
@@ -359,13 +361,20 @@ class Worker:
 
     @classmethod
     async def open(cls, settings: Settings, stop: asyncio.Event, **kwargs: Any) -> Worker | None:
-        """Open the global stores once the server has migrated them; None if stopped first."""
+        """Open the global stores once the server has migrated them; None if stopped first.
+
+        Unless ``ocr`` is passed, the OCR ports are F's modules over this process's one
+        ``SpendLedger`` (``build_ocr_ports``).
+        """
         path = global_db_path(settings.data_dir)
         waiting = False
         while not stop.is_set():
             try:
                 store = await asyncio.to_thread(GlobalStore.open, path, migrate=False)
                 queue = await asyncio.to_thread(JobQueue.open, path, migrate=False)
+                if "ocr" not in kwargs:
+                    ledger = await asyncio.to_thread(SpendLedger.open, path, migrate=False)
+                    kwargs["ocr"] = build_ocr_ports(ledger)
             except SchemaMismatch:
                 if not waiting:
                     log_event(logger, "worker_waiting_for_schema")

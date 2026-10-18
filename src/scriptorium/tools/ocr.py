@@ -33,14 +33,15 @@ from scriptorium.library import pages as pg
 from scriptorium.library.index import DocumentRow, TranscriptRow
 from scriptorium.ocr.batches import PENDING_REASON
 from scriptorium.ocr.pipeline import (
+    KEY_REFUSED_HOLD,
     LAZY,
     OCR_IMAGE_SIDE,
     SERVER_MODES,
     TRANSCRIPT_MAX_BYTES,
-    blocked_reason,
+    KeyRefusal,
     enqueue_page,
     load_auto_ocr,
-    resolve_mode,
+    load_key_refusal,
 )
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
 from scriptorium.tools._conventions import (
@@ -70,6 +71,7 @@ from scriptorium.tools._library import (
     use_account,
     use_document,
 )
+from scriptorium.tools._ocr import OCR_SERVER_NOTE, ocr_mode, ocr_queue, ocr_summary
 from scriptorium.tools._services import Services
 
 MODEL_MAX: Final = 100
@@ -182,36 +184,8 @@ LAZY_TRANSCRIBE_NOTE: Final = (
 )
 
 
-def ocr_mode(svc: Services, uid: str) -> tuple[str, str]:
-    """``(mode, reason)`` for ``uid`` now; the key ``resolve`` returns is dropped here."""
-    ports = svc.ocr
-    if ports is None:
-        return LAZY, "not_configured"
-    resolution = resolve_mode(ports, svc.settings, svc.store, uid, svc.clock())
-    mode, reason = resolution.mode, resolution.reason
-    if mode not in SERVER_MODES or resolution.api_key is None:
-        return LAZY, reason
-    return mode, reason
-
-
 def _reason(error: str | None) -> str:
     return error if error is not None and _REASON.fullmatch(error) else "other"
-
-
-def ocr_queue(svc: Services, account: Account) -> dict[str, dict[str, int]]:
-    """``{kind: {queued, running, retrying, done, dead}}`` for the account's OCR jobs."""
-    counts = svc.queue.counts(account.uid, acct=account.acct)
-    out: dict[str, dict[str, int]] = {}
-    for kind in OCR_KINDS:
-        by_state = counts.get(kind, {})
-        out[kind] = {
-            "queued": by_state.get("queued", 0),
-            "running": by_state.get("leased", 0),
-            "retrying": by_state.get("failed", 0),
-            "done": by_state.get("done", 0),
-            "dead": by_state.get("dead", 0),
-        }
-    return out
 
 
 # ---- read_page's server-side path --------------------------------------------------------------
@@ -419,59 +393,63 @@ class OcrStatusArgs(ToolArgs):
     )
 
 
-def _money(value: float | None) -> float | None:
-    return None if value is None else round(float(value), 4)
+def _key_note(refusal: KeyRefusal) -> str:
+    whose = "your own Claude API key" if refusal.mode == "user" else "this server's Claude API key"
+    fix = (
+        "Store a working key with set_claude_api_key, or remove it with clear_claude_api_key."
+        if refusal.mode == "user"
+        else "Tell the operator."
+    )
+    return (
+        f"The Claude API refused {whose} ({refusal.reason}); background transcription with "
+        f"it is paused and is tried again after {iso_utc(refusal.at + KEY_REFUSED_HOLD)}. {fix}"
+    )
 
 
 def _ocr_status(svc: Services, account: Account) -> dict[str, Any]:
-    uid = account.uid
+    """F's ``ocr_summary`` (the same spend and cap numbers as ``account_status.ocr``) plus the
+    account's queue, auto-OCR folders, latest failure reasons and refused-key note."""
     queue = ocr_queue(svc, account)
     errors = [
         {"kind": kind, "reason": _reason(error), "at": iso_utc(at)}
         for kind, error, at in svc.queue.recent_errors(
-            uid, acct=account.acct, kinds=OCR_KINDS, limit=RECENT_ERRORS * 4
+            account.uid, acct=account.acct, kinds=OCR_KINDS, limit=RECENT_ERRORS * 4
         )
         if error != PENDING_REASON
     ][:RECENT_ERRORS]
-    mode, reason = ocr_mode(svc, uid)
+    summary = ocr_summary(svc, account.uid)
+    if summary.get("mode") in SERVER_MODES:
+        summary["note"] = OCR_SERVER_NOTE
     auto = load_auto_ocr(account.index)
-    payload: dict[str, Any] = {
+    refusal = load_key_refusal(account.index)
+    key_refused: dict[str, object] | None = None
+    if refusal is not None:
+        applies = refusal.applies(str(summary.get("mode")), svc.clock())
+        key_refused = {
+            "mode": refusal.mode,
+            "reason": refusal.reason,
+            "since": iso_utc(refusal.at),
+            "paused": applies,
+        }
+        if applies:
+            summary["note"] = _key_note(refusal)
+    return {
         "account": account.acct,
-        "mode": mode,
-        "reason": reason,
+        **summary,
         "auto_ocr": {"enabled": auto.enabled, "folders": list(auto.folders)},
         "queue": queue,
         "dead": sum(q["dead"] for q in queue.values()),
         "recent_errors": errors,
-        "spend_this_month": None,
-        "remaining_this_month": None,
+        "key_refused": key_refused,
     }
-    ports = svc.ocr
-    if ports is None:
-        return payload
-    now = svc.clock()
-    spend = ports.ledger.month(uid=uid, mode=None, at=now)
-    payload["spend_this_month"] = {
-        "cost_usd": _money(spend.cost_usd),
-        "pages": spend.pages,
-        "input_tokens": spend.input_tokens,
-        "output_tokens": spend.output_tokens,
-    }
-    allowance = ports.ledger.allowance(svc.settings, svc.store, uid, now)
-    payload["remaining_this_month"] = {
-        "server_key_global_usd": _money(allowance.global_remaining_usd),
-        "server_key_user_usd": _money(allowance.user_remaining_usd),
-        "own_key_usd": _money(allowance.own_remaining_usd),
-        "blocked": blocked_reason(allowance, mode) if mode in SERVER_MODES else None,
-    }
-    return payload
 
 
 async def ocr_status(ctx: ToolContext, args: OcrStatusArgs) -> CallToolResult:
     """Show background transcription for your account: the OCR mode and why (your own API
-    key, the server key, or lazy mode), whether auto-OCR is on and for which folders, the
-    queue of transcription jobs by state, the reasons of the latest failures, and this
-    month's spend and what remains under each cap that applies."""
+    key, the server key, or lazy mode), this month's spend and what remains under each cap
+    that applies (the same numbers as account_status), whether auto-OCR is on and for which
+    folders, the queue of transcription jobs by state, the reasons of the latest failures,
+    and whether the Claude API refused the key in use."""
     account = await use_account(ctx, args.account)
     payload = await asyncio.to_thread(_ocr_status, services(ctx), account)
     return json_result(payload, cap=RESULT_CAP_BYTES)
@@ -501,8 +479,6 @@ __all__ = [
     "OLD_VERSION_NOTE",
     "TRANSCRIPT_MAX_BYTES",
     "await_server_transcript",
-    "ocr_mode",
-    "ocr_queue",
     "ocr_status",
     "register",
     "save_transcript",

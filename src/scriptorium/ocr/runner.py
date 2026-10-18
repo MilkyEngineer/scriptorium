@@ -1,26 +1,32 @@
 """The worker's half of server-side OCR (Architecture §7 step 6, §8; Plan 05 §3.2).
 
-- **The scan** runs after every ``ok`` or ``partial`` poll of an account. With auto-OCR
-  enabled for some folders and a user or server key available (``resolve``), it lists the
-  pages under those folders that have no transcript of their current version, keeps those
-  that :func:`~scriptorium.ocr.debounce.is_stable`, drops pages already in a running batch
-  or with an ``ocr`` job (a page version is queued once, ever, unless its last job was
-  deferred), and bounds what is left by the cap's remaining room at an estimated price per
-  page. More than ``OCR_BATCH_MIN`` pages go to Claude as one Message Batches request and an
-  ``ocr_batch`` job polls it; fewer become single ``ocr`` jobs. Caps are checked through the
-  ledger's ``allowance`` before every submission; a degraded allowance queues nothing.
-  After an ``ok`` poll the scan records the time under
-  :data:`~scriptorium.ocr.debounce.STATE_OCR_POLL_AT`, whatever the mode, for the next
-  poll's stability check.
+- **The scan** runs after every ``ok`` or ``partial`` poll of an account. It first adopts any
+  batch the API accepted whose ``ocr_batch`` job was never queued (``ocr_pending_batches``).
+  With auto-OCR enabled for some folders and a user or server key available (``resolve``),
+  it lists the pages under those folders that have no transcript of their current version,
+  keeps those that :func:`~scriptorium.ocr.debounce.is_stable`, drops pages already in a
+  running or pending batch or with an ``ocr`` job (a page version is queued once, ever,
+  unless its last job was deferred or died of a refused key), and bounds what is left by the
+  cap's remaining room at an estimated price per page. More than ``OCR_BATCH_MIN`` pages go
+  to Claude as one Message Batches request and an ``ocr_batch`` job polls it; fewer become
+  single ``ocr`` jobs. Caps are checked through the ledger's ``allowance`` for the resolved
+  mode before every submission; a degraded allowance, or a key refused within
+  ``KEY_REFUSED_HOLD``, queues nothing. After an ``ok`` poll the scan records the time under
+  :data:`~scriptorium.ocr.debounce.STATE_OCR_POLL_AT`, whatever the mode, for the next poll's
+  stability check.
 - **An ``ocr`` job** transcribes one page version: ``stale`` (nothing done) when the page
   changed since it was queued, ``exists`` when a transcript is already there (unless
-  ``force``), ``deferred`` when no key or no room is available now; otherwise it renders the
-  page if needed, downscales it to 2576 px in the render pool, calls Claude in a thread
-  while heartbeating the lease, records the spend and stores the transcript with the prompt
-  version, token counts and cost.
+  ``force``), ``deferred`` when no key, no room or only a refused key is available now;
+  otherwise it renders the page if needed, downscales it to 2576 px in the render pool,
+  checks it with F's ``check_png``, calls Claude in a thread while heartbeating the lease,
+  records the spend (also for a refusal the API billed) and stores the transcript with the
+  prompt version, token counts and cost. A refusal dies at once with its reason code
+  (``key_<reason>`` when the key, not the page, was refused).
 - **An ``ocr_batch`` job** polls its batch with the queue's backoff and, once it has ended,
   streams the results through :func:`~scriptorium.ocr.batches.collect`, records the spend at
-  the batch price, stores what came back and falls back to single ``ocr`` jobs for the rest.
+  the batch price, stores what came back with the prompt version recorded at submission,
+  records a ``dead`` ``ocr`` job for a page the API refused for good, and falls back to
+  single ``ocr`` jobs for the rest.
 
 Transcripts are note content: they go from the client to the index and nowhere else. Logs,
 job payloads, job results and job errors carry identifiers, counts, costs and reason codes.
@@ -30,13 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
-
-from pydantic import SecretStr
 
 from scriptorium.db.connect import from_db_time, to_db_time
 from scriptorium.errors import InvalidArgumentError, NotFoundError, ScriptoriumError
@@ -44,12 +48,14 @@ from scriptorium.jobs.kinds import (
     MAX_BATCH_ITEMS,
     OCR,
     OCR_BATCH,
+    PROMPT_VERSION_RE,
     BatchMode,
     OcrBatchSpec,
     OcrSpec,
     ocr_key,
     parse_ocr_batch_payload,
     parse_ocr_payload,
+    rerun_key,
 )
 from scriptorium.jobs.queue import JobRow
 from scriptorium.library import pages as pg
@@ -57,16 +63,26 @@ from scriptorium.library import render
 from scriptorium.library.index import PageRow
 from scriptorium.logging import log_event
 from scriptorium.ocr import batches
-from scriptorium.ocr._ports import BATCH_DISCOUNT, OcrPorts, TranscriptionLike
+from scriptorium.ocr._ports import OcrClientLike, OcrPorts
+from scriptorium.ocr.client import Transcription
 from scriptorium.ocr.debounce import STATE_OCR_POLL_AT, is_stable
+from scriptorium.ocr.errors import KEY_REASONS, OcrRefused, OcrUnavailable
+from scriptorium.ocr.ledger import cost_usd
 from scriptorium.ocr.pipeline import (
     OCR_IMAGE_SIDE,
-    SERVER_MODES,
+    add_pending_batch,
     affordable_pages,
     blocked_reason,
+    drop_pending_batch,
     enqueue_page,
     is_deferred,
+    is_key_failure,
+    key_error,
+    key_mode,
     load_auto_ocr,
+    load_key_refusal,
+    load_pending_batches,
+    note_key_refusal,
     remaining_usd,
     resolve_mode,
     safe_model,
@@ -88,7 +104,10 @@ EST_INPUT_TOKENS: Final = 5_000
 EST_OUTPUT_TOKENS: Final = 1_500
 """A generous estimate of one page's tokens, to bound a scan's submissions by the cap."""
 MAX_PNG_BYTES: Final = 64 * 1024 * 1024
-PROMPT_VERSION_MAX: Final = 32
+KEY_REFUSED: Final = "key_refused"
+"""Deferral reason while the account's refused-key note applies to the mode."""
+BATCH_KEY_REASONS: Final = KEY_REASONS - {"model_unavailable"}
+"""Key reasons that a batch lookup can tell: a 404 there means the batch is unknown."""
 
 
 class JobFailure(Exception):  # noqa: N818 - a job outcome, not an error type for callers
@@ -112,8 +131,8 @@ def _read_png(path: Path) -> bytes | None:
 
 
 def _prompt_version(version: object) -> str | None:
-    if isinstance(version, str) and 0 < len(version) <= PROMPT_VERSION_MAX:
-        return version if version.isprintable() else None
+    if isinstance(version, str) and PROMPT_VERSION_RE.fullmatch(version):
+        return version
     return None
 
 
@@ -143,15 +162,15 @@ class OcrRunner:
         raise InvalidArgumentError("not an OCR job")
 
     async def _call[T](self, job: JobRow, fn: Callable[..., T], *args: Any) -> T:
-        """Run a blocking OCR call in the OCR threads, heartbeating ``job``'s lease."""
-        ports = self.ports
-        assert ports is not None
+        """Run a blocking OCR call in the OCR threads, heartbeating ``job``'s lease.
+
+        ``OcrUnavailable`` becomes a retry; ``OcrRefused`` (a verdict) reaches the caller,
+        which knows what was refused.
+        """
         fut = self.executor.submit(fn, *args)
         try:
             return await self.worker._await_with_heartbeat(fut, job)
-        except ports.refused:
-            raise JobFailure("ocr_refused", final=True) from None
-        except ports.unavailable:
+        except OcrUnavailable:
             raise JobFailure("ocr_unavailable") from None
 
     # ---- one page --------------------------------------------------------------------------
@@ -182,14 +201,15 @@ class OcrRunner:
             return _deferred("not_configured")
         settings = worker.settings
         now = worker.clock()
-        resolution = await asyncio.to_thread(
-            resolve_mode, ports, settings, worker.store, job.uid, now
-        )
-        mode, key = resolution.mode, resolution.api_key
-        if mode not in SERVER_MODES or key is None:
-            return _deferred(resolution.reason)
+        choice = await asyncio.to_thread(resolve_mode, ports, settings, worker.store, job.uid, now)
+        mode = key_mode(choice.mode)
+        if mode is None or choice.api_key is None:
+            return _deferred(choice.reason)
+        refusal = await asyncio.to_thread(load_key_refusal, index)
+        if refusal is not None and refusal.applies(mode, now):
+            return _deferred(KEY_REFUSED)
         allowance = await asyncio.to_thread(
-            ports.ledger.allowance, settings, worker.store, job.uid, now
+            ports.ledger.allowance, settings, worker.store, job.uid, now, mode=mode
         )
         blocked = blocked_reason(allowance, mode)
         if blocked is not None:
@@ -197,42 +217,79 @@ class OcrRunner:
         png = await self.ocr_png(ctx, spec, job)
         if png is None:
             return {"state": "stale"}
-        client = ports.client(key)
-        del key, resolution
+        unfit = batches.fits(png)
+        if unfit is not None:
+            raise JobFailure(unfit, final=True)
         prompt = ports.prompt()
-        result = await self._call(job, client.transcribe, png, prompt)
-        outcome = batches.judge("p0", spec, result, ports.transcription)
+        client = ports.client(settings, choice.api_key)
+        del choice
+        try:
+            result = await self._call(job, client.transcribe, png, prompt)
+        except OcrRefused as exc:
+            reason = await asyncio.to_thread(self._refused, ctx, mode, exc)
+            raise JobFailure(reason, final=True) from None
+        finally:
+            client.close()
+        outcome = batches.judge("p0", spec, result)
+        t = outcome.transcription
         cost = 0.0
-        if outcome.transcription is not None:
-            cost = await asyncio.to_thread(self._record, job.uid, mode, outcome.transcription, 1.0)
+        if t is not None:
+            cost = await asyncio.to_thread(
+                self._record, job.uid, mode, t.input_tokens, t.output_tokens, t.model, False
+            )
         if outcome.error == "too_large":
             raise JobFailure("too_large", final=True)
-        if outcome.error is not None or outcome.transcription is None:
+        if outcome.error is not None or t is None:
             raise JobFailure("bad_result")
-        stored = await asyncio.to_thread(
-            self._store, ctx, spec, mode, outcome.transcription, prompt.version, cost
-        )
+        stored = await asyncio.to_thread(self._store, ctx, spec, mode, t, prompt.version, cost)
         if not stored:
             return {"state": "stale"}
         return {
             "state": "stored",
-            "input_tokens": outcome.transcription.input_tokens,
-            "output_tokens": outcome.transcription.output_tokens,
+            "input_tokens": t.input_tokens,
+            "output_tokens": t.output_tokens,
             "cost_usd": round(cost, 6),
         }
 
-    def _record(self, uid: str, mode: str, t: TranscriptionLike, factor: float) -> float:
-        """Record one page's spend; returns its cost (``factor`` is the batch discount)."""
+    def _refused(self, ctx: AccountContext, mode: BatchMode, exc: OcrRefused) -> str:
+        """Record what a refused call was billed; note a refused key. The job's reason code."""
+        if exc.input_tokens or exc.output_tokens:
+            self._record(
+                ctx.uid,
+                mode,
+                exc.input_tokens,
+                exc.output_tokens,
+                self.worker.settings.ocr_model,
+                False,
+            )
+        if not exc.about_key:
+            return exc.reason
+        note_key_refusal(ctx.index, mode, exc.reason, self.worker.clock())
+        log_event(
+            logger, "ocr_key_refused", level=logging.WARNING, acct=ctx.acct, reason=exc.reason
+        )
+        return key_error(exc.reason)
+
+    def _record(
+        self,
+        uid: str,
+        mode: BatchMode,
+        input_tokens: int,
+        output_tokens: int,
+        model: object,
+        batch: bool,
+    ) -> float:
+        """Record one page's spend at F's price (half for a batch); returns its cost."""
         ports = self.ports
         assert ports is not None
         worker = self.worker
-        cost = ports.cost_usd(worker.settings, t.input_tokens, t.output_tokens) * factor
+        cost = cost_usd(worker.settings, input_tokens, output_tokens, batch=batch)
         ports.ledger.record(
             uid=uid,
             mode=mode,
-            model=safe_model(t.model),
-            input_tokens=t.input_tokens,
-            output_tokens=t.output_tokens,
+            model=safe_model(model),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             cost_usd=cost,
             at=worker.clock(),
         )
@@ -243,7 +300,7 @@ class OcrRunner:
         ctx: AccountContext,
         spec: OcrSpec,
         mode: str,
-        t: TranscriptionLike,
+        t: Transcription,
         prompt_version: object,
         cost: float,
     ) -> bool:
@@ -320,50 +377,57 @@ class OcrRunner:
             return {"state": "gone"}
         ctx = await asyncio.to_thread(worker.context, job.uid, job.acct)
         ports = self.ports
-        key: SecretStr | None = None
-        if ports is not None:
-            box = SecretBox(worker.settings, job.uid)
-            key = await asyncio.to_thread(ports.batch_key, worker.settings, box, bspec.mode)
-        if ports is None or key is None:
-            queued = await asyncio.to_thread(self._fall_back, ctx, bspec.items.values())
-            return {"state": "orphaned", "fallback": queued}
-        client = ports.client(key)
+        if ports is None:
+            return await self._orphan(ctx, bspec, "not_configured")
+        box = SecretBox(worker.settings, job.uid)
+        key = await asyncio.to_thread(ports.batch_key, worker.settings, box, bspec.mode)
+        if key is None:
+            return await self._orphan(ctx, bspec, "no_key")
+        client = ports.client(worker.settings, key)
         del key
         try:
             status = await self._call(job, client.batch_status, bspec.batch_id)
-        except JobFailure as exc:
-            if not exc.final:
-                raise
-            # The key that submitted the batch is refused now: nobody can collect it.
-            queued = await asyncio.to_thread(self._fall_back, ctx, bspec.items.values())
-            return {"state": "orphaned", "fallback": queued}
-        state = batches.poll_state(status)
-        if state == "wait":
-            raise JobFailure(batches.PENDING_REASON)
-        if state == "unknown":
-            raise JobFailure("batch_unknown_state")
-        prompt_version = ports.prompt().version
-        return await self._call(job, self._collect, ctx, job, bspec, client, prompt_version)
+            state = batches.poll_state(status)
+            if state == "wait":
+                raise JobFailure(batches.PENDING_REASON)
+            if state == "unknown":
+                raise JobFailure("batch_unknown_state")
+            if status.state == "expired":
+                # Archived, or unknown to this key: the results cannot be read any more.
+                return await self._orphan(ctx, bspec, "expired")
+            return await self._call(job, self._collect, ctx, job, bspec, client)
+        except OcrRefused as exc:
+            # The key that submitted the batch is refused now, or the results could not be
+            # read: nobody can collect it. Whatever was stored stays; the rest goes single.
+            reason = exc.reason
+            if reason in BATCH_KEY_REASONS:
+                await asyncio.to_thread(
+                    note_key_refusal, ctx.index, bspec.mode, reason, worker.clock()
+                )
+                reason = key_error(reason)
+            return await self._orphan(ctx, bspec, reason)
+        finally:
+            client.close()
+
+    async def _orphan(
+        self, ctx: AccountContext, bspec: OcrBatchSpec, reason: str
+    ) -> dict[str, Any]:
+        queued = await asyncio.to_thread(self._fall_back, ctx, bspec.items.values())
+        return {"state": "orphaned", "reason": reason, "fallback": queued}
 
     def _collect(
-        self,
-        ctx: AccountContext,
-        job: JobRow,
-        bspec: OcrBatchSpec,
-        client: Any,
-        prompt_version: object,
+        self, ctx: AccountContext, job: JobRow, bspec: OcrBatchSpec, client: OcrClientLike
     ) -> dict[str, Any]:
         """Stream the batch's results into the index (runs in an OCR thread)."""
-        ports = self.ports
-        assert ports is not None
-        counts = dict.fromkeys(("stored", "exists", "stale", "fallback"), 0)
+        counts = dict.fromkeys(("stored", "exists", "stale", "fallback", "failed"), 0)
         cost = 0.0
         tally = batches.Tally()
         fall_back: list[OcrSpec] = []
+        dead: list[tuple[OcrSpec, str]] = []
+        refused_key: str | None = None
+        model = self.worker.settings.ocr_model
         results = client.batch_results(bspec.batch_id)
-        for outcome in batches.collect(
-            results, bspec.items, transcription_type=ports.transcription, tally=tally
-        ):
+        for outcome in batches.collect(results, bspec.items, tally=tally):
             spec, t = outcome.spec, outcome.transcription
             if t is not None:
                 if ctx.index.transcript(spec.document, spec.page, spec.hash) is not None:
@@ -371,13 +435,31 @@ class OcrRunner:
                     # lazy save; either way it is not replaced or counted again.
                     counts["exists"] += 1
                     continue
-                page_cost = self._record(job.uid, bspec.mode, t, BATCH_DISCOUNT)
+                page_cost = self._record(
+                    job.uid, bspec.mode, t.input_tokens, t.output_tokens, t.model, True
+                )
                 cost += page_cost
                 if outcome.error is None:
-                    stored = self._store(ctx, spec, bspec.mode, t, prompt_version, page_cost)
+                    stored = self._store(ctx, spec, bspec.mode, t, bspec.prompt_version, page_cost)
                     counts["stored" if stored else "stale"] += 1
-                    continue
-            fall_back.append(spec)
+                elif outcome.error == "too_large":
+                    dead.append((spec, "too_large"))  # the same page would be too large again
+                else:
+                    fall_back.append(spec)
+                continue
+            if outcome.billed != (0, 0):
+                cost += self._record(job.uid, bspec.mode, *outcome.billed, model, True)
+            error = outcome.error or "item_error"
+            if error in KEY_REASONS:
+                refused_key = error
+                fall_back.append(spec)  # deferred while the key's note applies
+            elif outcome.retryable:
+                fall_back.append(spec)
+            else:
+                dead.append((spec, error))
+        if refused_key is not None:
+            note_key_refusal(ctx.index, bspec.mode, refused_key, self.worker.clock())
+        counts["failed"] = self._settle(ctx, dead)
         counts["fallback"] = self._fall_back(ctx, fall_back)
         counts["stale"] += len(fall_back) - counts["fallback"]
         return {
@@ -388,14 +470,18 @@ class OcrRunner:
             "cost_usd": round(cost, 6),
         }
 
-    def _fall_back(self, ctx: AccountContext, specs: Any) -> int:
+    def _current(self, ctx: AccountContext, spec: OcrSpec) -> bool:
+        """Whether ``spec`` is still the page's version and has no transcript yet."""
+        row = ctx.index.page_by_id(spec.document, spec.page)
+        if row is None or row.content_hash != spec.hash:
+            return False
+        return ctx.index.transcript(spec.document, spec.page, spec.hash) is None
+
+    def _fall_back(self, ctx: AccountContext, specs: Iterable[OcrSpec]) -> int:
         """Single ``ocr`` jobs for batch items still current and untranscribed."""
         queued = 0
         for spec in specs:
-            row = ctx.index.page_by_id(spec.document, spec.page)
-            if row is None or row.content_hash != spec.hash:
-                continue
-            if ctx.index.transcript(spec.document, spec.page, spec.hash) is not None:
+            if not self._current(ctx, spec):
                 continue
             job, how = enqueue_page(
                 self.worker.queue, uid=ctx.uid, acct=ctx.acct, spec=spec, retry_failed=False
@@ -403,6 +489,35 @@ class OcrRunner:
             if job is not None and how in ("queued", "rerun"):
                 queued += 1
         return queued
+
+    def _settle(self, ctx: AccountContext, dead: Sequence[tuple[OcrSpec, str]]) -> int:
+        """A ``dead`` ``ocr`` job for each page the API refused for good inside the batch.
+
+        The page version then has a finished job like any refused page, so the scan does
+        not send it again; ``transcribe`` can still re-run it on request.
+        """
+        queue = self.worker.queue
+        settled = 0
+        for spec, reason in dead:
+            if not self._current(ctx, spec):
+                continue
+            key = spec.key(ctx.acct)
+            family = queue.family(ctx.uid, key)
+            if family:
+                latest = family[-1]
+                if latest.state not in ("done", "dead", "cancelled"):
+                    continue  # a job for the page is already under way; let it finish
+                key = rerun_key(latest.dedupe_key, latest.id)
+            queue.record_dead(
+                uid=ctx.uid,
+                acct=ctx.acct,
+                kind=OCR,
+                dedupe_key=key,
+                payload=spec.payload(),
+                error=reason,
+            )
+            settled += 1
+        return settled
 
     # ---- the scan --------------------------------------------------------------------------
 
@@ -426,17 +541,23 @@ class OcrRunner:
         worker = self.worker
         settings = worker.settings
         index = ctx.index
+        adopted = await asyncio.to_thread(self._adopt_pending, ctx)
+        if adopted:
+            log_event(logger, "ocr_batch_adopted", acct=ctx.acct, count=adopted)
         auto = await asyncio.to_thread(load_auto_ocr, index)
         if not auto.enabled or not auto.folders:
             return 0
-        resolution = await asyncio.to_thread(
-            resolve_mode, ports, settings, worker.store, ctx.uid, now
-        )
-        mode = resolution.mode
-        if mode not in SERVER_MODES or resolution.api_key is None:
+        choice = await asyncio.to_thread(resolve_mode, ports, settings, worker.store, ctx.uid, now)
+        mode = key_mode(choice.mode)
+        del choice
+        if mode is None:
+            return 0
+        refusal = await asyncio.to_thread(load_key_refusal, index)
+        if refusal is not None and refusal.applies(mode, now):
+            log_event(logger, "ocr_scan_skipped", acct=ctx.acct, reason=KEY_REFUSED)
             return 0
         allowance = await asyncio.to_thread(
-            ports.ledger.allowance, settings, worker.store, ctx.uid, now
+            ports.ledger.allowance, settings, worker.store, ctx.uid, now, mode=mode
         )
         blocked = blocked_reason(allowance, mode)
         if blocked is not None:
@@ -445,20 +566,40 @@ class OcrRunner:
         candidates, batch_running = await asyncio.to_thread(self._candidates, ctx, auto, now)
         if not candidates:
             return 0
-        per_page = ports.cost_usd(settings, EST_INPUT_TOKENS, EST_OUTPUT_TOKENS)
         remaining = remaining_usd(allowance, mode)
         if len(candidates) > settings.ocr_batch_min:
             if batch_running:
                 return 0  # one batch per account at a time; the rest goes in the next one
-            afford = affordable_pages(remaining, per_page * BATCH_DISCOUNT, len(candidates))
+            per_item = cost_usd(settings, EST_INPUT_TOKENS, EST_OUTPUT_TOKENS, batch=True)
+            afford = affordable_pages(remaining, per_item, len(candidates))
             submitted = await self._submit_batch(ctx, candidates[:afford], mode, now)
             if submitted is not None:
                 return submitted
+        per_page = cost_usd(settings, EST_INPUT_TOKENS, EST_OUTPUT_TOKENS)
         count = affordable_pages(remaining, per_page, len(candidates))
         queued = await asyncio.to_thread(self._enqueue_singles, ctx, candidates[:count])
         if queued:
             log_event(logger, "ocr_scan", acct=ctx.acct, outcome="single", count=queued)
         return queued
+
+    def _adopt_pending(self, ctx: AccountContext) -> int:
+        """Queue the ``ocr_batch`` job of every pending batch that has none; forget them."""
+        queue = self.worker.queue
+        adopted = 0
+        for bspec in load_pending_batches(ctx.index):
+            key = bspec.key(ctx.acct)
+            if not queue.family(ctx.uid, key):
+                queue.enqueue(
+                    uid=ctx.uid,
+                    acct=ctx.acct,
+                    kind=bspec.kind,
+                    dedupe_key=key,
+                    payload=bspec.payload(),
+                    max_attempts=batches.BATCH_MAX_ATTEMPTS,
+                )
+                adopted += 1
+            drop_pending_batch(ctx.index, bspec.batch_id)
+        return adopted
 
     def _candidates(
         self, ctx: AccountContext, auto: Any, now: datetime
@@ -478,12 +619,14 @@ class OcrRunner:
         stable = [r for r in rows if is_stable(r, now=now, previous_poll_at=previous)]
         running = queue.active(ctx.uid, acct=ctx.acct, kind=OCR_BATCH)
         in_batch: set[tuple[str, str, str]] = set()
+        specs: list[OcrBatchSpec] = load_pending_batches(index)
         for job in running:
             try:
-                items = parse_ocr_batch_payload(job.payload).items.values()
+                specs.append(parse_ocr_batch_payload(job.payload))
             except ScriptoriumError:
                 continue
-            in_batch.update((s.document, s.page, s.hash) for s in items)
+        for bspec in specs:
+            in_batch.update((s.document, s.page, s.hash) for s in bspec.items.values())
         generations: dict[str, int | None] = {}
         out: list[OcrSpec] = []
         for row in stable:
@@ -492,7 +635,7 @@ class OcrRunner:
             family = queue.family(
                 ctx.uid, ocr_key(ctx.acct, row.document, row.page_id, row.content_hash)
             )
-            if family and not is_deferred(family[-1]):
+            if family and not (is_deferred(family[-1]) or is_key_failure(family[-1])):
                 continue
             generation = self._generation(ctx, row, generations)
             if generation is None:
@@ -523,55 +666,64 @@ class OcrRunner:
         return queued
 
     async def _submit_batch(
-        self, ctx: AccountContext, specs: Sequence[OcrSpec], mode: str, now: datetime
+        self, ctx: AccountContext, specs: Sequence[OcrSpec], mode: BatchMode, now: datetime
     ) -> int | None:
         """Submit ``specs`` (those rendered already) as one batch and queue its job.
 
         None when too few pages are rendered for a batch: the caller queues single jobs,
-        which render as they go. 0 when the submission did not happen (logged).
+        which render as they go. 0 when the submission did not happen (logged). A page whose
+        image the API would refuse (F's ``check_png``) is left out of the batch and queued
+        as a single job, which dies with the reason.
         """
         ports = self.ports
         assert ports is not None
         worker = self.worker
         pages: list[batches.Planned] = []
+        unfit: list[OcrSpec] = []
         for spec in specs:
             rel = pg.png_relpath(spec.page, spec.hash)
             base = await asyncio.to_thread(_read_png, pg.resolve_png(ctx.paths, rel))
             if base is None:
                 continue
             png = await self._fit(ctx, spec.page, spec.hash, base, None)
+            if batches.fits(png) is not None:
+                unfit.append(spec)
+                continue
             pages.append(batches.Planned(spec, png))
         planned = batches.plan(pages)
         if len(planned) <= worker.settings.ocr_batch_min:
             return None
         # Checked again right before the submission: another account of the user, or a
         # tool call, may have spent since the scan began.
-        resolution = await asyncio.to_thread(
+        choice = await asyncio.to_thread(
             resolve_mode, ports, worker.settings, worker.store, ctx.uid, worker.clock()
         )
-        key = resolution.api_key
-        if resolution.mode != mode or key is None:
+        key = choice.api_key if choice.mode == mode else None
+        del choice
+        if key is None:
             return 0
         allowance = await asyncio.to_thread(
-            ports.ledger.allowance, worker.settings, worker.store, ctx.uid, worker.clock()
+            ports.ledger.allowance,
+            worker.settings,
+            worker.store,
+            ctx.uid,
+            worker.clock(),
+            mode=mode,
         )
         if blocked_reason(allowance, mode) is not None:
             return 0
-        client = ports.client(key)
-        del key, resolution
+        prompt = ports.prompt()
+        client = ports.client(worker.settings, key)
+        del key
         try:
-            batch_id = await asyncio.to_thread(
-                batches.submit, client, ports.prompt(), planned, ports.batch_item
-            )
-        except Exception as exc:
-            if isinstance(exc, InvalidArgumentError):
-                reason = "bad_batch_id"
-            elif isinstance(exc, ports.refused):
-                reason = "ocr_refused"
-            elif isinstance(exc, ports.unavailable):
+            batch_id = await asyncio.to_thread(batches.submit, client, prompt, planned)
+        except (InvalidArgumentError, OcrRefused, OcrUnavailable) as exc:
+            if isinstance(exc, OcrRefused):
+                reason = await asyncio.to_thread(self._refused, ctx, mode, exc)
+            elif isinstance(exc, OcrUnavailable):
                 reason = "ocr_unavailable"
             else:
-                raise
+                reason = "bad_batch_id"
             log_event(
                 logger,
                 "ocr_batch_submit_failed",
@@ -580,8 +732,17 @@ class OcrRunner:
                 reason=reason,
             )
             return 0
-        batch_mode: BatchMode = "user" if mode == "user" else "server"
-        bspec = OcrBatchSpec(batch_id, batch_mode, {cid: p.spec for cid, p in planned.items()})
+        finally:
+            client.close()
+        bspec = OcrBatchSpec(
+            batch_id,
+            mode,
+            {cid: p.spec for cid, p in planned.items()},
+            prompt_version=_prompt_version(prompt.version),
+        )
+        # Paid for from here on: remembered before anything else can fail, so the next scan
+        # adopts the batch if its job cannot be queued now.
+        await asyncio.to_thread(add_pending_batch, ctx.index, bspec)
         job = await asyncio.to_thread(
             worker.queue.enqueue,
             uid=ctx.uid,
@@ -592,6 +753,7 @@ class OcrRunner:
             max_attempts=batches.BATCH_MAX_ATTEMPTS,
             run_at=now + batches.BATCH_FIRST_POLL,
         )
+        await asyncio.to_thread(drop_pending_batch, ctx.index, batch_id)
         log_event(
             logger,
             "ocr_batch_submitted",
@@ -600,4 +762,5 @@ class OcrRunner:
             count=len(planned),
             bytes=sum(len(p.png) for p in planned.values()),
         )
-        return len(planned)
+        singles = await asyncio.to_thread(self._enqueue_singles, ctx, unfit)
+        return len(planned) + singles

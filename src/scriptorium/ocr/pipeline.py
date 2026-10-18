@@ -3,9 +3,20 @@
 - **The auto-OCR setting** (``settings`` key ``auto_ocr``): ``{"enabled": bool, "folders":
   [uuid, ...]}``, written by ``set_auto_ocr`` and read by the worker's scan. It is read
   defensively: anything malformed reads as disabled.
-- **The mode** a user's OCR runs in comes from F's ``resolve`` (§8.1); the allowance's
-  ``degraded`` field is read for the mode that applies (``own`` for a user's key, ``global``
-  and ``user`` for the server key).
+- **The mode** a user's OCR runs in comes from F's ``resolve`` (§8.1), with a stored key that
+  cannot be decrypted read as ``lazy`` / ``key_unreadable`` (never the server key); the
+  allowance is asked for the mode that applies (``own`` for a user's key, ``global`` and
+  ``user`` for the server key).
+- **A refused key** (``OcrRefused.about_key``: ``bad_key``, ``forbidden``, ``billing``,
+  ``model_unavailable``) is noted in the account's ``settings`` under ``ocr_key_refused``
+  (mode, reason code, time; never the key). While the note applies to the mode ``resolve``
+  picks, the worker sends nothing with that key: jobs are deferred and the scan queues
+  nothing, for :data:`KEY_REFUSED_HOLD` or until the user stores or clears their key. The
+  job that met the refusal dies with ``key_<reason>``; ``ocr_status`` shows the note.
+- **Pending batches** (``settings`` key ``ocr_pending_batches``): a batch's payload is
+  written there as soon as the API has accepted it and removed once its ``ocr_batch`` job is
+  queued, so a batch whose job could not be queued is adopted by the next scan instead of
+  being paid for and never collected.
 - **Queueing a page** follows the queue's dedupe convention: the key
   ``ocr:<acct>:<document>:<page>:<hash>`` names one page version, so ten polls of an
   unchanged page find the same job; a deliberate re-run (``force``, or a job that was
@@ -19,17 +30,25 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Final, Literal
 
+from pydantic import SecretStr
+
 from scriptorium.config import Settings
-from scriptorium.jobs.kinds import OcrSpec
+from scriptorium.db.connect import from_db_time, to_db_time
+from scriptorium.errors import ScriptoriumError
+from scriptorium.jobs.kinds import BatchMode, OcrBatchSpec, OcrSpec, parse_ocr_batch_payload
 from scriptorium.jobs.queue import JobQueue, JobRow
 from scriptorium.library.index import Index
 from scriptorium.library.layout import is_uuid
-from scriptorium.ocr._ports import AllowanceLike, OcrPorts, ResolutionLike
+from scriptorium.ocr._ports import OcrPorts
+from scriptorium.ocr.errors import KEY_REASONS
+from scriptorium.ocr.ledger import Allowance
+from scriptorium.ocr.modes import Mode
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import GlobalStore
 
@@ -37,18 +56,34 @@ __all__ = [
     "ACTIVE_STATES",
     "AUTO_OCR_KEY",
     "AUTO_OCR_MAX_FOLDERS",
+    "KEY_ERROR_PREFIX",
+    "KEY_REFUSED_HOLD",
+    "KEY_REFUSED_KEY",
+    "KEY_UNREADABLE",
     "LAZY",
     "OCR_IMAGE_SIDE",
     "OCR_MAX_ATTEMPTS",
+    "PENDING_BATCHES_KEY",
     "SERVER_MODES",
     "TRANSCRIPT_MAX_BYTES",
     "AutoOcr",
+    "KeyRefusal",
+    "ModeChoice",
     "Queued",
+    "add_pending_batch",
     "blocked_reason",
+    "clear_key_refusal",
+    "drop_pending_batch",
     "dump_auto_ocr",
     "enqueue_page",
     "is_deferred",
+    "is_key_failure",
+    "key_error",
+    "key_mode",
     "load_auto_ocr",
+    "load_key_refusal",
+    "load_pending_batches",
+    "note_key_refusal",
     "remaining_usd",
     "resolve_mode",
     "safe_model",
@@ -64,7 +99,17 @@ OCR_MAX_ATTEMPTS: Final = 5
 LAZY: Final = "lazy"
 SERVER_MODES: Final = frozenset({"user", "server"})
 ACTIVE_STATES: Final = frozenset({"queued", "leased", "failed"})
-MODEL_MAX: Final = 100
+KEY_UNREADABLE: Final = "key_unreadable"
+"""The reason a user whose stored key cannot be decrypted is in lazy mode (§8.1)."""
+KEY_REFUSED_KEY: Final = "ocr_key_refused"
+KEY_REFUSED_HOLD: Final = timedelta(hours=6)
+"""How long a refused key is left alone before one job tries it again."""
+KEY_ERROR_PREFIX: Final = "key_"
+"""Job errors ``key_<reason>``: the key, not the page, was refused."""
+PENDING_BATCHES_KEY: Final = "ocr_pending_batches"
+MAX_PENDING_BATCHES: Final = 10
+_MODEL_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,99}")
+"""A model id as ``SpendLedger.record`` accepts it."""
 
 
 # ---- the auto-OCR setting ---------------------------------------------------------------------
@@ -104,14 +149,45 @@ def dump_auto_ocr(setting: AutoOcr) -> str:
 # ---- the mode and the caps --------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ModeChoice:
+    """F's ``Resolution``, plus ``key_unreadable``; ``api_key`` is set for ``user``/``server``."""
+
+    mode: Mode
+    reason: str
+    api_key: SecretStr | None = field(default=None, repr=False, compare=False)
+
+
 def resolve_mode(
     ports: OcrPorts, settings: Settings, store: GlobalStore, uid: str, now: datetime
-) -> ResolutionLike:
-    """F's ``resolve`` for ``uid``; the caller drops the key as soon as it has used it."""
-    return ports.resolve(settings, store, SecretBox(settings, uid), ports.ledger, uid, now)
+) -> ModeChoice:
+    """F's ``resolve`` for ``uid``; the caller drops the key as soon as it has used it.
+
+    A stored key that cannot be decrypted is ``lazy`` / ``key_unreadable``: ``resolve`` fails
+    closed rather than spend the server key, and so does every caller of this function. A
+    key mode without a key (it cannot happen with F's ``resolve``) is lazy too.
+    """
+    try:
+        found = ports.resolve(settings, store, SecretBox(settings, uid), ports.ledger, uid, now)
+    except ScriptoriumError as exc:
+        if exc.code != "internal":
+            raise
+        return ModeChoice(LAZY, KEY_UNREADABLE)
+    if found.mode not in SERVER_MODES or found.api_key is None:
+        return ModeChoice(LAZY, str(found.reason))
+    return ModeChoice(found.mode, str(found.reason), found.api_key)
 
 
-def blocked_reason(allowance: AllowanceLike, mode: str) -> str | None:
+def key_mode(mode: str) -> BatchMode | None:
+    """``mode`` when a key is spent in it (``user`` or ``server``), else None."""
+    if mode == "user":
+        return "user"
+    if mode == "server":
+        return "server"
+    return None
+
+
+def blocked_reason(allowance: Allowance, mode: str) -> str | None:
     """The cap that stops ``mode`` now (a reason code), or None when there is room."""
     degraded = allowance.degraded
     if degraded is False or not isinstance(degraded, str):
@@ -123,7 +199,7 @@ def blocked_reason(allowance: AllowanceLike, mode: str) -> str | None:
     return None
 
 
-def remaining_usd(allowance: AllowanceLike, mode: str) -> float | None:
+def remaining_usd(allowance: Allowance, mode: str) -> float | None:
     """What ``mode`` may still spend this month; None when no cap applies."""
     if mode == "user":
         own = allowance.own_remaining_usd
@@ -141,10 +217,114 @@ def affordable_pages(remaining: float | None, per_page_usd: float, wanted: int) 
 
 
 def safe_model(model: object) -> str:
-    """A model name fit to store: printable, bounded; ``unknown`` otherwise (untrusted)."""
-    if isinstance(model, str) and 0 < len(model) <= MODEL_MAX and model.isprintable():
+    """A model id fit to store and record (the ledger's pattern); ``unknown`` otherwise."""
+    if isinstance(model, str) and _MODEL_RE.fullmatch(model):
         return model
     return "unknown"
+
+
+# ---- a refused key ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class KeyRefusal:
+    """The account's note that the key of ``mode`` was refused (``reason`` in KEY_REASONS)."""
+
+    mode: BatchMode
+    reason: str
+    at: datetime
+
+    def applies(self, mode: str, now: datetime) -> bool:
+        """Whether the worker should leave ``mode``'s key alone at ``now``."""
+        return self.mode == mode and now - self.at < KEY_REFUSED_HOLD
+
+
+def key_error(reason: str) -> str:
+    """The job error for a refused key: ``key_bad_key``, ``key_billing``, ..."""
+    return KEY_ERROR_PREFIX + reason
+
+
+def load_key_refusal(index: Index) -> KeyRefusal | None:
+    """The account's refused-key note; None when unset or malformed."""
+    raw = index.get_setting(KEY_REFUSED_KEY)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        mode, reason, at = value["mode"], value["reason"], from_db_time(value["at"])
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if mode not in SERVER_MODES or reason not in KEY_REASONS:
+        return None
+    return KeyRefusal(mode, reason, at)
+
+
+def note_key_refusal(index: Index, mode: str, reason: str, at: datetime) -> None:
+    """Record that ``mode``'s key was refused for ``reason`` (a code; never the key)."""
+    if mode not in SERVER_MODES or reason not in KEY_REASONS:
+        return
+    body = {"mode": mode, "reason": reason, "at": to_db_time(at)}
+    index.set_setting(KEY_REFUSED_KEY, json.dumps(body, separators=(",", ":")))
+
+
+def clear_key_refusal(index: Index, mode: str | None = None) -> None:
+    """Forget the note (only if it is about ``mode``, when given)."""
+    if index.get_setting(KEY_REFUSED_KEY) is None:
+        return
+    note = load_key_refusal(index)  # a malformed note is dropped whatever ``mode`` is
+    if mode is None or note is None or note.mode == mode:
+        index.set_setting(KEY_REFUSED_KEY, None)
+
+
+def is_key_failure(job: JobRow) -> bool:
+    """A job that died because the key was refused: re-run once the key is usable again."""
+    return job.state == "dead" and (job.error or "").startswith(KEY_ERROR_PREFIX)
+
+
+# ---- pending batches --------------------------------------------------------------------------
+
+
+def load_pending_batches(index: Index) -> list[OcrBatchSpec]:
+    """Batches submitted whose ``ocr_batch`` job may not exist; malformed entries are dropped."""
+    raw = index.get_setting(PENDING_BATCHES_KEY)
+    if raw is None:
+        return []
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(value, list):
+        return []
+    out: list[OcrBatchSpec] = []
+    for entry in value[:MAX_PENDING_BATCHES]:
+        try:
+            out.append(parse_ocr_batch_payload(entry))
+        except ScriptoriumError:
+            continue
+    return out
+
+
+def _store_pending(index: Index, batches: list[OcrBatchSpec]) -> None:
+    if not batches:
+        index.set_setting(PENDING_BATCHES_KEY, None)
+        return
+    body = [b.payload() for b in batches[-MAX_PENDING_BATCHES:]]
+    index.set_setting(PENDING_BATCHES_KEY, json.dumps(body, separators=(",", ":")))
+
+
+def add_pending_batch(index: Index, batch: OcrBatchSpec) -> None:
+    """Remember ``batch`` until its job is queued (the scan is the only writer)."""
+    kept = [b for b in load_pending_batches(index) if b.batch_id != batch.batch_id]
+    _store_pending(index, [*kept, batch])
+
+
+def drop_pending_batch(index: Index, batch_id: str) -> None:
+    pending = load_pending_batches(index)
+    kept = [b for b in pending if b.batch_id != batch_id]
+    if len(kept) != len(pending) or (
+        not kept and index.get_setting(PENDING_BATCHES_KEY) is not None
+    ):
+        _store_pending(index, kept)
 
 
 # ---- queueing ---------------------------------------------------------------------------------
@@ -168,7 +348,8 @@ def enqueue_page(
     - The latest job of the family is queued, leased or waiting to retry: that job
       (``active``).
     - The latest job finished: re-run it (``rerun``) when ``spec.force``, when it was
-      deferred, or when it died or was cancelled and ``retry_failed``; otherwise it is the
+      deferred or died of a refused key, or when it died or was cancelled and
+      ``retry_failed``; otherwise it is the
       answer (``finished``). A family at its re-run cap gives ``(None, "capped")``.
     """
     key = spec.key(acct)
@@ -189,6 +370,7 @@ def enqueue_page(
     again = (
         spec.force
         or is_deferred(latest)
+        or is_key_failure(latest)
         or (retry_failed and latest.state in ("dead", "cancelled"))
     )
     if not again:

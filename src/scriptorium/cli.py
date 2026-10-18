@@ -71,7 +71,6 @@ def _warn_about_settings(settings: Settings) -> None:
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
-    from scriptorium.ocr._ports import build_ocr_ports
     from scriptorium.server import create_app
     from scriptorium.tools._services import Services
 
@@ -80,7 +79,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 2
     # The server owns migrations (§6.1): the global database and every account index are
     # brought up to date before the first request; the worker waits for them.
-    services = Services.open(settings, ocr=build_ocr_ports(settings))
+    services = Services.open(settings)
     try:
         uvicorn.run(
             create_app(settings, services=services),
@@ -106,7 +105,6 @@ async def _run_worker(settings: Settings) -> int:
     import logging
 
     from scriptorium.logging import log_event
-    from scriptorium.ocr._ports import build_ocr_ports
     from scriptorium.worker import Worker, acquire_worker_lock
 
     lock = acquire_worker_lock(settings.data_dir)
@@ -119,7 +117,7 @@ async def _run_worker(settings: Settings) -> int:
         for sig in (signal.SIGTERM, signal.SIGINT):
             with contextlib.suppress(NotImplementedError):  # no signal handlers on Windows
                 loop.add_signal_handler(sig, stop.set)
-        worker = await Worker.open(settings, stop, ocr=build_ocr_ports(settings))
+        worker = await Worker.open(settings, stop)
         if worker is None:  # stopped while waiting for the server's migrations
             return 0
         try:

@@ -1,19 +1,24 @@
-"""What the transcription pipeline uses from workstream F (Plan 05 §3.1), as Protocols.
+"""The four OCR seams the transcription pipeline takes from one place (Plan 05 §3.1, §3.2).
 
-The pipeline (``ocr/batches.py``, ``ocr/pipeline.py``, ``ocr/runner.py``, the OCR tools) is
-written against these shapes, never against F's modules directly, so it can be built and
-tested before F's ``ocr/modes.py``, ``ocr/ledger.py``, ``ocr/client.py`` and
-``ocr/prompt.py`` exist. Tests inject fakes (``tests/fakes/ocr.py``). :func:`build_ocr_ports`
-is the one place that binds F's real classes; until it does, it returns ``None`` and every
-caller behaves as in M1 (lazy mode: the user's own Claude session transcribes).
+The pipeline (``ocr/runner.py``, the OCR tools, ``account_status.ocr``) reaches workstream F's
+modules directly for everything that is a value or a pure function: ``Transcription``,
+``BatchItem``, ``BatchStatus``, ``OcrItemError``, ``Prompt``, ``Resolution``, ``Spend``,
+``Allowance``, ``cost_usd``, ``check_png``, ``OcrRefused`` and ``OcrUnavailable``. Only what
+holds state, spends money or decides the mode goes through an :class:`OcrPorts`:
 
-Every attribute is declared as a read-only property so F's frozen dataclasses (with
-``Literal`` fields) satisfy the Protocols structurally. Parameters that only travel from one
-of F's functions back into another (the prompt, batch items, the ledger passed to
-``resolve``) are typed ``Any`` here so F's concrete parameter types stay compatible.
+- ``ledger``: the process's one ``SpendLedger`` (the server's ``Services.ledger``, the
+  worker's opened in ``Worker.open``), so every spend row and every cap check of a process
+  goes through one object;
+- ``client``: ``client_for(settings, key)``, the only way to an ``OcrClient``;
+- ``resolve``: ``ocr.modes.resolve``;
+- ``prompt``: ``ocr.prompt.load_prompt``;
+- ``batch_key``: the key a batch is collected with.
 
-Nothing here holds a key longer than a call: ``Resolution.api_key`` and the batch key are
-handed to the client factory and dropped.
+Tests replace any of them (``tests/fakes/ocr.py``: a fake client, an in-memory ledger whose
+caps a test sets directly, a resolver whose mode a test switches) without key material or
+settings juggling; production builds them with :func:`build_ocr_ports`. Nothing here holds a
+key longer than a call: ``Resolution.api_key`` and the batch key go to the client factory
+and are dropped.
 """
 
 from __future__ import annotations
@@ -21,133 +26,78 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Final, Protocol
+from typing import Any, Protocol
 
 from pydantic import SecretStr
 
 from scriptorium.config import Settings
+from scriptorium.errors import ScriptoriumError
+from scriptorium.ocr import modes
+from scriptorium.ocr.client import (
+    BatchItem,
+    BatchStatus,
+    OcrItemError,
+    Transcription,
+    client_for,
+)
+from scriptorium.ocr.ledger import Allowance, Spend
+from scriptorium.ocr.modes import Mode, Resolution, read_user_key
+from scriptorium.ocr.prompt import Prompt, load_prompt
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import GlobalStore
 
 __all__ = [
-    "BATCH_DISCOUNT",
-    "CLAUDE_KEY_NAME",
-    "AllowanceLike",
-    "BatchItemLike",
-    "BatchStatusLike",
+    "ClientFactory",
     "OcrClientLike",
-    "OcrItemErrorLike",
     "OcrPorts",
-    "PromptLike",
-    "ResolutionLike",
     "ResolveFn",
     "SpendLedgerLike",
-    "SpendLike",
-    "TranscriptionLike",
     "build_ocr_ports",
     "default_batch_key",
 ]
 
-CLAUDE_KEY_NAME: Final = "claude_api_key"
-"""The ``SecretBox`` name of the user's own key (§3.1)."""
-BATCH_DISCOUNT: Final = 0.5
-"""Message Batches cost half the standard price; ``cost_usd`` (F) prices a standard call."""
-
-
-class PromptLike(Protocol):
-    @property
-    def text(self) -> str: ...
-    @property
-    def version(self) -> str: ...
-
-
-class ResolutionLike(Protocol):
-    @property
-    def mode(self) -> str: ...  # "user" | "server" | "lazy"
-    @property
-    def reason(self) -> str: ...
-    @property
-    def api_key(self) -> SecretStr | None: ...
-
-
-class SpendLike(Protocol):
-    @property
-    def cost_usd(self) -> float: ...
-    @property
-    def pages(self) -> int: ...
-    @property
-    def input_tokens(self) -> int: ...
-    @property
-    def output_tokens(self) -> int: ...
-
-
-class AllowanceLike(Protocol):
-    @property
-    def global_remaining_usd(self) -> float: ...
-    @property
-    def user_remaining_usd(self) -> float: ...
-    @property
-    def own_remaining_usd(self) -> float | None: ...
-    @property
-    def degraded(self) -> bool | str: ...  # False | "global" | "user" | "own"
-
 
 class SpendLedgerLike(Protocol):
+    """``ocr.ledger.SpendLedger`` as the pipeline uses it."""
+
     def record(
         self,
         *,
         uid: str,
-        mode: Any,
+        mode: Mode,
         model: str,
         input_tokens: int,
         output_tokens: int,
         cost_usd: float,
         at: datetime,
     ) -> None: ...
-    def month(self, *, uid: str | None, mode: Any, at: datetime) -> SpendLike: ...
+    def month(self, *, uid: str | None, mode: Mode | None, at: datetime) -> Spend: ...
     def allowance(
-        self, settings: Settings, store: GlobalStore, uid: str, at: datetime
-    ) -> AllowanceLike: ...
-
-
-class TranscriptionLike(Protocol):
-    @property
-    def text(self) -> str: ...
-    @property
-    def model(self) -> str: ...
-    @property
-    def input_tokens(self) -> int: ...
-    @property
-    def output_tokens(self) -> int: ...
-    @property
-    def stop_reason(self) -> str: ...
-
-
-class OcrItemErrorLike(Protocol):
-    @property
-    def reason(self) -> str: ...
-
-
-class BatchStatusLike(Protocol):
-    @property
-    def state(self) -> str: ...  # "in_progress" | "ended" | "canceling" | "expired"
-
-
-class BatchItemLike(Protocol):
-    @property
-    def custom_id(self) -> str: ...
-    @property
-    def png(self) -> bytes: ...
+        self,
+        settings: Settings,
+        store: GlobalStore,
+        uid: str,
+        at: datetime,
+        *,
+        mode: Mode | None = None,
+    ) -> Allowance: ...
 
 
 class OcrClientLike(Protocol):
-    def transcribe(self, png: bytes, prompt: Any) -> TranscriptionLike: ...
-    def submit_batch(self, items: Sequence[Any], prompt: Any) -> str: ...
-    def batch_status(self, batch_id: str) -> BatchStatusLike: ...
-    def batch_results(self, batch_id: str) -> Iterator[tuple[str, object]]: ...
+    """``ocr.client.OcrClient`` as the pipeline uses it (one instance per key, then closed)."""
+
+    def transcribe(self, png: bytes, prompt: Prompt) -> Transcription: ...
+    def submit_batch(self, items: Sequence[BatchItem], prompt: Prompt) -> str: ...
+    def batch_status(self, batch_id: str) -> BatchStatus: ...
+    def batch_results(
+        self, batch_id: str
+    ) -> Iterator[tuple[str, Transcription | OcrItemError]]: ...
+    def close(self) -> None: ...
 
 
-ResolveFn = Callable[[Settings, GlobalStore, SecretBox, Any, str, datetime], ResolutionLike]
+ClientFactory = Callable[[Settings, SecretStr], OcrClientLike]
+"""``ocr.client.client_for(settings, key)``."""
+ResolveFn = Callable[[Settings, GlobalStore, SecretBox, Any, str, datetime], Resolution]
 """``ocr.modes.resolve(settings, store, secrets, ledger, uid, now)``."""
 
 
@@ -157,55 +107,30 @@ def default_batch_key(settings: Settings, box: SecretBox, mode: str) -> SecretSt
     Collecting results costs nothing more (the spend happened at submission), so a batch
     submitted before a cap was reached, or before the server key was withdrawn, is still
     collected and recorded. ``user``: the user's own key from the ``SecretBox``; ``server``:
-    ``ANTHROPIC_API_KEY``. None when that key is gone.
+    ``ANTHROPIC_API_KEY``. None when that key is gone or cannot be read.
     """
     if mode == "user":
-        raw = box.open(CLAUDE_KEY_NAME)
-        if raw is None:
-            return None
         try:
-            return SecretStr(raw.decode("utf-8"))
-        except UnicodeDecodeError:
+            return read_user_key(box)
+        except ScriptoriumError:
             return None
     if mode == "server":
-        # F adds ``anthropic_api_key`` to Settings (§3.1); read defensively until it merges.
-        key = getattr(settings, "anthropic_api_key", None)
-        return key if isinstance(key, SecretStr) else None
+        return settings.anthropic_api_key
     return None
 
 
 @dataclass(frozen=True)
 class OcrPorts:
-    """F's functions and classes as the pipeline uses them; one per process."""
+    """F's stateful OCR seams as the pipeline uses them; one per process."""
 
-    resolve: ResolveFn
     ledger: SpendLedgerLike
-    client: Callable[[SecretStr], OcrClientLike]
-    """``OcrClient(key, model=settings.ocr_model, max_tokens=settings.ocr_max_tokens)``."""
-    prompt: Callable[[], PromptLike]
-    """``ocr.prompt.load_prompt``."""
-    batch_item: Callable[[str, bytes], Any]
-    """``BatchItem(custom_id, png)``."""
-    cost_usd: Callable[[Settings, int, int], float]
-    """``ocr.ledger.cost_usd(settings, input_tokens, output_tokens)``: standard price."""
-    transcription: type[Any]
-    """``Transcription``: tells a batch result from an ``OcrItemError``."""
-    unavailable: tuple[type[BaseException], ...]
-    """``(OcrUnavailable,)``: try again later (rate limit, overload, network)."""
-    refused: tuple[type[BaseException], ...]
-    """``(OcrRefused,)``: a verdict (image rejected, key refused); not retried."""
+    client: ClientFactory = client_for
+    resolve: ResolveFn = modes.resolve
+    prompt: Callable[[], Prompt] = load_prompt
     batch_key: Callable[[Settings, SecretBox, str], SecretStr | None] = default_batch_key
-    """The key a batch submitted in ``mode`` is collected with."""
 
 
-def build_ocr_ports(settings: Settings) -> OcrPorts | None:
-    """The real ports, or None while F's modules are not wired (lazy mode everywhere).
-
-    Integration replaces the body with the binding of F's names (see the hand-back notes):
-    ``OcrPorts(resolve=modes.resolve, ledger=SpendLedger(...), client=lambda key:
-    OcrClient(key, model=settings.ocr_model, max_tokens=settings.ocr_max_tokens),
-    prompt=load_prompt, batch_item=BatchItem, cost_usd=cost_usd, transcription=Transcription,
-    unavailable=(OcrUnavailable,), refused=(OcrRefused,))``.
-    """
-    del settings
-    return None
+def build_ocr_ports(ledger: SpendLedgerLike, *, client: ClientFactory = client_for) -> OcrPorts:
+    """The production binding over the process's ledger (``client`` is ``Services.ocr_client``
+    on the server, so ``set_claude_api_key`` and the OCR tools share one factory)."""
+    return OcrPorts(ledger=ledger, client=client)
