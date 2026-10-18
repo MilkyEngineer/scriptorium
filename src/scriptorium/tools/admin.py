@@ -26,6 +26,7 @@ from scriptorium.tools._conventions import (
     tool_annotations,
 )
 from scriptorium.tools._library import services
+from scriptorium.tools._ocr import resume_ocr
 from scriptorium.tools._services import Services
 from scriptorium.users.store import UID_RE
 
@@ -63,6 +64,8 @@ def _allow_server_key(svc: Services, uid: str, allowed: bool) -> dict[str, objec
     row = svc.store.user(uid)
     if row is None:  # removed between the two statements; nothing else deletes users yet
         raise _unknown_user()
+    if allowed:
+        resume_ocr(svc, uid, forget_refusals=False)  # their deferred pages may run now
     settings = svc.settings
     listed = server_key_listed(settings, row)
     configured = settings.anthropic_api_key is not None

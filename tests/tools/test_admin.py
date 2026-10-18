@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from scriptorium.auth.oidc import OIDCValidator, uid_hash_for
+from scriptorium.jobs.kinds import OcrSpec
+from scriptorium.jobs.queue import is_deferred
 from scriptorium.users.store import uid_for
 from tests.conftest import ALLOWED_EMAIL, ALLOWED_SUB, ISSUER, FakeIssuer, make_settings
 from tests.fakes.ocr import FakeOcrFactory
@@ -113,6 +116,28 @@ async def test_grant_and_withdraw(app: Served) -> None:
         ("ok", {"user": USER_UID, "allowed": False}),
     ]
     assert SERVER_KEY not in json.dumps([granted, withdrawn])
+
+
+async def test_a_grant_wakes_the_users_deferred_ocr_jobs(app: Served) -> None:
+    queue = app.services.queue
+    acct = "01J0000000000000000000000A"
+    spec = OcrSpec(
+        "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002", "a" * 64, 1
+    )
+    job = queue.enqueue(
+        uid=USER_UID, acct=acct, kind="ocr", dedupe_key=spec.key(acct), payload=spec.payload()
+    )
+    leased = queue.lease("w", kinds=("ocr",))
+    assert leased is not None and leased.id == job.id
+    later = datetime(2030, 1, 1, tzinfo=UTC)
+    queue.defer(job.id, "w", until=later, reason="server_key_not_allowed")
+    await _admin(app, {"user": USER_UID, "allowed": False})
+    row = queue.get(job.id, USER_UID)
+    assert row is not None and is_deferred(row) and row.next_run_at == later
+    await _admin(app, {"user": USER_UID, "allowed": True})
+    row = queue.get(job.id, USER_UID)
+    assert row is not None and row.state == "queued" and not is_deferred(row)
+    assert row.next_run_at < later
 
 
 @pytest.mark.parametrize(

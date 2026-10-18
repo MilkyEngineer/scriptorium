@@ -21,18 +21,19 @@ from typing import Any
 
 import pytest
 
-from scriptorium.jobs.kinds import OCR_KINDS, OcrSpec
-from scriptorium.jobs.queue import JobRow
+from scriptorium.jobs.kinds import KEY_ERROR_PREFIX, OCR_KINDS, RERUN_CAP, OcrSpec
+from scriptorium.jobs.queue import JobRow, deferral_reason, is_deferred
 from scriptorium.library import pages as pg
 from scriptorium.ocr import runner as runner_mod
 from scriptorium.ocr._ports import build_ocr_ports
 from scriptorium.ocr.client import OcrItemError
 from scriptorium.ocr.debounce import STATE_OCR_POLL_AT
 from scriptorium.ocr.errors import OcrRefused, OcrUnavailable
-from scriptorium.ocr.ledger import SpendLedger, cost_usd
+from scriptorium.ocr.ledger import SpendLedger, cost_usd, month_bounds
 from scriptorium.ocr.modes import USER_KEY_SECRET
 from scriptorium.ocr.pipeline import (
     AUTO_OCR_KEY,
+    KEY_REFUSED_HOLD,
     KEY_REFUSED_KEY,
     PENDING_BATCHES_KEY,
     AutoOcr,
@@ -132,6 +133,27 @@ class Harness:
             assert job is not None
             out.append(job)
         return out
+
+    def get(self, job_id: int) -> JobRow:
+        job = self.linked.queue.get(job_id, self.linked.uid)
+        assert job is not None
+        return job
+
+    def spec(self, n: int, *, force: bool = False) -> OcrSpec:
+        """The current version of the notebook's page ``n`` (from 0)."""
+        index = self.linked.index()
+        page = index.page(NOTEBOOK, n)
+        version = pg.current_version(self.linked.paths, index, NOTEBOOK)
+        assert page is not None and version is not None
+        return OcrSpec(NOTEBOOK, page.page_id, page.content_hash, version.generation, force)
+
+    def enqueue(self, spec: OcrSpec, **kwargs: bool) -> tuple[JobRow | None, str]:
+        linked = self.linked
+        kwargs.setdefault("retry_failed", False)
+        return enqueue_page(linked.queue, uid=linked.uid, acct=linked.acct, spec=spec, **kwargs)
+
+    def after_keys(self) -> list[JobRow]:
+        return [j for j in self.jobs() if ":after:" in j.dedupe_key]
 
     def transcribed(self) -> dict[str, str]:
         index = self.linked.index()
@@ -272,8 +294,11 @@ async def test_without_ports_the_worker_stays_lazy(harness: Harness) -> None:
     job = harness.jobs()[0]
     assert job.state == "queued"
     await harness.linked.worker.drain_jobs(kinds=OCR_KINDS)
-    done = harness.linked.queue.get(job.id, harness.linked.uid)
-    assert done is not None and done.result == {"state": "deferred", "reason": "not_configured"}
+    later = harness.get(job.id)
+    assert (later.state, deferral_reason(later), later.attempts) == ("queued", "not_configured", 0)
+    assert later.result is None
+    wait = later.next_run_at - harness.linked.clock.now
+    assert timedelta(minutes=55) < wait <= runner_mod.DEFER_RECHECK
 
 
 async def test_spend_stops_at_the_cap(harness: Harness) -> None:
@@ -293,28 +318,76 @@ async def test_spend_stops_at_the_cap(harness: Harness) -> None:
     assert harness.client.pages_sent() == calls
 
 
-async def test_a_deferred_page_is_queued_again_once_a_key_is_back(harness: Harness) -> None:
-    await harness.poll()
-    harness.resolver.mode = "lazy"
-    index = harness.linked.index()
-    page = index.page(NOTEBOOK, 0)
-    version = pg.current_version(harness.linked.paths, index, NOTEBOOK)
-    assert page is not None and version is not None
-    spec = OcrSpec(NOTEBOOK, page.page_id, page.content_hash, version.generation)
-    job, _ = enqueue_page(
-        harness.linked.queue,
-        uid=harness.linked.uid,
-        acct=harness.linked.acct,
-        spec=spec,
-        retry_failed=False,
-    )
+async def test_a_deferred_page_runs_under_its_own_key_once_a_key_is_back(
+    harness: Harness,
+) -> None:
+    h = harness
+    await h.poll()
+    h.resolver.mode = "lazy"
+    job, _ = h.enqueue(h.spec(0))
     assert job is not None
-    await harness.linked.worker.drain_jobs(kinds=OCR_KINDS)
-    deferred = harness.linked.queue.get(job.id, harness.linked.uid)
-    assert deferred is not None and deferred.result == {"state": "deferred", "reason": "no_key"}
-    harness.resolver.mode = "server"
-    await harness.poll(2)
-    assert PAGES[0] in harness.transcribed()
+    await h.linked.worker.drain_jobs(kinds=OCR_KINDS)
+    deferred = h.get(job.id)
+    assert (deferred.state, deferral_reason(deferred), deferred.attempts) == ("queued", "no_key", 0)
+    # The scan wakes it once a key is there, whether or not auto-OCR covers the page.
+    h.linked.index().set_setting(AUTO_OCR_KEY, None)
+    h.resolver.mode = "server"
+    await h.poll()
+    done = h.get(job.id)
+    assert (done.state, done.attempts) == ("done", 1)
+    assert done.result is not None and done.result["state"] == "stored"
+    assert set(h.transcribed()) == {PAGES[0]} and h.after_keys() == []
+
+
+async def test_waiting_for_a_key_never_spends_an_attempt_or_a_rerun(harness: Harness) -> None:
+    """Review scenario C: deferrals used to finish the job, so every read_page while no key
+    (or no room) was available minted an :after: re-run, and RERUN_CAP was spent waiting."""
+    h = harness
+    await h.poll()
+    h.resolver.mode = "lazy"
+    spec = h.spec(0)
+    first, how = h.enqueue(spec)
+    assert first is not None and how == "queued"
+    for _ in range(RERUN_CAP + 2):
+        # Each round wakes the job (as transcribe does) and lets the worker look at it again.
+        job, how = h.enqueue(spec, wake=True)
+        assert job is not None and (job.id, how) == (first.id, "active")
+        await h.linked.worker.drain_jobs(kinds=OCR_KINDS)
+        later = h.get(first.id)
+        assert (later.state, deferral_reason(later), later.attempts) == ("queued", "no_key", 0)
+    assert len(h.linked.queue.family(h.linked.uid, first.dedupe_key)) == 1
+    assert h.client.pages_sent() == 0
+    # The key is back: the next poll wakes the job and every page is transcribed once.
+    h.resolver.mode = "server"
+    await h.poll(3)
+    assert set(h.transcribed()) == set(PAGES)
+    assert h.client.pages_sent() == len(PAGES) and h.after_keys() == []
+    done = h.get(first.id)
+    assert (done.state, done.attempts) == ("done", 1)
+    # The page's re-runs are all still there for the user.
+    forced, how = h.enqueue(h.spec(0, force=True), retry_failed=True)
+    assert forced is not None and how == "rerun"
+
+
+async def test_a_capped_job_waits_for_the_month_unless_room_comes_back(harness: Harness) -> None:
+    h = harness
+    await h.poll()
+    h.ledger.user_cap = 0.0
+    job, _ = h.enqueue(h.spec(1))
+    assert job is not None
+    await h.linked.worker.drain_jobs(kinds=OCR_KINDS)
+    later = h.get(job.id)
+    assert (deferral_reason(later), later.attempts) == ("cap_reached_user", 0)
+    assert later.next_run_at == month_bounds(h.linked.clock.now)[1]
+    # The scan sees the cap and queues nothing, leaving the job asleep.
+    await h.poll()
+    assert h.get(job.id).next_run_at == later.next_run_at and len(h.jobs()) == 1
+    # Room again (the operator raised the cap): the scan wakes it.
+    h.ledger.user_cap = 10.0
+    await h.poll()
+    done = h.get(job.id)
+    assert done.state == "done" and done.result is not None and done.result["state"] == "stored"
+    assert h.after_keys() == []
 
 
 # ---- single jobs ------------------------------------------------------------------------------
@@ -434,10 +507,119 @@ async def test_a_refused_key_does_not_pause_the_other_mode(harness: Harness) -> 
 
 async def test_a_queued_job_defers_while_the_key_is_refused(harness: Harness) -> None:
     h = harness
-    note_key_refusal(h.linked.index(), "server", "billing", h.linked.clock.now)
+    at = h.linked.clock.now
+    note_key_refusal(h.linked.index(), "server", "billing", at)
     job = await _one_job(h)
-    assert (job.state, job.result) == ("done", {"state": "deferred", "reason": "key_refused"})
+    assert (job.state, deferral_reason(job), job.attempts) == ("queued", "key_refused", 0)
+    assert job.next_run_at == at + KEY_REFUSED_HOLD and job.result is None
     assert h.client.pages_sent() == 0
+    # Once the hold has passed, it runs under its own key.
+    h.linked.clock.now = at + KEY_REFUSED_HOLD + timedelta(minutes=1)
+    await h.linked.worker.drain_jobs(kinds=OCR_KINDS)
+    done = h.get(job.id)
+    assert done.state == "done" and done.result is not None and done.result["state"] == "stored"
+    assert h.after_keys() == []
+
+
+async def test_a_key_refused_across_several_holds_still_transcribes_every_page(
+    harness: Harness,
+) -> None:
+    """Review scenario D: every hold used to end with each waiting page re-run once, so a
+    key refused for a few days left every page at its re-run cap, never transcribed."""
+    h = harness
+    cycles = RERUN_CAP + 1
+    for _ in range(cycles):
+        h.client.transcriptions.append(OcrRefused("billing"))
+    await h.poll()  # first sight: nothing is stable yet
+    for cycle in range(1, cycles + 1):
+        h.linked.clock.now += KEY_REFUSED_HOLD + timedelta(hours=1)
+        await h.poll()
+        jobs = h.jobs()
+        dead = [j for j in jobs if j.state == "dead"]
+        assert len(dead) == cycle and all(j.error == "key_billing" for j in dead)
+        assert all(j.attempts <= 1 for j in jobs)
+        waiting = [j for j in jobs if j.state != "dead"]
+        assert all(is_deferred(j) and deferral_reason(j) == "key_refused" for j in waiting)
+        # Re-runs only replace jobs that died of the refused key; waiting mints none.
+        by_id = {j.id: j for j in jobs}
+        for rerun in h.after_keys():
+            parent = by_id[int(rerun.dedupe_key.rsplit(":", 1)[1])]
+            assert parent.state == "dead" and (parent.error or "").startswith(KEY_ERROR_PREFIX)
+        assert len(h.after_keys()) == cycle - 1
+    # The billing problem is fixed and the hold has passed: every page is transcribed.
+    h.linked.clock.now += KEY_REFUSED_HOLD + timedelta(hours=1)
+    await h.poll(2)
+    assert set(h.transcribed()) == set(PAGES)
+    assert h.client.pages_sent() == cycles + len(PAGES)
+    # Only the key deaths were re-run, and none of them counted against the cap.
+    assert len(h.after_keys()) == cycles
+    forced, how = h.enqueue(h.spec(0, force=True), retry_failed=True)
+    assert forced is not None and how == "rerun"
+
+
+# ---- a removed account ------------------------------------------------------------------------
+
+
+async def test_a_job_for_a_removed_account_sends_nothing(harness: Harness) -> None:
+    h = harness
+    await h.poll()
+    job, _ = h.enqueue(h.spec(0))
+    assert job is not None
+    # Marked removed, directory not moved yet: the row is still there, with removed_at.
+    h.linked.store.mark_removed(h.linked.uid, h.linked.acct, at=h.linked.clock.now)
+    await h.linked.worker.drain_jobs(kinds=OCR_KINDS)
+    assert h.get(job.id).result == {"state": "gone"}
+    assert h.client.calls == [] and h.ledger.pages() == 0
+
+
+async def test_an_account_removed_while_its_page_renders_sends_nothing(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = harness
+    await h.poll()
+    job, _ = h.enqueue(h.spec(0))
+    assert job is not None
+    real = runner_mod.batches.fits
+
+    def removed_meanwhile(png: bytes) -> str | None:
+        h.linked.store.mark_removed(h.linked.uid, h.linked.acct, at=h.linked.clock.now)
+        return real(png)
+
+    monkeypatch.setattr(runner_mod.batches, "fits", removed_meanwhile)
+    await h.linked.worker.drain_jobs(kinds=OCR_KINDS)
+    assert h.get(job.id).result == {"state": "gone"}
+    assert h.client.calls == [] and h.ledger.pages() == 0
+
+
+async def test_a_scan_of_a_removed_account_submits_nothing(batching: Harness) -> None:
+    h = batching
+    await h.poll()  # first sight
+    h.linked.store.mark_removed(h.linked.uid, h.linked.acct, at=h.linked.clock.now)
+    ctx = h.linked.context()
+    assert await h.linked.worker.ocr_runner.scan(ctx, complete=True) == 0
+    assert h.client.calls == [] and h.jobs() == [] and h.jobs("ocr_batch") == []
+    # The same scan with the mark lifted would have sent the batch.
+    h.linked.store.unmark_removed(h.linked.uid, h.linked.acct)
+    assert await h.linked.worker.ocr_runner.scan(ctx, complete=True) == len(PAGES)
+    assert len(h.client.batches) == 1
+
+
+async def test_an_account_removed_during_a_scan_submits_no_batch(
+    batching: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = batching
+    real = runner_mod.batches.plan
+
+    def removed_meanwhile(pages: Any) -> Any:
+        planned = real(pages)
+        if planned:
+            h.linked.store.mark_removed(h.linked.uid, h.linked.acct, at=h.linked.clock.now)
+        return planned
+
+    monkeypatch.setattr(runner_mod.batches, "plan", removed_meanwhile)
+    await h.poll(2)
+    assert h.client.count("submit_batch") == 0 and h.client.batches == {}
+    assert h.jobs("ocr_batch") == []
 
 
 # ---- the real binding -----------------------------------------------------------------------
@@ -674,8 +856,12 @@ async def test_a_refused_key_in_a_batch_defers_the_fallback(batching: Harness) -
     await _until_ended(h, batch_id, results=results)
     note = json.loads(h.linked.index().get_setting(KEY_REFUSED_KEY) or "{}")
     assert (note["mode"], note["reason"]) == ("server", "bad_key")
-    assert all(j.result == {"state": "deferred", "reason": "key_refused"} for j in h.jobs())
+    assert len(h.jobs()) == 7
+    assert all(deferral_reason(j) == "key_refused" and j.attempts == 0 for j in h.jobs())
     assert h.client.count("transcribe") == 0
+    h.linked.clock.now += KEY_REFUSED_HOLD + timedelta(minutes=1)
+    await h.poll()
+    assert set(h.transcribed()) == set(PAGES) and h.after_keys() == []
 
 
 async def test_a_batch_whose_key_is_gone_falls_back_to_single_jobs(batching: Harness) -> None:

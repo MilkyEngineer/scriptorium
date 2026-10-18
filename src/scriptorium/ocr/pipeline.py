@@ -10,18 +10,23 @@
 - **A refused key** (``OcrRefused.about_key``: ``bad_key``, ``forbidden``, ``billing``,
   ``model_unavailable``) is noted in the account's ``settings`` under ``ocr_key_refused``
   (mode, reason code, time; never the key). While the note applies to the mode ``resolve``
-  picks, the worker sends nothing with that key: jobs are deferred and the scan queues
-  nothing, for :data:`KEY_REFUSED_HOLD` or until the user stores or clears their key. The
-  job that met the refusal dies with ``key_<reason>``; ``ocr_status`` shows the note.
+  picks, the worker sends nothing with that key: jobs are deferred, the scan queues
+  nothing and ``read_page`` answers as in lazy mode, for :data:`KEY_REFUSED_HOLD` or until
+  the user stores or clears their key. The job that met the refusal dies with
+  ``key_<reason>``; ``ocr_status`` shows the note.
 - **Pending batches** (``settings`` key ``ocr_pending_batches``): a batch's payload is
   written there as soon as the API has accepted it and removed once its ``ocr_batch`` job is
   queued, so a batch whose job could not be queued is adopted by the next scan instead of
   being paid for and never collected.
 - **Queueing a page** follows the queue's dedupe convention: the key
   ``ocr:<acct>:<document>:<page>:<hash>`` names one page version, so ten polls of an
-  unchanged page find the same job; a deliberate re-run (``force``, or a job that was
-  deferred because no key was available) is an ``:after:`` re-run of the latest job, at most
-  :data:`~scriptorium.jobs.kinds.RERUN_CAP` per page version for all time.
+  unchanged page find the same job. A job that cannot run now (no key, a cap reached, a
+  refused key) is *deferred* (``JobQueue.defer``): it stays queued under its key until the
+  situation changes, so waiting never mints a re-run. A deliberate re-run (``force``, a dead
+  job ``transcribe`` retries, or a job that died of a refused key, which the scan retries
+  once the key's hold is over) is an ``:after:`` re-run of the latest job, at most
+  :data:`~scriptorium.jobs.kinds.RERUN_CAP` per page version for all time; re-runs of
+  ``key_*`` deaths are not counted, since the refusal was not about the page.
 
 Payloads carry UUIDs, hashes and generations only; transcripts never enter a job.
 """
@@ -31,18 +36,23 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Final, Literal
+from typing import Final, Literal
 
 from pydantic import SecretStr
 
 from scriptorium.config import Settings
 from scriptorium.db.connect import from_db_time, to_db_time
 from scriptorium.errors import ScriptoriumError
-from scriptorium.jobs.kinds import BatchMode, OcrBatchSpec, OcrSpec, parse_ocr_batch_payload
-from scriptorium.jobs.queue import JobQueue, JobRow
+from scriptorium.jobs.kinds import (
+    KEY_ERROR_PREFIX,
+    BatchMode,
+    OcrBatchSpec,
+    OcrSpec,
+    parse_ocr_batch_payload,
+)
+from scriptorium.jobs.queue import JobQueue, JobRow, is_deferred
 from scriptorium.library.index import Index
 from scriptorium.library.layout import is_uuid
 from scriptorium.ocr._ports import OcrPorts
@@ -104,8 +114,6 @@ KEY_UNREADABLE: Final = "key_unreadable"
 KEY_REFUSED_KEY: Final = "ocr_key_refused"
 KEY_REFUSED_HOLD: Final = timedelta(hours=6)
 """How long a refused key is left alone before one job tries it again."""
-KEY_ERROR_PREFIX: Final = "key_"
-"""Job errors ``key_<reason>``: the key, not the page, was refused."""
 PENDING_BATCHES_KEY: Final = "ocr_pending_batches"
 MAX_PENDING_BATCHES: Final = 10
 _MODEL_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,99}")
@@ -277,7 +285,8 @@ def clear_key_refusal(index: Index, mode: str | None = None) -> None:
 
 
 def is_key_failure(job: JobRow) -> bool:
-    """A job that died because the key was refused: re-run once the key is usable again."""
+    """A job that died because the key was refused (``key_<reason>``): the scan re-runs it
+    once the key's hold is over, ``transcribe`` on request; ``read_page`` never does."""
     return job.state == "dead" and (job.error or "").startswith(KEY_ERROR_PREFIX)
 
 
@@ -333,24 +342,28 @@ def drop_pending_batch(index: Index, batch_id: str) -> None:
 Queued = Literal["queued", "rerun", "active", "finished", "capped"]
 
 
-def is_deferred(job: JobRow) -> bool:
-    """A finished ``ocr`` job that did nothing because no key or no room was available."""
-    result: Mapping[str, Any] | None = job.result
-    return job.state == "done" and result is not None and result.get("state") == "deferred"
-
-
 def enqueue_page(
-    queue: JobQueue, *, uid: str, acct: str, spec: OcrSpec, retry_failed: bool
+    queue: JobQueue,
+    *,
+    uid: str,
+    acct: str,
+    spec: OcrSpec,
+    retry_failed: bool,
+    retry_key_failure: bool = False,
+    wake: bool = False,
 ) -> tuple[JobRow | None, Queued]:
     """Queue the ``ocr`` job for one page version, or find the one that exists.
 
     - No job for the key yet: a new one (``queued``).
-    - The latest job of the family is queued, leased or waiting to retry: that job
-      (``active``).
-    - The latest job finished: re-run it (``rerun``) when ``spec.force``, when it was
-      deferred or died of a refused key, or when it died or was cancelled and
-      ``retry_failed``; otherwise it is the
-      answer (``finished``). A family at its re-run cap gives ``(None, "capped")``.
+    - The latest job of the family is queued (deferred or not), leased or waiting to retry:
+      that job (``active``); a deferred one is made runnable now when ``wake`` (the caller
+      has just checked that a key with room is available).
+    - The latest job finished: re-run it (``rerun``) when ``spec.force``, when it died or was
+      cancelled and ``retry_failed`` (``transcribe``), or when it died of a refused key and
+      ``retry_key_failure`` (the scan, which runs only while no refusal applies); otherwise
+      it is the answer (``finished``). A family at its re-run cap gives ``(None, "capped")``.
+
+    A deferral is never finished work, so waiting for a key or a cap never mints a re-run.
     """
     key = spec.key(acct)
     family = queue.family(uid, key)
@@ -366,12 +379,13 @@ def enqueue_page(
         return job, "queued"
     latest = family[-1]
     if latest.state in ACTIVE_STATES:
+        if wake and is_deferred(latest):
+            latest = queue.wake(latest.id, uid) or latest
         return latest, "active"
     again = (
         spec.force
-        or is_deferred(latest)
-        or is_key_failure(latest)
         or (retry_failed and latest.state in ("dead", "cancelled"))
+        or (retry_key_failure and is_key_failure(latest))
     )
     if not again:
         return latest, "finished"

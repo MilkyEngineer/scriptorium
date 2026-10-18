@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from datetime import timedelta
 
 import pytest
 from mcp_types import ImageContent
@@ -18,10 +19,11 @@ from pydantic import SecretStr
 
 from scriptorium.auth.oidc import OIDCValidator
 from scriptorium.jobs.kinds import OCR_KINDS
+from scriptorium.jobs.queue import deferral_reason, is_deferred
 from scriptorium.ocr._ports import OcrPorts, build_ocr_ports
 from scriptorium.ocr.errors import OcrRefused
 from scriptorium.ocr.ledger import cost_usd
-from scriptorium.ocr.pipeline import KEY_REFUSED_KEY
+from scriptorium.ocr.pipeline import KEY_REFUSED_HOLD, KEY_REFUSED_KEY
 from scriptorium.tools.ocr import LAZY_INSTRUCTION
 from tests.cloud.fake_cloud import NOTEBOOK, PDF, fixture_documents
 from tests.conftest import FakeIssuer
@@ -268,6 +270,84 @@ async def test_clearing_the_key_clears_its_refusal(ocr: Ocr) -> None:
     assert ocr.linked.index().get_setting(KEY_REFUSED_KEY) is None
     status = await ocr.served.ok("ocr_status")
     assert (status["mode"], status["key_refused"]) == ("server", None)
+
+
+async def test_read_page_never_reruns_a_refused_key_and_answers_at_once_while_it_is_paused(
+    ocr: Ocr,
+) -> None:
+    """Review scenario E: read_page used to re-run a job that died of a refused key on every
+    read, and to queue (and wait for) jobs during the key's 6-hour hold."""
+    queue, uid = ocr.linked.queue, ocr.linked.uid
+    await ocr.served.ok("set_claude_api_key", {"key": USER_KEY})
+    ocr.client.transcriptions.append(OcrRefused("bad_key"))
+    await ocr.served.ok("transcribe", {"document": NOTEBOOK, "pages": [1]})
+    await ocr.drain()
+    assert queue.counts(uid)["ocr"] == {"dead": 1}
+    sent = ocr.client.pages_sent()
+    # During the hold: the dead page and a page with no job both answer as lazy mode, at once,
+    # and nothing is queued.
+    for page in (1, 2):
+        read = await ocr.served.call("read_page", {"document": NOTEBOOK, "page": page})
+        assert not read.is_error and LAZY_INSTRUCTION in text_of(read)
+    assert queue.counts(uid)["ocr"] == {"dead": 1}
+    # transcribe still queues; the worker defers the job until the hold is over, and asking
+    # again says so rather than waking it.
+    queued = await ocr.served.ok("transcribe", {"document": NOTEBOOK, "pages": [2]})
+    await ocr.drain()
+    again = await ocr.served.ok("transcribe", {"document": NOTEBOOK, "pages": [2]})
+    (item,) = again["jobs"]
+    assert item["job"] == queued["jobs"][0]["job"]
+    assert (item["state"], item["how"], item["deferred"]) == ("queued", "active", "key_refused")
+    # After the hold: read_page still leaves the dead job alone; the deferred one runs.
+    ocr.linked.clock.now += KEY_REFUSED_HOLD + timedelta(minutes=1)
+    read = await ocr.served.call("read_page", {"document": NOTEBOOK, "page": 1})
+    assert not read.is_error and LAZY_INSTRUCTION in text_of(read)
+    await ocr.drain()
+    assert queue.counts(uid)["ocr"] == {"dead": 1, "done": 1}
+    assert ocr.client.pages_sent() == sent + 1
+    # transcribe re-runs the dead page on request.
+    rerun = await ocr.served.ok("transcribe", {"document": NOTEBOOK, "pages": [1]})
+    assert rerun["jobs"][0]["how"] == "rerun"
+
+
+async def test_ocr_status_counts_deferred_jobs_and_read_page_does_not_wait_for_them(
+    ocr: Ocr,
+) -> None:
+    queue, uid = ocr.linked.queue, ocr.linked.uid
+    ports = ocr.linked.worker.ocr
+    ocr.linked.worker.ocr = None  # a worker without OCR defers every OCR job it leases
+    queued = await ocr.served.ok("transcribe", {"document": NOTEBOOK, "pages": [1, 2, 3]})
+    ids = [j["job"] for j in queued["jobs"]]
+    await ocr.drain()
+    status = await ocr.served.ok("ocr_status")
+    assert status["queue"]["ocr"] == {
+        "queued": 0,
+        "deferred": 3,
+        "running": 0,
+        "retrying": 0,
+        "done": 0,
+        "dead": 0,
+    }
+    assert status["deferred_reasons"] == {"not_configured": 3}
+    account = (await ocr.served.ok("account_status"))["ocr"]
+    assert account["queue"] == status["queue"]
+    # read_page answers as lazy mode at once and leaves the job asleep.
+    read = await ocr.served.call("read_page", {"document": NOTEBOOK, "page": 1})
+    assert not read.is_error and LAZY_INSTRUCTION in text_of(read)
+    first = queue.get(ids[0], uid)
+    assert first is not None and deferral_reason(first) == "not_configured"
+    # Storing a key wakes them; each runs under its own job, without a re-run.
+    ocr.linked.worker.ocr = ports
+    await ocr.served.ok("set_claude_api_key", {"key": USER_KEY})
+    woken = [queue.get(i, uid) for i in ids]
+    assert all(j is not None and not is_deferred(j) for j in woken)
+    await ocr.drain()
+    status = await ocr.served.ok("ocr_status")
+    assert (status["queue"]["ocr"]["deferred"], status["queue"]["ocr"]["done"]) == (0, 3)
+    assert status["deferred_reasons"] == {}
+    rows = queue._conn.execute("SELECT dedupe_key FROM jobs WHERE kind = 'ocr'").fetchall()
+    assert len(rows) == 3 and not any(":after:" in r[0] for r in rows)
+    assert ocr.factory.keys[-1] == USER_KEY
 
 
 # ---- set_auto_ocr ------------------------------------------------------------------------------

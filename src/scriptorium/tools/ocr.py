@@ -9,8 +9,9 @@ mislabelled.
 
 With a user or server key (M2, §8.1) the worker transcribes: ``transcribe`` queues ``ocr``
 jobs, ``read_page`` queues one on a miss and waits ``PENDING_WAIT_SECONDS`` for it
-(:func:`await_server_transcript`), and ``ocr_status`` reports the queue, the last failure
-reasons and the month's spend. The server never holds a key beyond the ``resolve`` call
+(:func:`await_server_transcript`), and ``ocr_status`` reports the queue (with the jobs
+deferred for want of a key or room, and why), the last failure reasons and the month's
+spend. The server never holds a key beyond the ``resolve`` call
 that decides the mode; the worker resolves again before it spends anything.
 
 Transcripts are note content: they are stored, returned to their owner, and never logged
@@ -29,6 +30,7 @@ from mcp_types import CallToolResult, ImageContent, TextContent
 from pydantic import Field
 
 from scriptorium.jobs.kinds import OCR_KINDS, OcrSpec
+from scriptorium.jobs.queue import JobRow, deferral_reason, is_deferred
 from scriptorium.library import pages as pg
 from scriptorium.library.index import DocumentRow, TranscriptRow
 from scriptorium.ocr.batches import PENDING_REASON
@@ -71,7 +73,13 @@ from scriptorium.tools._library import (
     use_account,
     use_document,
 )
-from scriptorium.tools._ocr import OCR_SERVER_NOTE, ocr_mode, ocr_queue, ocr_summary
+from scriptorium.tools._ocr import (
+    OCR_SERVER_NOTE,
+    ocr_deferred_reasons,
+    ocr_mode,
+    ocr_queue,
+    ocr_summary,
+)
 from scriptorium.tools._services import Services
 
 MODEL_MAX: Final = 100
@@ -198,21 +206,27 @@ async def await_server_transcript(
 
     Returns the transcript if it arrives within ``PENDING_WAIT_SECONDS``; raises ``pending``
     with the job id if the job is still queued or running then. None means "answer as in
-    lazy mode": no key, a page not indexed yet, or a job that finished without a transcript
-    (refused, failed for good, re-runs spent). A deferred job is queued again, since a key is
-    available now.
+    lazy mode", at once: no key, the key in use refused within ``KEY_REFUSED_HOLD``, a page
+    not indexed yet, a job the worker deferred (it found no key or no room), or a job that
+    finished without a transcript (refused, failed for good, re-runs spent). A deferred job is
+    left to wait rather than woken: the user's session may transcribe the page meanwhile, and
+    the job then finds the transcript and spends nothing. The scan, a stored key, an allowed
+    server key and ``transcribe`` wake deferred jobs.
     """
     svc = services(ctx)
     mode, _ = await asyncio.to_thread(ocr_mode, svc, account.uid)
     if mode not in SERVER_MODES:
         return None
     index = account.index
+    refusal = await asyncio.to_thread(load_key_refusal, index)
+    if refusal is not None and refusal.applies(mode, svc.clock()):
+        return None  # the worker leaves this key alone for now; nothing would run
     row = await asyncio.to_thread(index.page_by_id, doc.uuid, source.page_id)
     if row is None or row.content_hash != source.content_hash:
         return None
     spec = OcrSpec(doc.uuid, source.page_id, source.content_hash, generation)
-    # A dead job is not retried from here: every read of a page the API refuses would pay
-    # again. transcribe retries it on request.
+    # A dead job is not retried from here, whatever killed it (a refused key included):
+    # every read of a page the API refuses would pay again. transcribe retries it on request.
     job, _how = await asyncio.to_thread(
         enqueue_page, svc.queue, uid=account.uid, acct=account.acct, spec=spec, retry_failed=False
     )
@@ -226,7 +240,7 @@ async def await_server_transcript(
         )
         if transcript is not None:
             return transcript
-        if job.state in ("done", "dead", "cancelled"):
+        if job.state in ("done", "dead", "cancelled") or is_deferred(job):
             return None
         if time.monotonic() >= deadline:
             raise ToolError(
@@ -275,6 +289,14 @@ def _page_numbers(pages: Pages, wanted: list[int]) -> list[int]:
     return numbers
 
 
+def _job_item(job: JobRow, how: str) -> dict[str, object]:
+    item: dict[str, object] = {"job": job.id, "state": job.state, "how": how}
+    reason = deferral_reason(job) if is_deferred(job) else None
+    if reason is not None:
+        item["deferred"] = reason
+    return item
+
+
 def _queue_pages(
     svc: Services,
     account: Account,
@@ -282,8 +304,13 @@ def _queue_pages(
     pages: Pages,
     numbers: list[int],
     force: bool,
+    mode: str,
 ) -> list[dict[str, object]]:
+    """Queue (or re-run, when dead) each page's job. A deferred job is made runnable now
+    unless the key in use is on hold after a refusal, when it would only be deferred again."""
     index = account.index
+    refusal = load_key_refusal(index)
+    wake = refusal is None or not refusal.applies(mode, svc.clock())
     out: list[dict[str, object]] = []
     for number in numbers:
         source = pick_page(pages, number)
@@ -298,12 +325,17 @@ def _queue_pages(
                 doc.uuid, source.page_id, source.content_hash, pages.version.generation, force
             )
             job, how = enqueue_page(
-                svc.queue, uid=account.uid, acct=account.acct, spec=spec, retry_failed=True
+                svc.queue,
+                uid=account.uid,
+                acct=account.acct,
+                spec=spec,
+                retry_failed=True,
+                wake=wake,
             )
             if job is None:
                 item["state"] = "rerun_cap"
             else:
-                item.update({"job": job.id, "state": job.state, "how": how})
+                item.update(_job_item(job, how))
         out.append(item)
     return out
 
@@ -368,7 +400,9 @@ async def transcribe(ctx: ToolContext, args: TranscribeArgs) -> CallToolResult:
                 "transcript with save_transcript.",
             )
         return await _lazy_pages(ctx, account, doc, pages, numbers, args.force, reason)
-    jobs = await asyncio.to_thread(_queue_pages, svc, account, doc, pages, numbers, args.force)
+    jobs = await asyncio.to_thread(
+        _queue_pages, svc, account, doc, pages, numbers, args.force, mode
+    )
     ctx.audit["count"] = sum(1 for j in jobs if "job" in j)
     return json_result(
         {
@@ -438,6 +472,7 @@ def _ocr_status(svc: Services, account: Account) -> dict[str, Any]:
         **summary,
         "auto_ocr": {"enabled": auto.enabled, "folders": list(auto.folders)},
         "queue": queue,
+        "deferred_reasons": ocr_deferred_reasons(svc, account),
         "dead": sum(q["dead"] for q in queue.values()),
         "recent_errors": errors,
         "key_refused": key_refused,
@@ -448,8 +483,9 @@ async def ocr_status(ctx: ToolContext, args: OcrStatusArgs) -> CallToolResult:
     """Show background transcription for your account: the OCR mode and why (your own API
     key, the server key, or lazy mode), this month's spend and what remains under each cap
     that applies (the same numbers as account_status), whether auto-OCR is on and for which
-    folders, the queue of transcription jobs by state, the reasons of the latest failures,
-    and whether the Claude API refused the key in use."""
+    folders, the queue of transcription jobs by state (deferred jobs wait for a key, a cap's
+    monthly reset or a refused key's pause, with the reasons counted), the reasons of the
+    latest failures, and whether the Claude API refused the key in use."""
     account = await use_account(ctx, args.account)
     payload = await asyncio.to_thread(_ocr_status, services(ctx), account)
     return json_result(payload, cap=RESULT_CAP_BYTES)

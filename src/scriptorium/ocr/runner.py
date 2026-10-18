@@ -6,21 +6,27 @@
   it lists the pages under those folders that have no transcript of their current version,
   keeps those that :func:`~scriptorium.ocr.debounce.is_stable`, drops pages already in a
   running or pending batch or with an ``ocr`` job (a page version is queued once, ever,
-  unless its last job was deferred or died of a refused key), and bounds what is left by the
-  cap's remaining room at an estimated price per page. More than ``OCR_BATCH_MIN`` pages go
-  to Claude as one Message Batches request and an ``ocr_batch`` job polls it; fewer become
-  single ``ocr`` jobs. Caps are checked through the ledger's ``allowance`` for the resolved
-  mode before every submission; a degraded allowance, or a key refused within
-  ``KEY_REFUSED_HOLD``, queues nothing. After an ``ok`` poll the scan records the time under
-  :data:`~scriptorium.ocr.debounce.STATE_OCR_POLL_AT`, whatever the mode, for the next poll's
-  stability check.
-- **An ``ocr`` job** transcribes one page version: ``stale`` (nothing done) when the page
-  changed since it was queued, ``exists`` when a transcript is already there (unless
-  ``force``), ``deferred`` when no key, no room or only a refused key is available now;
-  otherwise it renders the page if needed, downscales it to 2576 px in the render pool,
-  checks it with F's ``check_png``, calls Claude in a thread while heartbeating the lease,
-  records the spend (also for a refusal the API billed) and stores the transcript with the
-  prompt version, token counts and cost. A refusal dies at once with its reason code
+  unless its last job died of a refused key), and bounds what is left by the cap's remaining
+  room at an estimated price per page. More than ``OCR_BATCH_MIN`` pages go to Claude as one
+  Message Batches request and an ``ocr_batch`` job polls it; fewer become single ``ocr``
+  jobs. Caps are checked through the ledger's ``allowance`` for the resolved mode before
+  every submission; a degraded allowance, or a key refused within ``KEY_REFUSED_HOLD``,
+  queues nothing. Once a key with room and no refusal is available, the scan also wakes the
+  account's deferred ``ocr`` jobs, whether or not auto-OCR is on. Nothing is scanned or sent
+  for an account whose row is marked removed. After an ``ok`` poll the scan records the time
+  under :data:`~scriptorium.ocr.debounce.STATE_OCR_POLL_AT`, whatever the mode, for the next
+  poll's stability check.
+- **An ``ocr`` job** transcribes one page version: ``gone`` when the account is unknown or
+  marked removed, ``stale`` (nothing done) when the page changed since it was queued,
+  ``exists`` when a transcript is already there (unless ``force``). When no key, no room or
+  only a refused key is available now it is *deferred* (``JobQueue.defer``): put back under
+  its own key, its attempt given back, until the refused key's hold ends, the month's caps
+  reset, or :data:`DEFER_RECHECK` passes (no key), or earlier when a stored key, an allowed
+  server key or the scan wakes it; waiting never spends an attempt or a re-run. Otherwise
+  it renders the page if needed, downscales it to 2576 px in the render pool, checks it with
+  F's ``check_png``, calls Claude in a thread while heartbeating the lease, records the
+  spend (also for a refusal the API billed) and stores the transcript with the prompt
+  version, token counts and cost. A refusal dies at once with its reason code
   (``key_<reason>`` when the key, not the page, was refused).
 - **An ``ocr_batch`` job** polls its batch with the queue's backoff and, once it has ended,
   streams the results through :func:`~scriptorium.ocr.batches.collect`, records the spend at
@@ -38,9 +44,9 @@ import asyncio
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NoReturn
 
 from scriptorium.db.connect import from_db_time, to_db_time
 from scriptorium.errors import InvalidArgumentError, NotFoundError, ScriptoriumError
@@ -57,7 +63,7 @@ from scriptorium.jobs.kinds import (
     parse_ocr_payload,
     rerun_key,
 )
-from scriptorium.jobs.queue import JobRow
+from scriptorium.jobs.queue import JobRow, LeaseLostError
 from scriptorium.library import pages as pg
 from scriptorium.library import render
 from scriptorium.library.index import PageRow
@@ -67,15 +73,15 @@ from scriptorium.ocr._ports import OcrClientLike, OcrPorts
 from scriptorium.ocr.client import Transcription
 from scriptorium.ocr.debounce import STATE_OCR_POLL_AT, is_stable
 from scriptorium.ocr.errors import KEY_REASONS, OcrRefused, OcrUnavailable
-from scriptorium.ocr.ledger import cost_usd
+from scriptorium.ocr.ledger import cost_usd, month_bounds
 from scriptorium.ocr.pipeline import (
+    KEY_REFUSED_HOLD,
     OCR_IMAGE_SIDE,
     add_pending_batch,
     affordable_pages,
     blocked_reason,
     drop_pending_batch,
     enqueue_page,
-    is_deferred,
     is_key_failure,
     key_error,
     key_mode,
@@ -92,7 +98,7 @@ from scriptorium.users.secrets import SecretBox
 if TYPE_CHECKING:
     from scriptorium.worker import AccountContext, Worker
 
-__all__ = ["OCR_SLOTS", "JobFailure", "OcrRunner"]
+__all__ = ["OCR_SLOTS", "JobDeferred", "JobFailure", "OcrRunner"]
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +112,11 @@ EST_OUTPUT_TOKENS: Final = 1_500
 MAX_PNG_BYTES: Final = 64 * 1024 * 1024
 KEY_REFUSED: Final = "key_refused"
 """Deferral reason while the account's refused-key note applies to the mode."""
+CAP_REASONS: Final = frozenset({"cap_reached_global", "cap_reached_user", "user_cap_reached"})
+"""Deferral reasons that last until the UTC month's caps reset (or the scan finds room)."""
+DEFER_RECHECK: Final = timedelta(hours=1)
+"""How long a job deferred for want of a key waits before it looks again; storing a key,
+being allowed the server key, or a scan that finds a usable key wakes it sooner."""
 BATCH_KEY_REASONS: Final = KEY_REASONS - {"model_unavailable"}
 """Key reasons that a batch lookup can tell: a 404 there means the batch is unknown."""
 
@@ -117,6 +128,28 @@ class JobFailure(Exception):  # noqa: N818 - a job outcome, not an error type fo
         super().__init__(reason)
         self.reason = reason
         self.final = final
+
+
+class JobDeferred(LeaseLostError):  # noqa: N818 - a job outcome, like JobFailure
+    """The runner put the job back to wait (``JobQueue.defer``): nothing is left to report.
+
+    A :class:`~scriptorium.jobs.queue.LeaseLostError` because that is what the worker's job
+    loop already reads as "the job's row is settled; neither complete nor fail it".
+    """
+
+
+class _Defer(Exception):  # noqa: N818 - control flow inside the runner
+    def __init__(self, reason: str, until: datetime) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.until = until
+
+
+def _defer_until(reason: str, now: datetime) -> datetime:
+    """When a job deferred because ``resolve`` found no usable key should look again."""
+    if reason in CAP_REASONS:
+        return month_bounds(now)[1]
+    return now + DEFER_RECHECK
 
 
 def _read_png(path: Path) -> bytes | None:
@@ -136,10 +169,6 @@ def _prompt_version(version: object) -> str | None:
     return None
 
 
-def _deferred(reason: str) -> dict[str, Any]:
-    return {"state": "deferred", "reason": reason}
-
-
 class OcrRunner:
     """The worker's OCR jobs and auto-OCR scan; one per :class:`~scriptorium.worker.Worker`."""
 
@@ -155,11 +184,30 @@ class OcrRunner:
         return self.worker.ocr
 
     async def run(self, job: JobRow) -> Mapping[str, Any]:
+        """Run one leased OCR job; its result, or :class:`JobDeferred` once it is put back."""
         if job.kind == OCR:
-            return await self.run_page(job)
+            try:
+                return await self.run_page(job)
+            except _Defer as wait:
+                await self._defer(job, wait)
         if job.kind == OCR_BATCH:
             return await self.run_batch(job)
         raise InvalidArgumentError("not an OCR job")
+
+    async def _defer(self, job: JobRow, wait: _Defer) -> NoReturn:
+        worker = self.worker
+        await asyncio.to_thread(
+            worker.queue.defer, job.id, worker.owner, until=wait.until, reason=wait.reason
+        )
+        log_event(logger, "ocr_deferred", job=job.id, acct=job.acct, reason=wait.reason)
+        raise JobDeferred("The job was deferred.")
+
+    def _gone(self, uid: str, acct: str | None) -> bool:
+        """The account is unknown, or marked removed (its directory may not be moved yet)."""
+        if acct is None:
+            return True
+        row = self.worker.store.account(uid, acct)
+        return row is None or row.removed_at is not None
 
     async def _call[T](self, job: JobRow, fn: Callable[..., T], *args: Any) -> T:
         """Run a blocking OCR call in the OCR threads, heartbeating ``job``'s lease.
@@ -178,10 +226,7 @@ class OcrRunner:
     async def run_page(self, job: JobRow) -> Mapping[str, Any]:
         spec = parse_ocr_payload(job.payload)
         worker = self.worker
-        if (
-            job.acct is None
-            or await asyncio.to_thread(worker.store.account, job.uid, job.acct) is None
-        ):
+        if job.acct is None or await asyncio.to_thread(self._gone, job.uid, job.acct):
             return {"state": "gone"}
         ctx = await asyncio.to_thread(worker.context, job.uid, job.acct)
         index = ctx.index
@@ -197,29 +242,31 @@ class OcrRunner:
         ):
             return {"state": "exists"}
         ports = self.ports
-        if ports is None:
-            return _deferred("not_configured")
-        settings = worker.settings
         now = worker.clock()
+        if ports is None:
+            raise _Defer("not_configured", now + DEFER_RECHECK)
+        settings = worker.settings
         choice = await asyncio.to_thread(resolve_mode, ports, settings, worker.store, job.uid, now)
         mode = key_mode(choice.mode)
         if mode is None or choice.api_key is None:
-            return _deferred(choice.reason)
+            raise _Defer(choice.reason, _defer_until(choice.reason, now))
         refusal = await asyncio.to_thread(load_key_refusal, index)
         if refusal is not None and refusal.applies(mode, now):
-            return _deferred(KEY_REFUSED)
+            raise _Defer(KEY_REFUSED, refusal.at + KEY_REFUSED_HOLD)
         allowance = await asyncio.to_thread(
             ports.ledger.allowance, settings, worker.store, job.uid, now, mode=mode
         )
         blocked = blocked_reason(allowance, mode)
         if blocked is not None:
-            return _deferred(blocked)
+            raise _Defer(blocked, month_bounds(now)[1])
         png = await self.ocr_png(ctx, spec, job)
         if png is None:
             return {"state": "stale"}
         unfit = batches.fits(png)
         if unfit is not None:
             raise JobFailure(unfit, final=True)
+        if await asyncio.to_thread(self._gone, job.uid, job.acct):
+            return {"state": "gone"}  # removed while the page was rendered: nothing is sent
         prompt = ports.prompt()
         client = ports.client(settings, choice.api_key)
         del choice
@@ -370,10 +417,7 @@ class OcrRunner:
     async def run_batch(self, job: JobRow) -> Mapping[str, Any]:
         bspec = parse_ocr_batch_payload(job.payload)
         worker = self.worker
-        if (
-            job.acct is None
-            or await asyncio.to_thread(worker.store.account, job.uid, job.acct) is None
-        ):
+        if job.acct is None or await asyncio.to_thread(self._gone, job.uid, job.acct):
             return {"state": "gone"}
         ctx = await asyncio.to_thread(worker.context, job.uid, job.acct)
         ports = self.ports
@@ -484,7 +528,12 @@ class OcrRunner:
             if not self._current(ctx, spec):
                 continue
             job, how = enqueue_page(
-                self.worker.queue, uid=ctx.uid, acct=ctx.acct, spec=spec, retry_failed=False
+                self.worker.queue,
+                uid=ctx.uid,
+                acct=ctx.acct,
+                spec=spec,
+                retry_failed=False,
+                retry_key_failure=True,
             )
             if job is not None and how in ("queued", "rerun"):
                 queued += 1
@@ -525,8 +574,11 @@ class OcrRunner:
         """Queue OCR for the stable, untranscribed pages under the auto-OCR folders.
 
         Returns the pages queued or submitted. ``complete`` (an ``ok`` poll) records this
-        poll's time for the next scan's stability check, whatever happens here.
+        poll's time for the next scan's stability check, whatever happens here. An account
+        marked removed is left alone.
         """
+        if await asyncio.to_thread(self._gone, ctx.uid, ctx.acct):
+            return 0
         now = self.worker.clock()
         try:
             return await self._scan(ctx, now)
@@ -545,7 +597,10 @@ class OcrRunner:
         if adopted:
             log_event(logger, "ocr_batch_adopted", acct=ctx.acct, count=adopted)
         auto = await asyncio.to_thread(load_auto_ocr, index)
-        if not auto.enabled or not auto.folders:
+        scanning = auto.enabled and bool(auto.folders)
+        if not scanning and not await asyncio.to_thread(
+            worker.queue.deferred_counts, ctx.uid, acct=ctx.acct, kinds=(OCR,)
+        ):
             return 0
         choice = await asyncio.to_thread(resolve_mode, ports, settings, worker.store, ctx.uid, now)
         mode = key_mode(choice.mode)
@@ -562,6 +617,14 @@ class OcrRunner:
         blocked = blocked_reason(allowance, mode)
         if blocked is not None:
             log_event(logger, "ocr_scan_skipped", acct=ctx.acct, reason=blocked)
+            return 0
+        # A key with room and no refusal: whatever the deferred jobs were waiting for is here.
+        woken = await asyncio.to_thread(
+            worker.queue.wake_deferred, ctx.uid, acct=ctx.acct, kinds=(OCR,)
+        )
+        if woken:
+            log_event(logger, "ocr_woken", acct=ctx.acct, count=woken)
+        if not scanning:
             return 0
         candidates, batch_running = await asyncio.to_thread(self._candidates, ctx, auto, now)
         if not candidates:
@@ -635,8 +698,8 @@ class OcrRunner:
             family = queue.family(
                 ctx.uid, ocr_key(ctx.acct, row.document, row.page_id, row.content_hash)
             )
-            if family and not (is_deferred(family[-1]) or is_key_failure(family[-1])):
-                continue
+            if family and not is_key_failure(family[-1]):
+                continue  # queued, deferred, running or finished: one job per page version
             generation = self._generation(ctx, row, generations)
             if generation is None:
                 continue
@@ -659,7 +722,12 @@ class OcrRunner:
         queued = 0
         for spec in specs:
             job, how = enqueue_page(
-                self.worker.queue, uid=ctx.uid, acct=ctx.acct, spec=spec, retry_failed=False
+                self.worker.queue,
+                uid=ctx.uid,
+                acct=ctx.acct,
+                spec=spec,
+                retry_failed=False,
+                retry_key_failure=True,
             )
             if job is not None and how in ("queued", "rerun"):
                 queued += 1
@@ -712,6 +780,8 @@ class OcrRunner:
         )
         if blocked_reason(allowance, mode) is not None:
             return 0
+        if await asyncio.to_thread(self._gone, ctx.uid, ctx.acct):
+            return 0  # removed since the scan began: nothing is sent for it
         prompt = ports.prompt()
         client = ports.client(worker.settings, key)
         del key

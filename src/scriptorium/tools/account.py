@@ -107,7 +107,7 @@ from scriptorium.tools._library import (
     state_of,
     use_account,
 )
-from scriptorium.tools._ocr import account_ocr, forget_key_refusals, ocr_mode, ocr_summary
+from scriptorium.tools._ocr import account_ocr, ocr_mode, ocr_summary, resume_ocr
 from scriptorium.tools._services import KEY_CHECK_WINDOW_S, Services
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import (
@@ -661,7 +661,7 @@ def _set_key(svc: Services, user: User, key: SecretStr, cap_usd: float | None) -
     # without the cap its owner asked for would spend more than they allowed.
     svc.store.set_user_ocr_cap(uid, cap_usd)
     SecretBox(svc.settings, uid).seal(USER_KEY_SECRET, key.get_secret_value().encode("ascii"))
-    forget_key_refusals(svc, uid)  # the worker may try the new key at once
+    resume_ocr(svc, uid, forget_refusals=True)  # the worker may try the new key at once
     cap = f" up to ${cap_usd:g} a month" if cap_usd is not None else ""
     return {
         "stored": True,
@@ -693,7 +693,7 @@ def _clear_key(svc: Services, user: User) -> dict[str, object]:
     uid = svc.uid(user)
     SecretBox(svc.settings, uid).forget(USER_KEY_SECRET)
     svc.store.set_user_ocr_cap(uid, None)
-    forget_key_refusals(svc, uid)
+    resume_ocr(svc, uid, forget_refusals=True)  # the server key may apply now
     return {
         "cleared": True,
         "ocr": ocr_summary(svc, uid),

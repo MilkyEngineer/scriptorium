@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Final
 
 from scriptorium.errors import ScriptoriumError
-from scriptorium.jobs.kinds import OCR_KINDS
+from scriptorium.jobs.kinds import OCR, OCR_KINDS
 from scriptorium.ocr.ledger import month_bounds
 from scriptorium.ocr.modes import read_user_key, server_key_permitted
 from scriptorium.ocr.pipeline import LAZY, SERVER_MODES, clear_key_refusal, resolve_mode
@@ -27,9 +27,11 @@ __all__ = [
     "OCR_SERVER_NOTE",
     "account_ocr",
     "forget_key_refusals",
+    "ocr_deferred_reasons",
     "ocr_mode",
     "ocr_queue",
     "ocr_summary",
+    "resume_ocr",
 ]
 
 OCR_LAZY_NOTE: Final = (
@@ -52,13 +54,18 @@ def ocr_mode(svc: Services, uid: str) -> tuple[str, str]:
 
 
 def ocr_queue(svc: Services, account: Account) -> dict[str, dict[str, int]]:
-    """``{kind: {queued, running, retrying, done, dead}}`` for the account's OCR jobs."""
+    """``{kind: {queued, deferred, running, retrying, done, dead}}`` for the account's OCR
+    jobs; ``deferred`` jobs (waiting for a key, a cap's reset or a refused key's hold) are
+    not counted as ``queued``."""
     counts = svc.queue.counts(account.uid, acct=account.acct)
+    deferred = svc.queue.deferred_counts(account.uid, acct=account.acct, kinds=OCR_KINDS)
     out: dict[str, dict[str, int]] = {}
     for kind in OCR_KINDS:
         by_state = counts.get(kind, {})
+        waiting = sum(deferred.get(kind, {}).values())
         out[kind] = {
-            "queued": by_state.get("queued", 0),
+            "queued": max(0, by_state.get("queued", 0) - waiting),
+            "deferred": waiting,
             "running": by_state.get("leased", 0),
             "retrying": by_state.get("failed", 0),
             "done": by_state.get("done", 0),
@@ -170,8 +177,28 @@ def account_ocr(svc: Services, account: Account | None, uid: str) -> dict[str, o
     return summary
 
 
+def ocr_deferred_reasons(svc: Services, account: Account) -> dict[str, int]:
+    """``{reason: n}`` over the account's deferred OCR jobs (reason codes only)."""
+    out: dict[str, int] = {}
+    deferred = svc.queue.deferred_counts(account.uid, acct=account.acct, kinds=OCR_KINDS)
+    for by_reason in deferred.values():
+        for reason, n in by_reason.items():
+            out[reason] = out.get(reason, 0) + n
+    return out
+
+
 def forget_key_refusals(svc: Services, uid: str) -> None:
     """Drop every account's note that the user's own key was refused (a new key, or none)."""
     for row in svc.store.accounts(uid):
         if account_paths(svc.settings.data_dir, uid, row.acct).index.is_file():
             clear_key_refusal(svc.index(uid, row.acct), "user")
+
+
+def resume_ocr(svc: Services, uid: str, *, forget_refusals: bool) -> int:
+    """The user's key situation changed (a key stored or cleared, the server key allowed):
+    optionally forget the notes that their own key was refused, and make their deferred OCR
+    jobs runnable now, so the worker looks again at once instead of after the deferral's
+    wait. A job that still cannot run is deferred again. Returns the jobs woken."""
+    if forget_refusals:
+        forget_key_refusals(svc, uid)
+    return svc.queue.wake_deferred(uid, kinds=(OCR,))

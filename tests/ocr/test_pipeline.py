@@ -156,19 +156,31 @@ def test_enqueue_page_dedupes_one_page_version(queue: JobQueue) -> None:
     assert done is not None and (done.id, how) == (first.id, "finished")
 
 
-def test_force_and_deferred_rerun_under_after_keys_up_to_the_cap(queue: JobQueue) -> None:
+def test_a_deferred_job_is_the_active_job_and_never_a_rerun(queue: JobQueue) -> None:
     first, _ = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=False)
     assert first is not None
-    finish(queue, first.id, {"state": "deferred", "reason": "no_key"})
-    assert is_deferred(queue.get(first.id, UID))  # type: ignore[arg-type]
-    rerun, how = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=False)
-    assert rerun is not None and how == "rerun"
-    assert rerun.dedupe_key == f"{first.dedupe_key}:after:{first.id}"
-    assert rerun.payload["force"] is False
-    finish(queue, rerun.id, {"state": "stored"})
+    job = queue.lease("w", kinds=("ocr",))
+    assert job is not None and job.id == first.id
+    queue.defer(job.id, "w", until=T0 + timedelta(hours=1), reason="no_key")
+    deferred = queue.get(first.id, UID)
+    assert deferred is not None and is_deferred(deferred)
+    for retry_failed in (False, True):
+        same, how = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=retry_failed)
+        assert same is not None and (same.id, how) == (first.id, "active") and is_deferred(same)
+    woken, how = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=False, wake=True)
+    assert woken is not None and (woken.id, how) == (first.id, "active")
+    assert not is_deferred(woken) and woken.next_run_at == T0
+    assert len(queue.family(UID, first.dedupe_key)) == 1
+
+
+def test_force_reruns_under_after_keys_up_to_the_cap(queue: JobQueue) -> None:
+    first, _ = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=False)
+    assert first is not None
+    finish(queue, first.id, {"state": "stored"})
     forced, how = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(True), retry_failed=False)
     assert forced is not None and how == "rerun" and forced.payload["force"] is True
-    for _ in range(RERUN_CAP - 2):
+    assert forced.dedupe_key == f"{first.dedupe_key}:after:{first.id}"
+    for _ in range(RERUN_CAP - 1):
         finish(queue, forced.id, {"state": "stored"})
         forced, how = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(True), retry_failed=False)
         assert forced is not None and how == "rerun"
@@ -189,7 +201,7 @@ def test_dead_jobs_are_retried_only_on_request(queue: JobQueue) -> None:
     assert rerun is not None and how == "rerun" and rerun.id != first.id
 
 
-def test_key_failures_are_rerun_without_being_asked(queue: JobQueue) -> None:
+def test_key_failures_are_rerun_only_by_the_scan_or_transcribe(queue: JobQueue) -> None:
     first, _ = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=False)
     assert first is not None
     job = queue.lease("w", kinds=("ocr",))
@@ -197,8 +209,20 @@ def test_key_failures_are_rerun_without_being_asked(queue: JobQueue) -> None:
     queue.fail(job.id, "w", key_error("bad_key"), final=True)
     dead = queue.get(first.id, UID)
     assert dead is not None and dead.error == "key_bad_key" and is_key_failure(dead)
-    rerun, how = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=False)
-    assert rerun is not None and how == "rerun" and rerun.id != first.id
+    # read_page: a dead job stays dead, a refused key included.
+    same, how = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=False, wake=True)
+    assert same is not None and (same.id, how) == (first.id, "finished")
+    # The scan (once the key's hold is over) and transcribe re-run it, outside the cap.
+    for _ in range(RERUN_CAP + 2):
+        rerun, how = enqueue_page(
+            queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=False, retry_key_failure=True
+        )
+        assert rerun is not None and how == "rerun"
+        job = queue.lease("w", kinds=("ocr",))
+        assert job is not None and job.id == rerun.id
+        queue.fail(job.id, "w", key_error("billing"), final=True)
+    rerun, how = enqueue_page(queue, uid=UID, acct=ACCT, spec=spec(), retry_failed=True)
+    assert rerun is not None and how == "rerun"
 
 
 # ---- the mode ---------------------------------------------------------------------------------
