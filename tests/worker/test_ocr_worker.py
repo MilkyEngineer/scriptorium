@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import io
 import json
 import logging
 import sqlite3
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from scriptorium.jobs.kinds import (
     KEY_ERROR_PREFIX,
@@ -42,6 +44,7 @@ from scriptorium.ocr.pipeline import (
     AUTO_OCR_KEY,
     KEY_REFUSED_HOLD,
     KEY_REFUSED_KEY,
+    OCR_IMAGE_SIDE,
     PENDING_BATCHES_KEY,
     AutoOcr,
     clear_key_refusal,
@@ -601,8 +604,8 @@ async def test_an_account_removed_while_its_page_renders_sends_nothing(
 async def test_a_scan_of_a_removed_account_submits_nothing(batching: Harness) -> None:
     h = batching
     await h.poll()  # first sight
+    ctx = h.linked.context()  # held by a poll that began before the removal
     h.linked.store.mark_removed(h.linked.uid, h.linked.acct, at=h.linked.clock.now)
-    ctx = h.linked.context()
     assert await h.linked.worker.ocr_runner.scan(ctx, complete=True) == 0
     assert h.client.calls == [] and h.jobs() == [] and h.jobs("ocr_batch") == []
     # The same scan with the mark lifted would have sent the batch.
@@ -627,6 +630,109 @@ async def test_an_account_removed_during_a_scan_submits_no_batch(
     await h.poll(2)
     assert h.client.count("submit_batch") == 0 and h.client.batches == {}
     assert h.jobs("ocr_batch") == []
+
+
+def _remove_and_move(h: Harness) -> Path:
+    """What ``disconnect_remarkable(keep_archive=false)`` does: mark the account, then move
+    its directory aside. Returns where it went."""
+    linked = h.linked
+    linked.store.mark_removed(linked.uid, linked.acct, at=linked.clock.now)
+    moved = linked.paths.root.with_name(linked.paths.root.name + "-moved")
+    linked.paths.root.rename(moved)
+    return moved
+
+
+def _big_png() -> bytes:
+    """A blank page wider than the OCR image side, so the runner downscales and writes it."""
+    out = io.BytesIO()
+    Image.new("L", (OCR_IMAGE_SIDE + 24, 64), 255).save(out, format="PNG")
+    return out.getvalue()
+
+
+async def test_an_account_moved_away_while_its_page_renders_is_gone_and_not_retried(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = harness
+    worker = h.linked.worker
+    await h.poll()
+    job, _ = h.enqueue(h.spec(0))
+    assert job is not None
+    real_render = worker._render
+
+    async def render_then_removed(*args: Any) -> bytes:
+        data = await real_render(*args)
+        _remove_and_move(h)
+        return data
+
+    # No PNG on disk: the runner renders the page and writes it, after the move.
+    monkeypatch.setattr(runner_mod, "_read_png", lambda path: None)
+    monkeypatch.setattr(worker, "_render", render_then_removed)
+    await worker.drain_jobs(kinds=OCR_KINDS)
+    done = h.get(job.id)
+    assert (done.state, done.result, done.attempts) == ("done", {"state": "gone"}, 1)
+    assert h.client.calls == [] and h.ledger.pages() == 0
+    assert not h.linked.paths.root.exists()  # write_png never recreated it
+
+
+async def test_an_account_removed_before_its_context_opens_is_gone(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = harness
+    worker = h.linked.worker
+    await h.poll()
+    job, _ = h.enqueue(h.spec(0))
+    assert job is not None
+    real_context = worker.context
+
+    def removed_first(uid: str, acct: str) -> Any:
+        h.linked.store.mark_removed(uid, acct, at=h.linked.clock.now)
+        return real_context(uid, acct)  # refuses it: NotFoundError
+
+    monkeypatch.setattr(worker, "context", removed_first)
+    await worker.drain_jobs(kinds=OCR_KINDS)
+    done = h.get(job.id)
+    assert (done.state, done.result, done.attempts) == ("done", {"state": "gone"}, 1)
+    assert h.client.calls == [] and h.ledger.pages() == 0
+
+
+async def test_a_batch_of_an_account_removed_before_its_context_opens_is_gone(
+    batching: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = batching
+    worker = h.linked.worker
+    await h.poll(2)
+    (batch_id,) = h.client.batches
+    (job,) = h.jobs("ocr_batch")
+    real_context = worker.context
+
+    def removed_first(uid: str, acct: str) -> Any:
+        h.linked.store.mark_removed(uid, acct, at=h.linked.clock.now)
+        return real_context(uid, acct)
+
+    monkeypatch.setattr(worker, "context", removed_first)
+    await _until_ended(h, batch_id)
+    done = h.get(job.id)
+    assert (done.state, done.result) == ("done", {"state": "gone"})
+    assert h.client.count("batch_results") == 0 and h.ledger.pages() == 0
+
+
+async def test_an_account_moved_away_during_a_scan_submits_no_batch(
+    batching: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = batching
+    await h.poll()  # first sight
+    big = _big_png()
+
+    def read_then_removed(path: Path) -> bytes:
+        if h.linked.paths.root.exists():
+            _remove_and_move(h)
+        return big
+
+    monkeypatch.setattr(runner_mod, "_read_png", read_then_removed)
+    await h.poll()
+    assert h.client.calls == [] and h.client.batches == {}
+    assert h.jobs() == [] and h.jobs("ocr_batch") == []
+    assert not h.linked.paths.root.exists()
 
 
 # ---- the real binding -----------------------------------------------------------------------
