@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from collections.abc import AsyncIterator, Callable
 from datetime import timedelta
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any
 import pytest
 
 from scriptorium import accounts
-from scriptorium.accounts import device_token_name, poll_lock
+from scriptorium.accounts import device_token_name, move_aside, poll_lock, removal_destination
 from scriptorium.auth.oidc import OIDCValidator
 from scriptorium.cloud.scope import SETTING_SYNC_SCOPE
 from scriptorium.errors import NotFoundError
@@ -457,6 +458,27 @@ async def test_a_token_that_cannot_be_forgotten_leaves_the_account_removed(
         if r.name == "scriptorium.tools.account"
     ]
     assert ("account_token_forget_failed", {"acct": linked.acct, "reason": "OSError"}) in logged
+
+
+async def test_a_cached_index_is_refused_once_another_process_removed_the_account(
+    library: Served, linked: Linked
+) -> None:
+    services = library.services
+    cached = services.index(linked.uid, linked.acct)
+    assert services.index(linked.uid, linked.acct) is cached
+    # Another process removes the account; this one's cache still holds the open index.
+    now = linked.clock()
+    destination = removal_destination(linked.settings.data_dir, linked.uid, linked.acct, at=now)
+    linked.store.mark_removed(linked.uid, linked.acct, at=now)
+    move_aside(linked.paths, destination)
+
+    with pytest.raises(NotFoundError):
+        services.index(linked.uid, linked.acct)
+
+    with pytest.raises(sqlite3.ProgrammingError):  # closed and dropped from the cache
+        cached.counts()
+    await _assert_stays_removed(library, linked)
+    assert (destination / "index.sqlite").is_file()
 
 
 async def test_a_removal_waits_for_a_connect_of_the_same_user(

@@ -49,6 +49,7 @@ KEY_CHECKS_PER_WINDOW: Final = 5
 KEY_CHECK_WINDOW_S: Final = 15 * 60
 """``set_claude_api_key`` validates at most this many keys per user per window: each check is
 a call to the Claude API, and the tool must not become a key-guessing oracle."""
+_REMOVED: Final = "That account was removed from this server."
 
 
 def identity_of(device_token: str) -> str | None:
@@ -182,21 +183,33 @@ class Services:
         """The account's index, migrated and opened once per process.
 
         ``not_found`` for an account that was removed (its directory moved to ``removed/``):
-        opening it would recreate an empty account directory in its place.
+        opening it would recreate an empty account directory in its place. ``removed_at`` is
+        read on every call, cached index or not, because another process may have removed
+        the account since this one opened it; such an index is closed and dropped.
         """
         key = (uid, acct)
+        if self._removed(uid, acct):
+            self.evict_index(uid, acct)
+            raise NotFoundError(_REMOVED)
         with self._lock:
             index = self._indexes.get(key)
             if index is None:
-                row = self.store.account(uid, acct)
-                if row is not None and row.removed_at is not None:
-                    raise NotFoundError("That account was removed from this server.")
+                # Again under the lock: a removal in this process marks the account and then
+                # evicts under this lock, so no index is opened (and no directory created)
+                # once the account is marked.
+                if self._removed(uid, acct):
+                    raise NotFoundError(_REMOVED)
                 paths = account_paths(self.settings.data_dir, uid, acct)
                 paths.root.mkdir(parents=True, exist_ok=True)
                 paths.inside(paths.index)
                 index = Index.open(paths.index, migrate=True, clock=self.clock)
                 self._indexes[key] = index
             return index
+
+    def _removed(self, uid: str, acct: str) -> bool:
+        """Whether the account's directory was moved to ``removed/`` (one SELECT)."""
+        row = self.store.account(uid, acct)
+        return row is not None and row.removed_at is not None
 
     def evict_index(self, uid: str, acct: str) -> None:
         """Close and forget the account's cached index (before its directory is moved); the
