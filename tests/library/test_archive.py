@@ -52,6 +52,25 @@ V2 = {
     f"{DOC}/{P1}.rm": b"page one, version two",
 }
 OTHER = {f"{DOC2}.metadata": b'{"visibleName":"other"}', f"{DOC2}.pdf": b"%PDF-synthetic"}
+# Every per-page shape: layer names, highlights, thumbnails (both formats), text conversion.
+RICH = {
+    f"{DOC}.metadata": b'{"visibleName":"rich"}',
+    f"{DOC}.content": b'{"v":3}',
+    f"{DOC}.pdf": b"%PDF-synthetic rich",
+    f"{DOC}/{P1}.rm": b"page one, rich",
+    f"{DOC}/{P1}-metadata.json": b'{"layers":[{"name":"synthetic"}]}',
+    f"{DOC}.highlights/{P1}.json": b'{"highlights":[]}',
+    f"{DOC}.thumbnails/{P1}.png": b"synthetic png",
+    f"{DOC}.thumbnails/{P2}.jpg": b"synthetic jpg",
+    f"{DOC}.textconversion/{P1}.json": b'{"synthetic":true}',
+}
+# The next version: no highlights or text conversion any more, a changed thumbnail.
+RICH2 = {
+    f"{DOC}.metadata": b'{"visibleName":"rich2"}',
+    f"{DOC}.content": b'{"v":4}',
+    f"{DOC}/{P1}.rm": b"page one, rich2",
+    f"{DOC}.thumbnails/{P1}.png": b"synthetic png, version two",
+}
 
 
 def sha(data: bytes) -> str:
@@ -398,6 +417,10 @@ def test_commit_two_documents_do_not_touch_each_other(
     [
         ({"../x": "a" * 64}, 1, HASH_ROOT),
         ({DOC: "a" * 64}, 1, HASH_ROOT),  # the bare <uuid> is the page directory, not a file
+        ({f"{DOC}.thumbnails": "a" * 64}, 1, HASH_ROOT),  # and so is <uuid>.thumbnails
+        ({f"{DOC}.highlights/../{DOC}.content": "a" * 64}, 1, HASH_ROOT),
+        ({f"{DOC2}.thumbnails/{P1}.png": "a" * 64}, 1, HASH_ROOT),  # another document's
+        ({f"{DOC}.thumbnails/{P1}.gif": "a" * 64}, 1, HASH_ROOT),
         ({f"{DOC2}.content": "a" * 64}, 1, HASH_ROOT),  # another document's file
         ({f"{DOC}.txt": "a" * 64}, 1, HASH_ROOT),
         ({f"{DOC}/../{DOC2}.content": "a" * 64}, 1, HASH_ROOT),
@@ -620,7 +643,19 @@ def test_current_files_lists_only_allowlisted_names(archive: Archive, paths: Acc
     assert archive.current_files(DOC2) == {}
 
 
-@pytest.mark.parametrize("planted", [f"{DOC}.content", DOC, f"{DOC}/{P1}.rm"])
+@pytest.mark.parametrize(
+    "planted",
+    [
+        f"{DOC}.content",
+        DOC,
+        f"{DOC}/{P1}.rm",
+        f"{DOC}/{P1}-metadata.json",
+        f"{DOC}.highlights",
+        f"{DOC}.thumbnails",
+        f"{DOC}.thumbnails/{P1}.png",
+        f"{DOC}.textconversion/{P1}.json",
+    ],
+)
 def test_current_files_refuses_symlinks_out_of_the_library(
     archive: Archive, paths: AccountPaths, tmp_path: Path, planted: str
 ) -> None:
@@ -628,8 +663,9 @@ def test_current_files_refuses_symlinks_out_of_the_library(
     secret.mkdir()
     (secret / f"{P1}.rm").write_bytes(b"not yours")
     if "/" in planted:
-        (paths.library / DOC).mkdir()
-    (paths.library / planted).symlink_to(secret / f"{P1}.rm" if planted != DOC else secret)
+        (paths.library / planted).parent.mkdir()
+    directory = planted in (DOC, f"{DOC}.highlights", f"{DOC}.thumbnails")
+    (paths.library / planted).symlink_to(secret if directory else secret / f"{P1}.rm")
     with pytest.raises(PathEscapeError):
         archive.current_files(DOC)
 
@@ -638,6 +674,89 @@ def test_current_files_refuses_symlinks_out_of_the_library(
 def test_current_files_refuses_bad_uuids(archive: Archive, bad: str) -> None:
     with pytest.raises(RefusedError):
         archive.current_files(bad)
+
+
+def test_current_files_lists_the_per_page_directories(
+    archive: Archive, paths: AccountPaths
+) -> None:
+    commit(archive, RICH, 1)
+    (paths.library / f"{DOC}.thumbnails" / f"{P1}.gif").write_bytes(b"x")
+    (paths.library / f"{DOC}.highlights" / f"{P1}.png").write_bytes(b"x")
+    (paths.library / f"{DOC}.highlightsx").mkdir()  # not the document's
+    (paths.library / f"{DOC}.highlightsx" / f"{P1}.json").write_bytes(b"x")
+    files = archive.current_files(DOC)
+    assert set(files) == set(RICH)
+    for name, path in files.items():
+        assert path.read_bytes() == RICH[name]
+
+
+def test_per_page_directories_commit_hold_tombstone_and_come_back(
+    archive: Archive, paths: AccountPaths
+) -> None:
+    seen = census(paths)
+
+    def nothing_lost() -> None:
+        nonlocal seen
+        now = census(paths)
+        assert seen <= now
+        seen = now
+
+    first = commit(archive, RICH, 1)
+    assert tree(paths.library) == RICH
+    assert first.held is None
+    assert set(first.files) == set(RICH)
+    for name, path in first.files.items():  # hardlinks to the verified blobs
+        assert os.stat(path).st_ino == os.stat(archive.blob_path(sha(RICH[name]))).st_ino
+    nothing_lost()
+
+    second = commit(archive, RICH2, 2)
+    assert tree(paths.library) == RICH2  # the directories RICH2 lacks left the view whole
+    assert not os.path.lexists(paths.library / f"{DOC}.highlights")
+    assert not os.path.lexists(paths.library / f"{DOC}.textconversion")
+    assert second.held is not None
+    assert holding(paths, "2") == RICH  # the whole previous version, directories included
+    nothing_lost()
+
+    archive.tombstone(DOC)
+    assert tree(paths.library) == {}
+    assert tree(paths.tombstones / DOC) == RICH2
+    assert archive.current_files(DOC) == {}
+    nothing_lost()
+
+    archive.untombstone(DOC)
+    assert tree(paths.library) == RICH2
+    assert set(archive.current_files(DOC)) == set(RICH2)
+    assert not os.path.lexists(paths.tombstones / DOC)
+    nothing_lost()
+
+    commit(archive, RICH, 3)  # the directories come back with a later version
+    assert tree(paths.library) == RICH
+    assert holding(paths, "3") == RICH2
+    nothing_lost()
+
+
+def test_untombstone_beside_a_newer_version_holds_the_per_page_directories(
+    archive: Archive, paths: AccountPaths
+) -> None:
+    commit(archive, RICH, 1)
+    archive.tombstone(DOC)
+    commit(archive, RICH2, 2)
+    archive.untombstone(DOC)
+    assert tree(paths.library) == RICH2
+    assert holding(paths, "tombstone") == RICH  # never mixed into the newer version
+
+
+@pytest.mark.parametrize("nth", [1, 4, 7])
+def test_crash_mid_swap_with_per_page_directories_is_rolled_forward(
+    archive: Archive, rec: RecordingFs, paths: AccountPaths, nth: int
+) -> None:
+    commit(archive, RICH, 1)  # seven top-level entries to hold
+    rec.crash_when = _rename_into(HOLDING_DIR, nth)
+    _crash_commit(archive, RICH2, 2)
+    rec.crash_when = None
+    Archive(paths).sweep_staging()
+    assert tree(paths.library) == RICH2
+    assert holding(paths, "2") == RICH
 
 
 # ---- tombstones -----------------------------------------------------------------------------

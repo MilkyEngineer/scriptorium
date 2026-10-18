@@ -19,7 +19,8 @@ test can prove it, and the one deleting helper (:meth:`Archive._discard`) refuse
 outside ``staging/``.
 
 **Crash atomicity.** A document is several top-level entries (``<uuid>.metadata``, ...,
-``<uuid>/``), so no single rename can swap it. Each multi-entry change (commit, tombstone,
+``<uuid>/``, ``<uuid>.thumbnails/``, ...: :func:`~scriptorium.library.layout.doc_entries`),
+so no single rename can swap it. Each multi-entry change (commit, tombstone,
 un-tombstone) is planned first, the plan is written to ``staging/.journal/`` atomically, and
 only then are the renames made; a plan left behind by a crash or an I/O error is rolled
 forward (idempotently) before the next change to that document and by
@@ -60,6 +61,7 @@ from scriptorium.errors import NotFoundError, RefusedError
 from scriptorium.library.layout import (
     DOC_EXTENSIONS,
     belongs_to,
+    doc_dirs,
     doc_entries,
     is_safe_name,
     is_sha256,
@@ -370,9 +372,12 @@ class Archive:
         The new tree is prepared in the staging directory from hardlinks to the blobs (copies
         where hardlinks fail), fsynced, and swapped in by a journalled sequence of renames:
         the previous entries of the document move to
-        ``library/.holding/<uuid>/<generation>/``; nothing is unlinked. Every name must be a
-        file name of ``staged.uuid`` (``<uuid>.<ext>`` or ``<uuid>/<page>.rm``) and every blob
-        must already be stored.
+        ``library/.holding/<uuid>/<generation>/``; nothing is unlinked. Every name must be an
+        allowlisted file name of ``staged.uuid`` (``<uuid>.<ext>`` or a per-page file such as
+        ``<uuid>/<page>.rm`` or ``<uuid>.thumbnails/<page>.png``; not the bare ``<uuid>``) and
+        every blob must already be stored. Each top-level entry (a file, or a directory such
+        as ``<uuid>.highlights/``) is swapped whole: a directory the new version lacks moves
+        to holding with the rest of the old version.
         """
         uuid = staged.uuid
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
@@ -518,17 +523,20 @@ class Archive:
                 real = resolve_inside(self._lib, path)
                 if real.is_file():
                     out[name] = real
-        page_dir = self._lib / uuid
-        if os.path.lexists(page_dir):
-            real_dir = resolve_inside(self._lib, page_dir)
-            if real_dir.is_dir():
-                for entry in sorted(os.listdir(real_dir)):
-                    name = f"{uuid}/{entry}"
-                    if not is_safe_name(name):
-                        continue
-                    real = resolve_inside(self._lib, real_dir / entry)
-                    if real.is_file():
-                        out[name] = real
+        for directory in doc_dirs(uuid):
+            path = self._lib / directory
+            if not os.path.lexists(path):
+                continue
+            real_dir = resolve_inside(self._lib, path)
+            if not real_dir.is_dir():
+                continue
+            for entry in sorted(os.listdir(real_dir)):
+                name = f"{directory}/{entry}"
+                if not is_safe_name(name):
+                    continue
+                real = resolve_inside(self._lib, real_dir / entry)
+                if real.is_file():
+                    out[name] = real
         return out
 
     # ---- staging housekeeping ------------------------------------------------------------
