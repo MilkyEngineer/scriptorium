@@ -17,6 +17,7 @@ Request bodies on ``/mcp`` are limited by the SDK's body-limit middleware to
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import logging
@@ -25,7 +26,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
@@ -71,9 +72,11 @@ from scriptorium.auth.oidc import (
     UserNotAllowed,
 )
 from scriptorium.config import IPNetwork, Settings
+from scriptorium.errors import AmbiguousError, ScriptoriumError
 from scriptorium.logging import log_event, uid_prefix
 from scriptorium.tools import DownloadMinter, ToolContext, ToolRegistry
 from scriptorium.tools._conventions import ErrorCode, ToolError, error_result
+from scriptorium.tools._services import Services
 
 logger = logging.getLogger(__name__)
 
@@ -402,10 +405,50 @@ def _describe_validation_error(exc: ValidationError) -> str:
     return "Invalid arguments: " + "; ".join(problems)
 
 
+def _scriptorium_error_result(exc: ScriptoriumError) -> CallToolResult:
+    """A library error as a tool error; its message and hint are client-safe by contract."""
+    extra: dict[str, object] = {}
+    if isinstance(exc, AmbiguousError):
+        extra["candidates"] = list(exc.candidates)
+    return error_result(ErrorCode(exc.code), exc.message, exc.hint, extra=extra)
+
+
+def _write_audit(
+    services: Services,
+    user: User,
+    tool: str,
+    duration_ms: float,
+    outcome: str,
+    identifiers: Mapping[str, Any],
+) -> None:
+    """One audit row per call (§11.0); a malformed identifier drops the identifiers, not the
+    row, and the log names only the tool."""
+    try:
+        services.store.audit(
+            uid_hash=user.uid_hash,
+            tool=tool,
+            duration_ms=duration_ms,
+            outcome=outcome,
+            identifiers=identifiers,
+        )
+    except ValueError:
+        log_event(logger, "audit_identifiers_rejected", level=logging.ERROR, tool=tool)
+        services.store.audit(
+            uid_hash=user.uid_hash,
+            tool=tool,
+            duration_ms=duration_ms,
+            outcome=outcome,
+            identifiers={},
+        )
+
+
 def build_mcp_server(
-    settings: Settings, registry: ToolRegistry, downloads: DownloadStore
+    settings: Settings,
+    registry: ToolRegistry,
+    downloads: DownloadStore,
+    services: Services | None = None,
 ) -> Server[dict[str, Any]]:
-    """The low-level MCP server: per-request tool listing and dispatch."""
+    """The low-level MCP server: per-request tool listing, dispatch and the audit row."""
 
     async def list_tools(
         ctx: ServerRequestContext[dict[str, Any]], params: PaginatedRequestParams | None
@@ -423,6 +466,7 @@ def build_mcp_server(
         spec = registry.get(params.name)
         tool_name = spec.name if spec is not None else "<unknown>"
         outcome = "ok"
+        tool_ctx: ToolContext | None = None
         try:
             if spec is None:
                 outcome = "unknown_tool"
@@ -434,7 +478,9 @@ def build_mcp_server(
                     "This tool is for administrators only.",
                     "Ask the operator if you need it.",
                 )
-            tool_ctx = ToolContext(user=user, settings=settings, downloads=downloads)
+            tool_ctx = ToolContext(
+                user=user, settings=settings, downloads=downloads, services=services
+            )
             try:
                 result = await spec.invoke(tool_ctx, params.arguments or {})
             except ValidationError as exc:
@@ -446,7 +492,21 @@ def build_mcp_server(
                 )
             except ToolError as exc:
                 outcome = exc.code.value
-                return error_result(exc.code, exc.message, exc.hint)
+                return error_result(exc.code, exc.message, exc.hint, extra=exc.extra)
+            except ScriptoriumError as exc:
+                if exc.code == "internal":
+                    outcome = "internal_error"
+                    log_event(
+                        logger,
+                        "tool_failed",
+                        level=logging.ERROR,
+                        exc_info=True,
+                        uid=user.log_uid,
+                        tool=tool_name,
+                    )
+                    raise MCPError(code=INTERNAL_ERROR, message="Internal error") from None
+                outcome = exc.code
+                return _scriptorium_error_result(exc)
             except Exception:
                 outcome = "internal_error"
                 log_event(
@@ -463,14 +523,25 @@ def build_mcp_server(
                 outcome = "error"
             return result
         finally:
+            duration_ms = round((time.perf_counter() - started) * 1000, 1)
             log_event(
                 logger,
                 "tool_call",
                 uid=user.log_uid,
                 tool=tool_name,
-                duration_ms=round((time.perf_counter() - started) * 1000, 1),
+                duration_ms=duration_ms,
                 outcome=outcome,
             )
+            if services is not None and spec is not None:
+                identifiers = dict(tool_ctx.audit) if tool_ctx is not None else {}
+                try:
+                    await asyncio.to_thread(
+                        _write_audit, services, user, spec.name, duration_ms, outcome, identifiers
+                    )
+                except Exception:
+                    log_event(
+                        logger, "audit_failed", level=logging.ERROR, exc_info=True, tool=tool_name
+                    )
 
     server: Server[dict[str, Any]] = Server(
         "scriptorium",
@@ -495,9 +566,16 @@ def _require_user() -> User:
     return user
 
 
-def build_registry(settings: Settings) -> ToolRegistry:
-    """The tools this deployment offers."""
+def build_registry(settings: Settings, services: Services | None = None) -> ToolRegistry:
+    """The tools this deployment offers: the M1 tools when the server has ``/data`` open
+    (``services``), and the S6 spike tools when ``SPIKE_TOOLS`` is on."""
     registry = ToolRegistry()
+    if services is not None:
+        from scriptorium.tools import account, library, ocr
+
+        account.register(registry)
+        library.register(registry)
+        ocr.register(registry)
     if settings.spike_tools:
         from scriptorium.tools.spike import register_spike_tools
 
@@ -514,14 +592,19 @@ def create_app(
     validator: OIDCValidator | None = None,
     downloads: DownloadStore | None = None,
     registry: ToolRegistry | None = None,
+    services: Services | None = None,
 ) -> Starlette:
-    """Build the ASGI app. Dependencies are injectable for tests and later milestones."""
+    """Build the ASGI app. Dependencies are injectable for tests and later milestones.
+
+    ``services`` (the opened, migrated ``/data``; the caller owns and closes it) enables the
+    library tools and the audit log; without it only the spike tools can be offered.
+    """
     owns_validator = validator is None
     oidc = validator or OIDCValidator(settings)
     store: DownloadStore = downloads or InMemoryDownloadStore()
-    tools = registry or build_registry(settings)
+    tools = registry or build_registry(settings, services)
 
-    mcp_server = build_mcp_server(settings, tools, store)
+    mcp_server = build_mcp_server(settings, tools, store, services)
     session_manager = StreamableHTTPSessionManager(
         app=mcp_server,
         stateless=True,
