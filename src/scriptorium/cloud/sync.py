@@ -160,6 +160,7 @@ from scriptorium.cloud.scope import (
 )
 from scriptorium.db.connect import to_db_time
 from scriptorium.errors import PathEscapeError, ScriptoriumError
+from scriptorium.library.tags import TagSet, parse_tags
 from scriptorium.logging import log_event
 
 logger = logging.getLogger(__name__)
@@ -277,6 +278,12 @@ class SyncReport:
     breaker (the approval covered every tripped candidate and had not expired)."""
     excluded: int = 0
     """Listed documents outside the sync scope after this poll (rows with ``excluded_at``)."""
+    newly_excluded: tuple[str, ...] = ()
+    """Documents already in the index that this poll moved out of the scope: the worker
+    lowers their waiting renders."""
+    included: tuple[str, ...] = ()
+    """Excluded documents this poll let back in by unmarking them (their archived version is
+    current, so nothing was committed): the worker refreshes their pages and tags."""
 
 
 class _BudgetSpentError(Exception):
@@ -327,6 +334,8 @@ class _Run:
     anomaly_reason: str | None = None
     mass_delete_approved: bool = False
     excluded: int = 0
+    newly_excluded: list[str] = field(default_factory=list)
+    included: list[str] = field(default_factory=list)
     #: protocol.name_shape -> documents whose index left out a name of that shape (bounded).
     skipped_shapes: Counter[str] = field(default_factory=Counter)
 
@@ -769,14 +778,18 @@ class SyncOnce:
                         continue  # step 3 commits it, or it is archived and stays so
                     if row.hash_root == entry.hash:
                         self._put(dataclasses.replace(row, excluded_at=None))
+                        run.included.append(uuid)  # the worker refreshes its pages and tags
                     else:
                         late.append(uuid)
                     continue
                 if fact is not None:
                     indexes.pop(uuid, None)  # before the upsert: never commit it on a failure
-                    self._put(self._excluded_row(entry, fact, row, now, run))
+                    self._put(self._excluded_row(entry, fact, row, now, run), _own_tags(fact))
+                    if row is not None and row.excluded_at is None:
+                        run.newly_excluded.append(uuid)
                 elif row is not None and row.excluded_at is None:
                     self._put(dataclasses.replace(row, excluded_at=now))
+                    run.newly_excluded.append(uuid)
                 if (
                     me is not None
                     and me.parent_known
@@ -827,9 +840,15 @@ class SyncOnce:
             return Known(self._archived_tags(uuid), row.parent)
         return None
 
-    def _put(self, row: DocumentRow) -> None:
+    def _put(self, row: DocumentRow, tags: TagSet | None = None) -> None:
+        """Upsert ``row`` and, unless ``tags`` is None, replace its tags, in one transaction.
+
+        Only an excluded row brings tags here: a committed or un-excluded document has its
+        tags (and pages) replaced by the worker's refresh after the poll (§7 step 3)."""
         with self._index.transaction():
             self._index.upsert_document(row)
+            if tags is not None:
+                self._index.replace_tags(row.uuid, tags)
 
     def _fetch_facts(
         self,
@@ -1304,6 +1323,8 @@ class SyncOnce:
             anomaly_reason=run.anomaly_reason,
             mass_delete_approved=run.mass_delete_approved,
             excluded=run.excluded,
+            newly_excluded=tuple(run.newly_excluded),
+            included=tuple(run.included),
         )
         for shape, documents in sorted(run.skipped_shapes.items()):
             # The shape of names the allowlist left out (protocol.name_shape), never a name:
@@ -1512,6 +1533,16 @@ def _display_name(value: object, *, fallback: str) -> str:
         if unicodedata.category(ch) not in ("Cc", "Cs") and ch not in _BIDI_CONTROLS
     )[:MAX_NAME_CHARS]
     return clean if clean.strip() else fallback
+
+
+def _own_tags(fact: _Facts) -> TagSet | None:
+    """The tag index rows of an excluded document: its document tags from the ``.content``
+    read for the scope (bounded and normalised by ``parse_tags``). Its page tags are dropped,
+    since its pages are not known; None (leave the stored tags) when the ``.content`` was not
+    read."""
+    if fact.content is None:
+        return None
+    return TagSet(document=parse_tags(fact.content).document)
 
 
 def _folder_files(uuid: str) -> frozenset[str]:

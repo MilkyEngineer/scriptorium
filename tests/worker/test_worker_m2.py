@@ -120,6 +120,32 @@ async def test_tombstoning_a_document_lowers_its_waiting_renders(
     assert lowered and lowered[0]["count"] >= 1 and NOTEBOOK not in repr(lowered)
 
 
+async def test_leaving_the_scope_lowers_waiting_renders_and_returning_raises_them(
+    linked: Linked,
+) -> None:
+    loop = linked.loop()
+    ctx = linked.context()
+    await loop.poll_once(ctx)  # queues every page, runs none
+    assert priorities(linked.queue) == {NOTEBOOK: {PRIORITY_NORMAL}, PDF: {PRIORITY_NORMAL}}
+
+    ctx.index.set_setting("sync_scope", json.dumps({"mode": "allow", "tags": ["synthetic"]}))
+    await loop.poll_once(ctx)  # neither carries the tag: both leave the scope
+
+    assert priorities(linked.queue) == {NOTEBOOK: {PRIORITY_LOW}, PDF: {PRIORITY_LOW}}
+
+    ctx.index.set_setting("sync_scope", None)
+    await loop.poll_once(ctx)  # back in, archived versions current: unmarked, not committed
+
+    assert priorities(linked.queue) == {NOTEBOOK: {PRIORITY_NORMAL}, PDF: {PRIORITY_NORMAL}}
+
+
+async def test_refresh_after_lowers_newly_excluded_documents(linked: Linked) -> None:
+    loop = linked.loop()
+    await loop.poll_once(linked.context())
+    loop.after_poll(linked.context(), report("ok", newly_excluded=(PDF,)))
+    assert priorities(linked.queue) == {NOTEBOOK: {PRIORITY_NORMAL}, PDF: {PRIORITY_LOW}}
+
+
 # ---- removed accounts and the poll lock -------------------------------------------------------
 
 

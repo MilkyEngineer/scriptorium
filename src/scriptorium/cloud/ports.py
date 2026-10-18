@@ -19,6 +19,7 @@ from typing import Any, BinaryIO, Protocol
 
 from scriptorium.library.index import DocumentRow
 from scriptorium.library.layout import is_safe_name
+from scriptorium.library.tags import TagSet
 from scriptorium.library.tombstones import Listing, TombstonePlan, plan
 
 # ---- structural seams ---------------------------------------------------------------------
@@ -60,6 +61,7 @@ class IndexPort(Protocol):
     def get_state(self, key: str) -> str | None: ...
     def set_state(self, key: str, value: str | None) -> None: ...
     def get_setting(self, key: str) -> str | None: ...
+    def replace_tags(self, document: str, tags: TagSet) -> None: ...
 
 
 class Planner(Protocol):

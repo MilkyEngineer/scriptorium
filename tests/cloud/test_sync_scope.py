@@ -197,6 +197,40 @@ def test_a_folder_with_pages_archived_before_a_scope_is_decided_like_a_document(
     assert report.tombstoned == ()
 
 
+def test_an_excluded_documents_own_tags_are_indexed(tmp_path: Path) -> None:
+    files = doc(A, "private", "travel")
+    content = json.loads(files[f"{A}.content"])
+    first_page = content["cPages"]["pages"][0]["id"]
+    content["pageTags"] = [{"name": "sketch", "pageId": first_page, "timestamp": 1}]
+    files[f"{A}.content"] = json.dumps(content).encode()
+    _cloud, h = setup(tmp_path, {A: files, B: doc(B)})
+    set_scope(h, "deny", "private")
+
+    report = h.poll()
+
+    assert report.committed == (B,) and excluded_at(h, A) is not None
+    assert report.newly_excluded == ()  # never in the index before: nothing to lower
+    tags = h.index.tags_of(A)
+    assert tags.document == {"private", "travel"}
+    assert dict(tags.pages) == {}  # its pages are not known: page tags are dropped
+    assert h.index.documents_tagged(["travel"]) == {A}
+    row = h.index.document(A)
+    assert row is not None and row.tags == ("private", "travel")
+
+
+def test_leaving_the_scope_is_reported_for_the_worker(tmp_path: Path) -> None:
+    cloud, h = setup(tmp_path, {A: doc(A), B: doc(B)})
+    h.poll()
+    set_scope(h, "deny", "private")
+    cloud.put_documents({A: doc(A, "private")})
+
+    report = h.poll()
+
+    assert report.newly_excluded == (A,)
+    assert h.index.tags_of(A).document == {"private"}
+    assert h.poll().newly_excluded == ()  # already excluded
+
+
 def test_an_unchanged_excluded_document_is_not_fetched_again(tmp_path: Path) -> None:
     cloud, h = setup(tmp_path, {A: doc(A, "private"), B: doc(B)})
     set_scope(h, "deny", "private")
@@ -257,6 +291,7 @@ def test_widening_the_scope_brings_documents_back(tmp_path: Path) -> None:
 
     assert report.outcome == "ok"
     assert report.committed == (C,)  # committed like a new document
+    assert report.included == (A,)  # just unmarked: the worker refreshes its pages and tags
     assert cloud.doc_hash(A) not in cloud.targets()  # its archived version is current
     assert excluded_at(h, A) is None and excluded_at(h, C) is None
     assert h.library_uuids() == {A, B, C}

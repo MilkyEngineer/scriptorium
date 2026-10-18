@@ -144,6 +144,28 @@ async def test_set_sync_scope_stores_the_scope_and_the_next_poll_applies_it(
     )
 
 
+async def test_an_excluded_documents_tags_are_known(library: Served, linked: Linked) -> None:
+    """Tagged on the tablet while outside the scope: its tags are indexed from the .content
+    the scope read, so set_sync_scope does not call the tag unmatched and list finds it."""
+    _tag(linked, NOTEBOOK, WORK)
+    await linked.sync()
+    await library.ok("set_sync_scope", {"mode": "allow", "tags": [WORK]})
+    await linked.sync()
+    assert _excluded(linked, PDF)
+
+    _tag(linked, PDF, PERSONAL)
+    await linked.sync()
+
+    assert _excluded(linked, PDF)
+    assert linked.index().documents_tagged([PERSONAL]) == {PDF}
+    denied = await library.ok("set_sync_scope", {"mode": "deny", "tags": [PERSONAL]})
+    assert denied["unmatched_tags"] == []
+    listed = await library.ok("list", {"tags": [PERSONAL]})
+    assert [(i["uuid"], i["state"], i["tags"]) for i in listed["items"]] == [
+        (PDF, "excluded", [PERSONAL])
+    ]
+
+
 async def test_a_damaged_stored_scope_is_replaced(library: Served, linked: Linked) -> None:
     linked.index().set_setting(SETTING_SYNC_SCOPE, "{not json")
     result = await library.ok("set_sync_scope", {"mode": "all"})

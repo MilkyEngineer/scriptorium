@@ -16,11 +16,13 @@ One process, one asyncio loop, four kinds of task:
   thread under a watchdog (``POLL_TIMEOUT_SECONDS``): when it fires, the cloud client is
   closed (failing whatever request is in flight) and no new poll of that account starts
   until the old one has returned. After a poll, the pages and tags of every committed or
-  un-tombstoned document (the tags of a folder) are refreshed from its new version
-  (:func:`refresh_document`) and ``render`` jobs are queued for pages without a PNG: at low
-  priority (:func:`render_priority`) for a document that is tombstoned, in the trash or
-  outside the sync scope, so live pages render first; the waiting render jobs of a document
-  the poll tombstoned are lowered too (``JobQueue.deprioritise``). Each poll holds the
+  un-tombstoned document, or of one let back into the sync scope without a commit (the tags
+  of a folder), are refreshed from its current version (:func:`refresh_document`) and
+  ``render`` jobs are queued for pages without a PNG: at low priority
+  (:func:`render_priority`) for a document that is tombstoned, in the trash or outside the
+  sync scope, so live pages render first; the waiting render jobs of a document the poll
+  tombstoned or moved out of the scope are lowered too (``JobQueue.deprioritise``). Each
+  poll holds the
   account's poll lock (``accounts.poll_lock``); a poll that finds the directory moved
   (``disconnect_remarkable(keep_archive=false)``) does nothing (``account_moved``). A poll
   the watchdog gave up on is still reaped when its thread returns: its error is logged by
@@ -1112,13 +1114,15 @@ class AccountLoop:
         task.add_done_callback(self._reaping.discard)
 
     def refresh_after(self, ctx: AccountContext, report: SyncReport) -> None:
-        """Refresh the pages of what ``report`` committed or un-tombstoned, and lower the
-        waiting renders of what it tombstoned."""
-        changed = dict.fromkeys((*report.committed, *report.untombstoned))
+        """Refresh the pages and tags of what ``report`` committed, un-tombstoned or let back
+        into the sync scope, and lower the waiting renders of what it tombstoned or moved out
+        of the scope."""
+        changed = dict.fromkeys((*report.committed, *report.untombstoned, *report.included))
         if changed:
             self.worker.refresh(ctx, changed)
-        if report.tombstoned:
-            self.worker.deprioritise(ctx, report.tombstoned)
+        lowered = dict.fromkeys((*report.tombstoned, *report.newly_excluded))
+        if lowered:
+            self.worker.deprioritise(ctx, lowered)
 
     def _record_failure(self, ctx: AccountContext, outcome: str) -> float:
         self._pokeable = False
