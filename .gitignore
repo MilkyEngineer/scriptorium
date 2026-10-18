@@ -28,3 +28,6 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code local state (worktrees, plugin settings)
+.claude/
