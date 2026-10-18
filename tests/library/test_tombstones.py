@@ -180,6 +180,16 @@ def test_empty_root_on_an_empty_account_is_fine() -> None:
     assert run(NONE, NONE, NONE) == TombstonePlan(NONE, NONE, None)
 
 
+def test_an_empty_previous_listing_is_not_evidence_of_entries() -> None:
+    """Deliberate: once an administrator has cleared empty_root and the empty listing becomes
+    ``previous``, a root that is still empty is believed. A small library is tombstoned (a
+    move, never a delete) and a larger one still trips the breaker; judging by the library
+    instead would keep an account that really was emptied in empty_root for ever."""
+    small, large = ids(3), ids(6)
+    assert run(small, NONE, NONE) == TombstonePlan(small, NONE, None)
+    assert run(large, NONE, NONE) == TombstonePlan(NONE, NONE, ANOMALY_MASS_DELETE)
+
+
 def test_regression_takes_precedence_over_empty_root() -> None:
     lib = ids(3)
     assert run(lib, lib, NONE, prev_gen=5, cur_gen=1).anomaly == ANOMALY_GENERATION_REGRESSED

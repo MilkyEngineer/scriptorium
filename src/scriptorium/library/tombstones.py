@@ -7,6 +7,9 @@ The rules, in the order they are applied:
    listing's. The listing cannot be trusted: ``anomaly="generation_regressed"``, empty plan.
 2. **Empty root**: the current listing has no entries although the previous one had some (or,
    with no previous listing, the library is not empty). ``anomaly="empty_root"``, empty plan.
+   An empty *previous* listing is not evidence of entries: after an administrator clears the
+   anomaly, a root that stays empty is believed and goes on to rules 4 and 5 (so a small
+   library is tombstoned, which only moves files, and a larger one trips the breaker).
 3. **Un-tombstone**: a tombstoned UUID present in the current listing comes back. Presence is
    positive evidence, so this holds for a partial listing too.
 4. **Candidates**: only when the previous and the current listing are both complete, a
@@ -19,7 +22,8 @@ The rules, in the order they are applied:
    exact (no rounding): with 55 documents, 5 candidates pass and 6 trip it.
 
 An anomaly means the account goes read-only until an administrator clears it (§7 step 7);
-the plan returned with one never tombstones anything.
+the plan returned with one never tombstones anything, and the caller applies no plan while
+the account is read-only.
 """
 
 from __future__ import annotations
