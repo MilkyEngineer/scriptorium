@@ -27,6 +27,7 @@ from scriptorium.users.store import (
     new_ulid,
     uid_for,
     user_dir,
+    worker_heartbeat_path,
 )
 
 ISS = "https://auth.example.com/realms/scriptorium"
@@ -419,3 +420,57 @@ def test_audit_validates_its_fields(
 def test_audit_refuses_a_malformed_user_hash(gs: GlobalStore) -> None:
     with pytest.raises(InvalidArgumentError):
         gs.audit(uid_hash="someone", tool="list", duration_ms=1, outcome="ok", identifiers={})
+
+
+# ---- account enumeration and replace --------------------------------------------------------
+
+
+def test_link_with_replace_deactivates_the_old_account_atomically(gs: GlobalStore) -> None:
+    alice = gs.ensure_user(make_user("alice")).uid
+    bob = gs.ensure_user(make_user("bob")).uid
+    old = gs.link_account(alice, "rm-a", "d")
+    gs.link_account(bob, "rm-b", "d")
+    # Refused because rm-b is bob's: alice's old account must stay active.
+    with pytest.raises(RefusedError):
+        gs.link_account(alice, "rm-b", "d", replace=True)
+    assert [a.active for a in gs.accounts(alice)] == [True]
+    new = gs.link_account(alice, "rm-c", "d", replace=True)
+    assert new.acct != old.acct and new.active
+    assert [(a.acct, a.active) for a in gs.accounts(alice)] == [(old.acct, False), (new.acct, True)]
+    # Replacing with the identity of the active account is a plain relink.
+    again = gs.link_account(alice, "rm-c", "d2", replace=True)
+    assert again.acct == new.acct and again.active
+
+
+def test_account_lookup_is_scoped_to_the_user(gs: GlobalStore) -> None:
+    alice = gs.ensure_user(make_user("alice")).uid
+    bob = gs.ensure_user(make_user("bob")).uid
+    a = gs.link_account(alice, None, "d")
+    got = gs.account(alice, a.acct)
+    assert got is not None and got.acct == a.acct
+    assert gs.account(bob, a.acct) is None
+    with pytest.raises(InvalidArgumentError):
+        gs.account(alice, "../x")
+
+
+def test_active_and_all_accounts(db: Path, gs: GlobalStore) -> None:
+    alice = gs.ensure_user(make_user("alice")).uid
+    bob = gs.ensure_user(make_user("bob")).uid
+    carol = gs.ensure_user(make_user("carol")).uid
+    a1 = gs.link_account(alice, None, "d")
+    gs.deactivate_account(alice, a1.acct)
+    a2 = gs.link_account(alice, None, "d")
+    b = gs.link_account(bob, None, "d")
+    c = gs.link_account(carol, None, "d")
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute(
+            "UPDATE users SET disabled_at = '2026-10-01T00:00:00Z' WHERE uid = ?", (carol,)
+        )
+    conn.close()
+    assert {a.acct for a in gs.active_accounts()} == {a2.acct, b.acct}
+    assert {a.acct for a in gs.all_accounts()} == {a1.acct, a2.acct, b.acct, c.acct}
+
+
+def test_worker_heartbeat_path(tmp_path: Path) -> None:
+    assert worker_heartbeat_path(tmp_path) == tmp_path / "worker.heartbeat"

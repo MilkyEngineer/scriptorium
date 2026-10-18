@@ -48,6 +48,7 @@ __all__ = [
     "new_ulid",
     "uid_for",
     "user_dir",
+    "worker_heartbeat_path",
 ]
 
 #: A user's directory name: ``uid_hash[:16]``.
@@ -104,6 +105,11 @@ class AccountPaths:
 def global_db_path(data_dir: Path) -> Path:
     """``<data>/scriptorium.sqlite``."""
     return Path(os.path.abspath(data_dir)) / "scriptorium.sqlite"
+
+
+def worker_heartbeat_path(data_dir: Path) -> Path:
+    """``<data>/worker.heartbeat``: the worker's liveness file (its healthcheck reads it)."""
+    return Path(os.path.abspath(data_dir)) / "worker.heartbeat"
 
 
 def user_dir(data_dir: Path, uid: str) -> Path:
@@ -362,16 +368,49 @@ class GlobalStore:
             ).fetchall()
         return [_account_row(r) for r in rows]
 
-    def link_account(self, uid: str, rm_identity: str | None, device_desc: str) -> AccountRow:
+    def account(self, uid: str, acct: str) -> AccountRow | None:
+        """Account ``acct`` if it belongs to ``uid`` (active or not), else None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT acct, uid, rm_account_identity, active, linked_at, device_desc "
+                "FROM accounts WHERE uid = ? AND acct = ?",
+                (_check_uid(uid), _check_acct(acct)),
+            ).fetchone()
+        return None if row is None else _account_row(row)
+
+    def active_accounts(self) -> list[AccountRow]:
+        """Every active account of a user who is not disabled: what the worker polls."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT a.acct, a.uid, a.rm_account_identity, a.active, a.linked_at, "
+                "a.device_desc FROM accounts a JOIN users u ON u.uid = a.uid "
+                "WHERE a.active = 1 AND u.disabled_at IS NULL ORDER BY a.linked_at, a.acct"
+            ).fetchall()
+        return [_account_row(r) for r in rows]
+
+    def all_accounts(self) -> list[AccountRow]:
+        """Every account ever linked, by anyone (the server migrates their indexes at start)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT acct, uid, rm_account_identity, active, linked_at, device_desc "
+                "FROM accounts ORDER BY linked_at, acct"
+            ).fetchall()
+        return [_account_row(r) for r in rows]
+
+    def link_account(
+        self, uid: str, rm_identity: str | None, device_desc: str, *, replace: bool = False
+    ) -> AccountRow:
         """Record a newly registered device; returns the account it belongs to.
 
         - The same reMarkable account (``rm_identity``) linked again by the same user reuses
           its ``acct`` (one directory per reMarkable account, §6) and reactivates it.
         - Otherwise a new ``acct`` ULID is minted.
         - Refuses (``refused``) when ``rm_identity`` is actively linked to another user, or
-          when the user already has a different active account: the caller deactivates it
-          first (``connect_remarkable(replace=true)``, §11.1). With ``rm_identity=None``
-          (identity not derivable, S0) a relink always gets a new ``acct``.
+          when the user already has a different active account and ``replace`` is false.
+          With ``replace=True`` (``connect_remarkable(replace=true)``, §11.1) that account is
+          deactivated in the same transaction, after the other-user check, so a refused link
+          leaves the old account active. With ``rm_identity=None`` (identity not derivable,
+          S0) a relink always gets a new ``acct``.
         """
         _check_uid(uid)
         if rm_identity is not None and (
@@ -416,10 +455,12 @@ class GlobalStore:
                     (uid, rm_identity),
                 ).fetchone()
             if active is not None and (reuse is None or reuse[0] != active[0]):
-                raise RefusedError(
-                    "a reMarkable account is already linked",
-                    hint="disconnect it first, or connect with replace=true",
-                )
+                if not replace:
+                    raise RefusedError(
+                        "a reMarkable account is already linked",
+                        hint="disconnect it first, or connect with replace=true",
+                    )
+                conn.execute("UPDATE accounts SET active = 0 WHERE acct = ?", (active[0],))
             if reuse is not None:
                 acct = str(reuse[0])
                 conn.execute(
