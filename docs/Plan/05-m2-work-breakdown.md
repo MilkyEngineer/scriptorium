@@ -211,6 +211,10 @@ Everything in `04-m1-work-breakdown.md` §4 applies. In addition:
 | + `disconnect_remarkable(keep_archive=false)` two-step | I token tests (bound to user and args, single use, expiry); live dry run then execute on the scratch link |
 | + `admin_clear_anomaly` | I: cassette that trips the breaker, clear without approval re-trips, clear with approval tombstones once |
 
+## 5a. Integration log
+
+- **H merged 2026-10-18 (`e352ac5`)**, 1411 tests. Deviations accepted and recorded in Architecture §6.1/§11.2: `page=''` for document tags; the 100-tag bound counts page tags; `folder` is a UUID subtree; `doc_tags` on transcripts feeds the FTS. Follow-up for the review wave: a page tag on an untranscribed notebook is findable by neither text nor filter; let document hits in the name fallback match page tags too.
+
 ## 6. Order of work and what the operator provides
 
 1. Coordinator: Architecture edits for the seams above (§6.1 `settings`, `tags`, `excluded_at`, `prompt_version`; §6.2 `ocr_spend`, `users.ocr_cap_usd`, `jobs.priority`, `confirmations`; §7 scope, wake-up, priority; §11 signatures; §12 `OCR_MAX_TOKENS`, `OCR_BATCH_MIN`, `OCR_USER_CONCURRENCY`, `NOTIFICATIONS`, `NOTIFY_MIN_GAP_SECONDS`), then spawn F, H, I (wave 1) and G against fakes.
