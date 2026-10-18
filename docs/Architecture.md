@@ -245,7 +245,7 @@ Key consequences:
 
 **Bring your own issuer.** Scriptorium contains no identity provider and the image has no dependency on Keycloak. An operator's issuer qualifies when it provides:
 
-1. OIDC discovery (`/.well-known/openid-configuration`) and/or RFC 8414 metadata, reachable from Anthropic's egress range and from users' machines.
+1. OIDC discovery (`/.well-known/openid-configuration`) and/or RFC 8414 metadata, reachable from Anthropic's egress range, from users' machines **and from the `scriptorium` container itself**, which fetches discovery and the JWKS over TLS with the system trust store. With a split-horizon resolver that points the issuer hostname at an internal proxy serving a private or CDN-origin certificate, give the container a public resolver (compose `dns:`) or mount that CA; the symptom is `oidc_discovery_failed` with `ConnectError` and 503 on every authenticated call.
 2. Authorization-code flow with PKCE S256 for **public** clients, and refresh tokens (`offline_access` or equivalent) with rotation.
 3. A way for Claude to obtain a client: a pre-registered public client whose ID the user types into Claude (works everywhere), **or** DCR (RFC 7591), **or** Client ID Metadata Documents.
 4. Redirect URIs `https://claude.ai/api/mcp/auth_callback` and port-agnostic `http://localhost/callback` / `http://127.0.0.1/callback` (the latter two only if Claude Code is used; otherwise a PAT, §5.4).
