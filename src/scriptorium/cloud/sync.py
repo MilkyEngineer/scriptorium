@@ -22,7 +22,10 @@
    files are back in place before a newer version replaces them. No plan is applied
    once an anomaly is set. An administrator's one-shot approval
    (``sync_state.allow_mass_delete``, written by ``admin_clear_anomaly``) is passed to
-   the planner as ``allow_mass_delete=True`` and consumed by the next poll that lists.
+   the planner as ``allow_mass_delete=True`` and consumed only by a poll whose plan was
+   acted on: the planner ran with it and either raised an anomaly or the poll reached the
+   tombstone step. A poll stopped during the listing or the commits (a budget, ``backoff``,
+   ``token_rejected``) or by an early anomaly leaves the approval for the next one.
 7. **Failure classes.** 401/403 from the token endpoint is ``token_rejected``; 429, a
    network failure or three transient failures in a row end the poll with ``backoff``;
    an unparseable root (a ``CloudProtocolError`` or a hash mismatch) is
@@ -196,7 +199,8 @@ class SyncReport:
     anomaly: str | None = None
     anomaly_reason: str | None = None
     mass_delete_approved: bool = False
-    """This poll consumed an administrator's ``allow_mass_delete`` approval."""
+    """This poll consumed an administrator's ``allow_mass_delete`` approval (its plan,
+    made with the approval, was acted on)."""
 
 
 class _BudgetSpentError(Exception):
@@ -352,6 +356,7 @@ class SyncOnce:
         # The listing ran to its end and is incomplete only because documents failed.
         listing_failures = len(run.failed) if stop is None and not complete else 0
 
+        consumed = False
         if stop is None:
             plan = self._planner(
                 previous,
@@ -361,15 +366,6 @@ class SyncOnce:
                 self._settings.tombstone_max_per_poll,
                 allow_mass_delete=approved,
             )
-            if approved:
-                run.mass_delete_approved = True
-                log_event(
-                    logger,
-                    "sync.mass_delete_approved",
-                    level=logging.WARNING,
-                    acct=self._settings.acct,
-                    count=len(plan.to_tombstone),
-                )
             if plan.anomaly is not None:
                 # The breaker (or a check the planner shares with step 1) tripped: nothing
                 # is moved, downloaded or committed until an operator has looked.
@@ -386,6 +382,18 @@ class SyncOnce:
                 stop = self._commit_all(root, entries, indexes, blocked, run)
                 if plan.to_tombstone and stop is None:
                     self._tombstone(plan.to_tombstone, run)
+            # The plan made with the approval was acted on: it is spent. A poll stopped
+            # before its tombstone step keeps it for the next poll's plan.
+            consumed = approved and (plan.anomaly is not None or stop is None)
+            if consumed:
+                run.mass_delete_approved = True
+                log_event(
+                    logger,
+                    "sync.mass_delete_approved",
+                    level=logging.WARNING,
+                    acct=self._settings.acct,
+                    count=len(plan.to_tombstone),
+                )
 
         fully_done = complete and stop is None and not run.failed and run.anomaly is None
         self._save_listing(
@@ -393,6 +401,7 @@ class SyncOnce:
             root_hash=root.hash if fully_done else None,
             listing_failures=listing_failures,
             started_at=run.started_at,
+            consume_approval=consumed,
         )
 
         if run.anomaly is not None:
@@ -427,8 +436,9 @@ class SyncOnce:
         root_hash: str | None,
         listing_failures: int = 0,
         started_at: datetime | None = None,
+        consume_approval: bool = False,
     ) -> None:
-        """Record this poll's listing for the next one and consume any one-shot approval.
+        """Record this poll's listing for the next one; consume the approval if told to.
 
         A complete listing clears the ``tombstoning_suspended_*`` keys; one that failed on
         ``listing_failures`` documents sets them (keeping the first poll's time).
@@ -454,7 +464,8 @@ class SyncOnce:
             ok = "true" if listing.complete else "false"
             self._index.set_state(STATE_LAST_FULL_LISTING_OK, ok)
             self._index.set_state(STATE_LAST_ROOT_HASH, root_hash)
-            self._index.set_state(STATE_ALLOW_MASS_DELETE, None)
+            if consume_approval:
+                self._index.set_state(STATE_ALLOW_MASS_DELETE, None)
 
     # ---- step 2 --------------------------------------------------------------------------
 

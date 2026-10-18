@@ -368,6 +368,63 @@ def test_an_approval_survives_a_poll_that_never_reached_the_root(tmp_path: Path)
     assert h.state("allow_mass_delete") == "true"
 
 
+def _approved_mass_delete(tmp_path: Path) -> tuple[FakeCloud, Harness]:
+    """Nine documents, six removed, the breaker tripped and cleared with an approval."""
+    cloud = FakeCloud()
+    nine(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.poll()
+    cloud.remove_document(*PAGES[:6])
+    h.poll()
+    assert h.poll().anomaly == "mass_delete"
+    clear_anomaly(h, allow_mass_delete=True)
+    return cloud, h
+
+
+def test_an_approval_survives_an_early_anomaly(tmp_path: Path) -> None:
+    cloud, h = _approved_mass_delete(tmp_path)
+    cloud.publish(generation=1)  # a regressed root: refused before anything is listed
+
+    assert h.poll().anomaly == "generation_regressed"
+    assert h.state("allow_mass_delete") == "true"
+
+
+def test_an_approval_survives_a_poll_stopped_during_the_listing(tmp_path: Path) -> None:
+    cloud, h = _approved_mass_delete(tmp_path)
+    cloud.set_file(NOTEBOOK, PAGE_101, b"synthetic page bytes: an edit")
+    cloud.status[cloud.doc_hash(NOTEBOOK)] = 429  # rate limited: the listing stops
+
+    stopped = h.poll()
+
+    assert stopped.outcome == "backoff" and not stopped.mass_delete_approved
+    assert h.state("allow_mass_delete") == "true"
+    assert h.tombstoned_uuids() == set()
+
+
+def test_an_approval_survives_a_poll_stopped_by_its_budget(tmp_path: Path) -> None:
+    cloud, h = _approved_mass_delete(tmp_path)
+    for name, data in (
+        (PAGE_101, b"synthetic page bytes: first edit"),
+        (f"{NOTEBOOK}/{PAGES[1]}.rm", b"synthetic page bytes: second edit"),
+    ):
+        cloud.set_file(NOTEBOOK, name, data)
+    settings = h.settings
+    h.settings = SyncSettings(sync_workers=1, sync_max_poll_bytes=1)
+
+    budget = h.poll()  # planned with the approval, stopped in the commits
+
+    assert (budget.outcome, budget.reason) == ("partial", "byte_budget")
+    assert not budget.mass_delete_approved
+    assert h.state("allow_mass_delete") == "true"
+    assert h.tombstoned_uuids() == set()
+
+    h.settings = settings
+    approved = h.poll()  # the next poll that reaches its tombstone step spends it
+    assert approved.mass_delete_approved and len(approved.tombstoned) == 6
+    assert h.state("allow_mass_delete") is None
+    assert_safe(h)
+
+
 def test_the_index_blob_is_kept_with_each_version(tmp_path: Path) -> None:
     cloud = FakeCloud()
     both(cloud)
