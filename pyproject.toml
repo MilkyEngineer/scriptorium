@@ -16,6 +16,7 @@ dependencies = [
     "starlette>=0.40,<1",
     "remarkable-mcp[render] @ git+https://github.com/MilkyEngineer/remarkable-mcp@scriptorium-s3",
     "anyio>=4.5,<5",
+    "pillow>=11,<14",  # imported directly by library/render.py (§4.4)
 ]
 
 [project.scripts]
