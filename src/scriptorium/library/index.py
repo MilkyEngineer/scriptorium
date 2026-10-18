@@ -184,7 +184,7 @@ def _decode_cursor(cursor: str, kind: str, types: Sequence[type]) -> list[Any]:
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
         value = json.loads(raw)
-    except (binascii.Error, ValueError):
+    except (binascii.Error, ValueError, RecursionError):  # deep nesting: RecursionError
         value = None
     if (
         isinstance(value, list)

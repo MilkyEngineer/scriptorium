@@ -192,13 +192,20 @@ def index_to_page(index: int) -> int:
 
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
+CURSOR_MAX: Final = 20_000
+"""Longest cursor accepted: an index cursor carries a name of up to 1024 characters, JSON
+escaped (up to 12 characters each) and base64 encoded."""
 
 
 class PageArgs(ToolArgs):
     """Mixin for list-like tools: ``limit`` (≤ 100, default 50) and an opaque ``cursor``."""
 
     limit: int = Field(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT, description="Maximum items.")
-    cursor: str | None = Field(default=None, description="next_cursor from the previous call.")
+    cursor: str | None = Field(
+        default=None,
+        max_length=CURSOR_MAX,
+        description="next_cursor from the previous call.",
+    )
 
 
 def encode_cursor(state: Mapping[str, str | int]) -> str:
@@ -212,7 +219,7 @@ def decode_cursor(cursor: str) -> dict[str, str | int]:
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
         state = json.loads(raw)
-    except (binascii.Error, ValueError):
+    except (binascii.Error, ValueError, RecursionError):  # deep nesting: RecursionError
         raise invalid_argument(
             "The cursor is not valid.", "Start again without a cursor."
         ) from None
@@ -237,9 +244,9 @@ def parse_iso_utc(value: str) -> datetime:
     """Parse a client-supplied ISO 8601 timestamp; naive values are taken as UTC."""
     try:
         moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    except (ValueError, OverflowError):  # OverflowError: year 1 or 9999 with an offset
         raise invalid_argument("Timestamps are ISO 8601, e.g. 2026-10-17T09:00:00Z.") from None
-    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
 
 
 # ---- annotations ------------------------------------------------------------------------

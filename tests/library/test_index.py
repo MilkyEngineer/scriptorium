@@ -245,6 +245,7 @@ def test_cursor_is_stable_under_inserts(index: Index) -> None:
         base64.urlsafe_b64encode(b'["recent","x","y"]').decode(),
         base64.urlsafe_b64encode(b'["children","a","b",3]').decode(),
         base64.urlsafe_b64encode(b'{"offset":10}').decode(),
+        base64.urlsafe_b64encode(b"[" * 200_000).decode(),  # json raises RecursionError
     ],
 )
 def test_bad_cursors_are_invalid_argument(index: Index, cursor: str) -> None:

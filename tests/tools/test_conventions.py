@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -9,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from scriptorium.tools._conventions import (
+    CURSOR_MAX,
     MAX_LIMIT,
     RESULT_CAP_BYTES,
     TEXT_CAP_BYTES,
@@ -134,7 +136,18 @@ def test_cursor_round_trip() -> None:
     assert decode_cursor(encode_cursor(state)) == state
 
 
-@pytest.mark.parametrize("bad", ["!!!", "bm90IGpzb24", encode_cursor({"a": 1})[:-2] + "@@", "WzFd"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "!!!",
+        "bm90IGpzb24",
+        encode_cursor({"a": 1})[:-2] + "@@",
+        "WzFd",
+        base64.urlsafe_b64encode(
+            b"[" * 200_000
+        ).decode(),  # nesting deep enough to make json raise RecursionError
+    ],
+)
 def test_bad_cursor_is_invalid_argument(bad: str) -> None:
     with pytest.raises(ToolError) as info:
         decode_cursor(bad)
@@ -156,3 +169,13 @@ def test_timestamps() -> None:
         iso_utc(datetime(2026, 1, 1))
     with pytest.raises(ToolError):
         parse_iso_utc("yesterday")
+    for edge in ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"):
+        with pytest.raises(ToolError) as info:
+            parse_iso_utc(edge)  # outside datetime's range once converted to UTC
+        assert info.value.code is ErrorCode.INVALID_ARGUMENT
+
+
+def test_page_args_bound_the_cursor() -> None:
+    with pytest.raises(ValidationError):
+        PageArgs.model_validate({"cursor": "a" * (CURSOR_MAX + 1)})
+    assert PageArgs.model_validate({"cursor": "a" * CURSOR_MAX}).cursor is not None
