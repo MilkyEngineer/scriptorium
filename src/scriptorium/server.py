@@ -571,12 +571,13 @@ def build_registry(settings: Settings, services: Services | None = None) -> Tool
     has ``/data`` open (``services``), and the S6 spike tools when ``SPIKE_TOOLS`` is on."""
     registry = ToolRegistry()
     if services is not None:
-        from scriptorium.tools import account, admin, library, ocr
+        from scriptorium.tools import account, admin, admin_sync, library, ocr
 
         account.register(registry)
         library.register(registry)
         ocr.register(registry)
         admin.register(registry)
+        admin_sync.register(registry)
     if settings.spike_tools:
         from scriptorium.tools.spike import register_spike_tools
 

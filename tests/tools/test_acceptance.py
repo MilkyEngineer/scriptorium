@@ -38,7 +38,7 @@ M2_TOOLS = {
     "set_auto_ocr",
     "set_sync_scope",
 }
-ADMIN_TOOLS = {"admin_allow_server_key"}
+ADMIN_TOOLS = {"admin_allow_server_key", "admin_clear_anomaly"}
 NOTEBOOK_NAME = "Scriptorium Test Notebook"
 TRANSCRIPT_MARKER = "transcript-marker-7f3a"
 PATH_MARKER = "path-marker-91c2"
