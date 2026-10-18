@@ -137,6 +137,31 @@ def test_m1_acceptance_6_sixty_percent_missing_trips_breaker() -> None:
     assert result.to_tombstone == NONE
 
 
+def test_an_approved_mass_delete_passes_the_breaker_once() -> None:
+    """After admin_clear_anomaly(allow_mass_delete=true) the next plan tombstones the
+    candidates; without the override the same facts trip the breaker again."""
+    lib = ids(100)
+    gone = ids(60)
+    assert run(lib, lib - gone, lib - gone).anomaly == ANOMALY_MASS_DELETE
+
+    def approved(previous: Listing, current: Listing) -> TombstonePlan:
+        return plan(previous, current, lib, NONE, 50, allow_mass_delete=True)
+
+    before = Listing(uuids=lib - gone, complete=True, generation=10)
+    now = Listing(uuids=lib - gone, complete=True, generation=11)
+    assert approved(before, now) == TombstonePlan(gone, NONE, None)
+    # The override does not weaken rules 1 to 4.
+    regressed = approved(Listing(uuids=lib - gone, complete=True, generation=12), now)
+    assert regressed.anomaly == ANOMALY_GENERATION_REGRESSED
+    empty = approved(
+        Listing(uuids=lib, complete=True, generation=10),
+        Listing(uuids=NONE, complete=True, generation=11),
+    )
+    assert empty.anomaly == ANOMALY_EMPTY_ROOT
+    partial = approved(Listing(uuids=lib - gone, complete=False, generation=10), now)
+    assert partial == TombstonePlan(NONE, NONE, None)
+
+
 def test_breaker_still_reports_untombstones() -> None:
     lib = ids(100)
     back = ids(2, start=500)

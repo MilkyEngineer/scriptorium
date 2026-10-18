@@ -19,7 +19,11 @@ The rules, in the order they are applied:
 5. **Circuit breaker**: more candidates than ``max(5, 10 % of the library)``, or more than
    ``max_per_poll``: ``anomaly="mass_delete"`` and nothing is tombstoned (un-tombstones from
    rule 3 are still reported; bringing a document back deletes nothing). The comparison is
-   exact (no rounding): with 55 documents, 5 candidates pass and 6 trip it.
+   exact (no rounding): with 55 documents, 5 candidates pass and 6 trip it. Clearing the
+   anomaly alone cannot recover the account, because the next poll recomputes the same
+   candidates; ``allow_mass_delete=True`` skips the breaker for **one** plan, and the caller
+   passes it only for the poll right after an administrator approved the deletion
+   (``admin_clear_anomaly(..., allow_mass_delete=true)``, §7 step 4).
 
 An anomaly means the account goes read-only until an administrator clears it (§7 step 7);
 the plan returned with one never tombstones anything, and the caller applies no plan while
@@ -78,12 +82,15 @@ def plan(
     library: frozenset[str],
     tombstoned: frozenset[str],
     max_per_poll: int,
+    *,
+    allow_mass_delete: bool = False,
 ) -> TombstonePlan:
     """Decide tombstones for this poll (rules in the module docstring).
 
     ``library`` is the set of documents currently in the library (not tombstoned);
     ``tombstoned`` the set currently in ``tombstones/``; ``max_per_poll`` is
-    ``TOMBSTONE_MAX_PER_POLL``.
+    ``TOMBSTONE_MAX_PER_POLL``. ``allow_mass_delete`` is the one-poll override of rule 5
+    granted by an administrator; rules 1 to 4 still apply.
     """
     if isinstance(max_per_poll, bool) or not isinstance(max_per_poll, int) or max_per_poll < 0:
         raise InvalidArgumentError("max_per_poll must be a non-negative integer")
@@ -100,7 +107,7 @@ def plan(
         return TombstonePlan(_EMPTY, to_untombstone, None)
 
     candidates = frozenset(library - tombstoned - previous.uuids - current.uuids)
-    if _breaker_trips(len(candidates), len(library), max_per_poll):
+    if not allow_mass_delete and _breaker_trips(len(candidates), len(library), max_per_poll):
         return TombstonePlan(_EMPTY, to_untombstone, ANOMALY_MASS_DELETE)
     return TombstonePlan(candidates, to_untombstone, None)
 

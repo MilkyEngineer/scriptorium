@@ -83,8 +83,10 @@ class Listing: uuids: frozenset[str]; complete: bool; generation: int
 @dataclass(frozen=True)
 class TombstonePlan: to_tombstone: frozenset[str]; to_untombstone: frozenset[str]; anomaly: str | None
 def plan(previous: Listing | None, current: Listing, library: frozenset[str], tombstoned: frozenset[str],
-         max_per_poll: int) -> TombstonePlan
+         max_per_poll: int, *, allow_mass_delete: bool = False) -> TombstonePlan
 ```
+
+`allow_mass_delete` (added after A landed) is the one-poll override an administrator grants through `admin_clear_anomaly(..., allow_mass_delete=true)` (Architecture §7 step 4); it skips rule 5 only. The caller never applies a plan while the account is read-only, and passes the immediately preceding listing as `previous`.
 
 Rules encoded exactly as §7 step 1 and 4: no candidates unless `previous.complete and current.complete`; candidates = absent from both; breaker when candidates > `max(5, 10 % of library)` or > `max_per_poll` → `anomaly="mass_delete"` and an empty `to_tombstone`; generation lower than previous → `anomaly="generation_regressed"`; zero entries after non-empty → `anomaly="empty_root"`.
 
@@ -181,7 +183,7 @@ class SyncOnce:
     def run(self) -> SyncReport        # §7 steps 1–4 and 7, exactly; rendering and OCR are the worker's (E)
 ```
 
-Every string from the cloud is untrusted: names are display data, file names go through `is_safe_name`, sizes are capped, JSON is bounded. Tests use the cassette harness (`tests/cloud/cassettes.py`: recorded, **scrubbed** request/response pairs played back through `httpx.MockTransport`); the recorder refuses to write a cassette containing a bearer token, a UUID not from the fixture allowlist, or any `.rm` payload that is not from the S3 fixture notebook. Live recording needs `SCRIPTORIUM_LIVE_TEST=1` and the operator's scratch device token, and is never run by an agent.
+Every string from the cloud is untrusted: names are display data, file names go through `is_safe_name`, sizes are capped, JSON is bounded. Facts from A's archive that D must honour: hashes are normalised to lowercase hex before they reach the archive or the index; the document index blob is stored with `put_blob` under its `hash_root` so history rows resolve to a file set (§6); files in a real index whose names fail the allowlist are skipped and counted in the `SyncReport`, never passed to the archive; `commit` refuses a bare `<uuid>` file name; a plan is applied only when the account is not read-only. Tests use the cassette harness (`tests/cloud/cassettes.py`: recorded, **scrubbed** request/response pairs played back through `httpx.MockTransport`); the recorder refuses to write a cassette containing a bearer token, a UUID not from the fixture allowlist, or any `.rm` payload that is not from the S3 fixture notebook. Live recording needs `SCRIPTORIUM_LIVE_TEST=1` and the operator's scratch device token, and is never run by an agent.
 
 ### 3.8 Worker and tools (E)
 
