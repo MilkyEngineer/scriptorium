@@ -720,3 +720,16 @@ def test_search_refuses_bad_cursors_and_too_many_terms(index: Index) -> None:
         index.search("x", cursor="garbage", limit=5)
     with pytest.raises(InvalidArgumentError):
         index.search(" ".join(["w"] * 65), cursor=None, limit=5)
+
+
+def test_page_by_id_and_guarded_set_rendered(index: Index) -> None:
+    index.upsert_document(doc(1, "A"))
+    index.replace_pages(uid(1), [pr(0, 0, "a"), pr(1, 1, "b")])
+    assert index.page_by_id(uid(101)) == index.page(uid(1), 1)
+    assert index.page_by_id(uid(199)) is None
+    # A render of an older content hash is not recorded once the page has changed.
+    assert index.set_rendered(uid(100), "pages/old.png", T0, content_hash="stale") is False
+    assert index.page(uid(1), 0) == pr(0, 0, "a")
+    assert index.set_rendered(uid(100), "pages/a.png", T0, content_hash="a") is True
+    assert index.page(uid(1), 0) == pr(0, 0, "a", rendered_at=T0, png_path="pages/a.png")
+    assert index.set_rendered(uid(199), "pages/x.png", T0, content_hash="a") is False

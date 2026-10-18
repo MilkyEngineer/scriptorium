@@ -672,14 +672,31 @@ class Index:
             ).fetchall()
         return [_page(r) for r in rows]
 
-    def set_rendered(self, page_id: str, png_path: str, at: datetime) -> None:
+    def page_by_id(self, page_id: str) -> PageRow | None:
+        """The current page with this page UUID, whichever document lists it."""
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM pages WHERE uuid = ?", (page_id,)).fetchone()
+        return None if row is None else _page(row)
+
+    def set_rendered(
+        self, page_id: str, png_path: str, at: datetime, *, content_hash: str | None = None
+    ) -> bool:
+        """Record the page's rendered image.
+
+        With ``content_hash``, only while the page still has that hash: a render that finishes
+        after the page changed again is not recorded (returns False). Without it, an unknown
+        page is ``not_found``.
+        """
+        sql = "UPDATE pages SET rendered_at = ?, png_path = ? WHERE uuid = ?"
+        args: tuple[str, ...] = (to_db_time(at), png_path, page_id)
+        if content_hash is not None:
+            sql += " AND content_hash = ?"
+            args += (content_hash,)
         with self.transaction():
-            cur = self._conn.execute(
-                "UPDATE pages SET rendered_at = ?, png_path = ? WHERE uuid = ?",
-                (to_db_time(at), png_path, page_id),
-            )
-            if cur.rowcount == 0:
+            cur = self._conn.execute(sql, args)
+            if cur.rowcount == 0 and content_hash is None:
                 raise NotFoundError("Page not found.")
+        return cur.rowcount > 0
 
     # ---- transcripts --------------------------------------------------------------------
 
