@@ -29,7 +29,8 @@ holding the same page re-runs it with its own payload.
 **OCR jobs.** ``ocr:<acct>:<document>:<page>:<hash>`` transcribes one version of one
 document's page (transcripts are per document, §6.1, so the document is in the key);
 ``transcribe(force=true)`` re-runs it under ``:after:<id>`` within the same
-:data:`RERUN_CAP`. ``ocr_batch:<acct>:<batch id>`` is one submitted Message Batches request:
+:data:`RERUN_CAP` (a re-run of a job that died of a refused key, :data:`KEY_ERROR_PREFIX`, is
+not counted). ``ocr_batch:<acct>:<batch id>`` is one submitted Message Batches request:
 its payload is the batch id, the mode whose key submitted it, and the items as
 ``{custom_id: page}``. Payloads carry UUIDs, hashes, generations and the batch id only; a
 transcript never goes into a payload or a result.
@@ -50,6 +51,7 @@ __all__ = [
     "BATCH_ID_RE",
     "CUSTOM_ID_RE",
     "GONE_RESULT",
+    "KEY_ERROR_PREFIX",
     "MAX_BATCH_ITEMS",
     "OCR",
     "OCR_BATCH",
@@ -84,6 +86,11 @@ RENDER_VERDICTS: Final = frozenset({"invalid_argument", "refused"})
 """Job errors that say the page is at fault, not the run: such a dead job stays dead."""
 RERUN_CAP: Final = 3
 """Most ``:after:`` re-runs one key family ever gets (page_png and worker-start revival)."""
+KEY_ERROR_PREFIX: Final = "key_"
+"""Errors ``key_<reason>`` of OCR jobs that died because the API refused the *key*, not the
+page. A re-run of such a job does not count against :data:`RERUN_CAP`: the refusal says
+nothing about the page, and the 6-hour key hold (``ocr/pipeline.py``) already bounds how often
+one can happen, since every refusal pauses the key's mode for the account."""
 AFTER: Final = ":after:"
 GONE_RESULT: Final[Mapping[str, str]] = MappingProxyType({"state": "gone"})
 """A render job's result when its page version (or its account) no longer exists: the job is

@@ -18,6 +18,8 @@ from scriptorium.jobs.queue import (
     JobQueue,
     LeaseLostError,
     backoff_seconds,
+    deferral_reason,
+    is_deferred,
 )
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
@@ -827,3 +829,114 @@ def test_a_family_that_went_gone_is_not_revived_or_reported(queue: JobQueue) -> 
 
     assert not any(k.startswith("render:fam:after:99:") for k in keys(queue))
     assert "render:fam:after:99:after:4" not in keys(queue)
+
+
+# ---- deferral ---------------------------------------------------------------------------------
+
+
+def test_defer_puts_the_job_back_with_its_attempt_and_reason(queue: JobQueue, clock: Clock) -> None:
+    job_id = put(queue, "ocr:a", kind="ocr")
+    leased = queue.lease("w")
+    assert leased is not None and leased.attempts == 1
+    later = T0 + timedelta(hours=1)
+    back = queue.defer(job_id, "w", until=later, reason="no_key")
+    assert (back.state, back.attempts, back.error) == ("queued", 0, "deferred:no_key")
+    assert (back.lease_owner, back.lease_expires_at, back.next_run_at) == (None, None, later)
+    assert is_deferred(back) and deferral_reason(back) == "no_key"
+    assert keys(queue) == {"ocr:a": "queued"}  # no new job, no re-run key
+    assert queue.lease("w") is None
+    # Deferred again and again, it never runs out of attempts.
+    for _ in range(10):
+        clock.advance(3600)
+        again = queue.lease("w")
+        assert again is not None and again.id == job_id and again.attempts == 1
+        queue.defer(job_id, "w", until=clock.now + timedelta(hours=1), reason="no_key")
+    final = queue.get(job_id, UID)
+    assert final is not None and final.attempts == 0
+    # Leased once more and finished, it is an ordinary done job.
+    clock.advance(3600)
+    assert queue.lease("w") is not None
+    queue.complete(job_id, "w", {"state": "stored"})
+    done = queue.get(job_id, UID)
+    assert done is not None and done.error is None and not is_deferred(done)
+    assert deferral_reason(done) is None
+
+
+def test_defer_requires_the_lease_and_a_reason_code(queue: JobQueue) -> None:
+    job_id = put(queue, "ocr:b", kind="ocr")
+    with pytest.raises(LeaseLostError):
+        queue.defer(job_id, "w", until=T0, reason="no_key")
+    assert queue.lease("w") is not None
+    for bad in ("", "No Key", "deferred:x", "x" * 41):
+        with pytest.raises(InvalidArgumentError):
+            queue.defer(job_id, "w", until=T0, reason=bad)
+    with pytest.raises(InvalidArgumentError):
+        queue.defer(job_id, "w", until=datetime(2026, 1, 1), reason="no_key")  # naive
+    with pytest.raises(LeaseLostError):
+        queue.defer(job_id, "other", until=T0, reason="no_key")
+    # A time in the past makes it runnable at once.
+    back = queue.defer(job_id, "w", until=T0 - timedelta(days=1), reason="no_key")
+    assert back.next_run_at == T0
+    assert queue.lease("w") is not None
+
+
+def test_wake_makes_deferred_jobs_runnable(queue: JobQueue) -> None:
+    acct = "01J0000000000000000000000A"
+    ids = [put(queue, f"ocr:{n}", kind="ocr") for n in range(3)]
+    other = put(queue, "ocr:other", kind="ocr", uid=OTHER)
+    render = put(queue, "render:r")
+    week = T0 + timedelta(days=7)
+    for _ in range(5):
+        job = queue.lease("w")
+        assert job is not None
+        queue.defer(job.id, "w", until=week, reason="cap_reached_user")
+    assert queue.lease("w") is None
+    counts = queue.deferred_counts(UID, acct=acct, kinds=("ocr", "render"))
+    assert counts == {"ocr": {"cap_reached_user": 3}, "render": {"cap_reached_user": 1}}
+    assert queue.deferred_counts(OTHER, kinds=("ocr",)) == {"ocr": {"cap_reached_user": 1}}
+    assert queue.deferred_counts(UID, kinds=()) == {}
+    assert queue.counts(UID)["ocr"] == {"queued": 3}  # deferred jobs are still queued
+    # One job, by its owner only.
+    assert queue.wake(ids[0], OTHER) is None
+    woken = queue.wake(ids[0], UID)
+    assert woken is not None and woken.next_run_at == T0 and woken.error is None
+    assert not is_deferred(woken)
+    # Every deferred job of one user and kind.
+    assert queue.wake_deferred(UID, kinds=("ocr",)) == 2
+    assert queue.wake_deferred(UID, acct="01J000000000000000000000ZZ", kinds=("ocr",)) == 0
+    assert queue.wake_deferred(UID, kinds=()) == 0
+    leased = set()
+    for _ in range(3):
+        job = queue.lease("w")
+        assert job is not None
+        leased.add(job.id)
+    assert leased == set(ids)
+    assert queue.lease("w") is None  # the other user's job and the render still wait
+    for job_id, uid in ((other, OTHER), (render, UID)):
+        row = queue.get(job_id, uid)
+        assert row is not None and is_deferred(row)
+    # A job that is not deferred is returned unchanged.
+    plain = put(queue, "ocr:plain", kind="ocr", run_at=week)
+    row = queue.wake(plain, UID)
+    assert row is not None and row.next_run_at == week
+
+
+def test_reruns_of_a_refused_key_do_not_count_against_the_cap(queue: JobQueue) -> None:
+    put(queue, "ocr:k", kind="ocr")
+    job = queue.lease("w")
+    assert job is not None
+    for _ in range(RERUN_CAP + 2):  # more refusals of the key than the cap
+        dead = queue.fail(job.id, "w", "key_billing", final=True)
+        nxt = queue.rerun(dead)
+        assert nxt is not None
+        job = queue.lease("w")
+        assert job is not None and job.id == nxt.id
+    # Any other death counts: the cap applies to those re-runs as before.
+    for _ in range(RERUN_CAP):
+        dead = queue.fail(job.id, "w", "refused", final=True)
+        nxt = queue.rerun(dead)
+        assert nxt is not None
+        job = queue.lease("w")
+        assert job is not None
+    dead = queue.fail(job.id, "w", "refused", final=True)
+    assert queue.rerun(dead) is None

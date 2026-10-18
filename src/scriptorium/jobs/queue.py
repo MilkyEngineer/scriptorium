@@ -6,11 +6,19 @@ The server enqueues, the worker leases and runs. Life of a job::
       ▲  │              │ └──fail (attempts < max)──▶ failed ──(next_run_at)──lease──▶ leased
       │  └─cancel─▶ cancelled                              └─cancel─▶ cancelled
       │                 ├──fail (attempts ≥ max)──▶ dead
-      └─requeue_expired─┘ (lease expired; ``dead`` instead once attempts ≥ max)
+      ├─requeue_expired─┤ (lease expired; ``dead`` instead once attempts ≥ max)
+      └──────defer──────┘ (nothing could be done now; the lease's attempt is given back)
 
 - ``attempts`` counts leases, so a job that crashes its worker (lease expires, never failed)
   still runs out of attempts instead of looping forever.
 - ``fail`` backs off ``min(2**attempts * 30 s, 1 h)`` (:func:`backoff_seconds`).
+- ``defer`` puts a leased job back to ``queued`` until a given time because the work cannot
+  be done *now* for a reason outside the job (no OCR key, a cap reached, a key the API
+  refused): it is not an attempt, so ``attempts`` is restored, and the job keeps its key and
+  its place, so a deferral never mints an ``:after:`` re-run. The reason is kept in ``error``
+  as ``deferred:<reason>`` (:func:`is_deferred`) until the job is leased and reported again;
+  ``wake`` / ``wake_deferred`` make deferred jobs runnable at once when the situation
+  changes (a key stored, a grant).
 - **Dedupe convention.** ``dedupe_key`` is unique across the table for all time. ``enqueue``
   with a key that exists returns that row, whatever its state, and creates nothing. Keys
   therefore name *the work*, including the version it applies to (``ocr:<acct>:<page>:<hash>``,
@@ -38,6 +46,7 @@ caller chose, and the ``error`` text is for ``*_status`` tools only.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -56,6 +65,7 @@ from scriptorium.errors import InvalidArgumentError, RefusedError
 from scriptorium.jobs.kinds import (
     AFTER,
     GONE_RESULT,
+    KEY_ERROR_PREFIX,
     RENDER_KINDS,
     RERUN_CAP,
     is_gone,
@@ -75,6 +85,9 @@ PRIORITY_NORMAL: Final = 0
 PRIORITY_LOW: Final = -1
 """Renders of tombstoned, trashed or excluded documents: leased after every normal job."""
 _PRIORITIES: Final = range(-10, 11)
+DEFERRED_PREFIX: Final = "deferred:"
+"""``error`` of a job :meth:`JobQueue.defer` put back: ``deferred:<reason>``."""
+_DEFER_REASON: Final = re.compile(r"[a-z_]{1,40}")
 
 
 class LeaseLostError(RefusedError):
@@ -103,6 +116,19 @@ class JobRow:
     created_at: datetime
     updated_at: datetime
     priority: int = PRIORITY_NORMAL
+
+
+def is_deferred(job: JobRow) -> bool:
+    """A job :meth:`JobQueue.defer` put back, still waiting (``queued``, ``deferred:…``)."""
+    return job.state == "queued" and (job.error or "").startswith(DEFERRED_PREFIX)
+
+
+def deferral_reason(job: JobRow) -> str | None:
+    """The reason code of a deferred job, None for any other job."""
+    if not is_deferred(job):
+        return None
+    assert job.error is not None
+    return job.error[len(DEFERRED_PREFIX) :]
 
 
 def backoff_seconds(attempts: int) -> int:
@@ -464,6 +490,74 @@ class JobQueue:
             ).fetchone()
         return _row(updated)
 
+    def defer(self, job_id: int, owner: str, *, until: datetime, reason: str) -> JobRow:
+        """Put ``owner``'s leased job back to ``queued`` until ``until``, for ``reason``.
+
+        For work that cannot be done now for a reason outside the job (a missing key, a cap,
+        a refused key): the lease's attempt is given back (``attempts - 1``), the job keeps
+        its key, payload and place in line, and ``error`` records ``deferred:<reason>``
+        (``reason`` is a ``[a-z_]`` code). It becomes leasable again at ``until`` (at once if
+        that is not in the future), or earlier through :meth:`wake`.
+        :class:`LeaseLostError` if the lease is not held.
+        """
+        if not isinstance(reason, str) or not _DEFER_REASON.fullmatch(reason):
+            raise InvalidArgumentError("a deferral reason is a short [a-z_] code.")
+        if until.tzinfo is None:
+            raise InvalidArgumentError("until must carry a time zone.")
+        now = self._now()
+        with self._write() as conn:
+            row = conn.execute(
+                "UPDATE jobs SET state = 'queued', error = ?, next_run_at = ?, "
+                "attempts = max(attempts - 1, 0), lease_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = ? WHERE id = ? AND lease_owner = ? AND state = 'leased' "
+                "RETURNING *",
+                (
+                    DEFERRED_PREFIX + reason,
+                    to_db_time(max(until, now)),
+                    to_db_time(now),
+                    job_id,
+                    owner,
+                ),
+            ).fetchone()
+        if row is None:
+            raise LeaseLostError("The job lease is no longer held.")
+        return _row(row)
+
+    def wake(self, job_id: int, uid: str) -> JobRow | None:
+        """Make ``uid``'s deferred job runnable now; the job as it is afterwards (None if it
+        is not ``uid``'s). A job that is not deferred is returned unchanged."""
+        now = to_db_time(self._now())
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE jobs SET next_run_at = ?, error = NULL, updated_at = ? "
+                "WHERE id = ? AND uid = ? AND state = 'queued' AND substr(error, 1, ?) = ?",
+                (now, now, job_id, uid, len(DEFERRED_PREFIX), DEFERRED_PREFIX),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id = ? AND uid = ?", (job_id, uid)
+            ).fetchone()
+        return None if row is None else _row(row)
+
+    def wake_deferred(self, uid: str, *, acct: str | None = None, kinds: Sequence[str]) -> int:
+        """Make every deferred job of ``uid`` (and ``acct``) of ``kinds`` runnable now, e.g.
+        once the user stores a key; returns how many."""
+        if not uid:
+            raise InvalidArgumentError("uid is required.")
+        if not kinds:
+            return 0
+        now = to_db_time(self._now())
+        sql = (
+            "UPDATE jobs SET next_run_at = ?, error = NULL, updated_at = ? "  # noqa: S608
+            f"WHERE uid = ? AND kind IN ({', '.join('?' * len(kinds))}) "
+            "AND state = 'queued' AND substr(error, 1, ?) = ?"
+        )
+        params: list[Any] = [now, now, uid, *kinds, len(DEFERRED_PREFIX), DEFERRED_PREFIX]
+        if acct is not None:
+            sql += " AND acct = ?"
+            params.append(acct)
+        with self._write() as conn:
+            return int(conn.execute(sql, params).rowcount)
+
     def requeue_expired(self) -> int:
         """Return expired leases to the queue (or ``dead`` when out of attempts).
 
@@ -492,7 +586,8 @@ class JobQueue:
         unless ``payload`` is given. If the re-run already exists (another caller got there
         first) it is returned whatever its state. Otherwise it is created only while the key's
         family has fewer than :data:`~scriptorium.jobs.kinds.RERUN_CAP` ``:after:`` jobs,
-        counted for all time. A job that ended :data:`~scriptorium.jobs.kinds.GONE_RESULT` is
+        counted for all time (re-runs of jobs that died of a refused OCR key excepted, see
+        :func:`_family_reruns`). A job that ended :data:`~scriptorium.jobs.kinds.GONE_RESULT` is
         not re-run with the payload it had (None): that page version was not there to render.
         Another version that holds the same page (a copy, a later generation) may re-run it
         by passing its own ``payload``.
@@ -661,6 +756,35 @@ class JobQueue:
 
     # ---- reporting --------------------------------------------------------------------------
 
+    def deferred_counts(
+        self, uid: str, *, acct: str | None = None, kinds: Sequence[str]
+    ) -> dict[str, dict[str, int]]:
+        """``{kind: {reason: n}}`` over the deferred jobs of ``uid`` (and ``acct``); they are
+        also counted as ``queued`` by :meth:`counts`."""
+        if not kinds:
+            return {}
+        sql = (
+            "SELECT kind, substr(error, ?) AS reason, count(*) AS n FROM jobs "  # noqa: S608
+            f"WHERE uid = ? AND kind IN ({', '.join('?' * len(kinds))}) "
+            "AND state = 'queued' AND substr(error, 1, ?) = ?"
+        )
+        params: list[Any] = [
+            len(DEFERRED_PREFIX) + 1,
+            uid,
+            *kinds,
+            len(DEFERRED_PREFIX),
+            DEFERRED_PREFIX,
+        ]
+        if acct is not None:
+            sql += " AND acct = ?"
+            params.append(acct)
+        with self._lock:
+            rows = self._conn.execute(sql + " GROUP BY kind, reason", params).fetchall()
+        out: dict[str, dict[str, int]] = {}
+        for row in rows:
+            out.setdefault(str(row["kind"]), {})[str(row["reason"])] = int(row["n"])
+        return out
+
     def counts(self, uid: str, *, acct: str | None = None) -> dict[str, dict[str, int]]:
         """``{kind: {state: n}}`` over the jobs of ``uid`` (and ``acct``), for status tools."""
         sql = "SELECT kind, state, count(*) AS n FROM jobs WHERE uid = ?"
@@ -712,10 +836,17 @@ def _family_gone(conn: sqlite3.Connection, base: str) -> bool:
 
 
 def _family_reruns(conn: sqlite3.Connection, base: str) -> int:
-    """How many ``:after:`` jobs the family ``base`` has (a range scan of the unique index)."""
+    """How many ``:after:`` jobs of the family ``base`` count against ``RERUN_CAP`` (a range
+    scan of the unique index). A re-run of a job that died because the OCR API refused the
+    key (``error`` ``key_…``, :data:`~scriptorium.jobs.kinds.KEY_ERROR_PREFIX`) is not
+    counted: the refusal was about the key, not the page."""
     low = base + AFTER
     high = low[:-1] + chr(ord(AFTER[-1]) + 1)  # the first string after every "<low>…"
     row = conn.execute(
-        "SELECT count(*) FROM jobs WHERE dedupe_key >= ? AND dedupe_key < ?", (low, high)
+        "SELECT count(*) FROM jobs AS r WHERE r.dedupe_key >= ? AND r.dedupe_key < ? "
+        "AND NOT EXISTS (SELECT 1 FROM jobs AS p "
+        "WHERE p.id = CAST(substr(r.dedupe_key, ?) AS INTEGER) AND p.uid = r.uid "
+        "AND p.state = 'dead' AND substr(p.error, 1, ?) = ?)",
+        (low, high, len(low) + 1, len(KEY_ERROR_PREFIX), KEY_ERROR_PREFIX),
     ).fetchone()
     return int(row[0])
