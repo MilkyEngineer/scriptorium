@@ -204,8 +204,12 @@ async def use_document(
 
 
 def state_of(doc: DocumentRow) -> str:
+    """``deleted`` (tombstoned), ``excluded`` (outside the sync scope), ``trashed`` or
+    ``live``, in that order of precedence."""
     if doc.deleted_at is not None:
         return "deleted"
+    if doc.excluded_at is not None:
+        return "excluded"
     return "trashed" if doc.parent == TRASH else "live"
 
 
@@ -235,6 +239,8 @@ def document_item(doc: DocumentRow) -> dict[str, object]:
     if doc.deleted_at is not None:
         item["deleted_at"] = iso_utc(doc.deleted_at)
         item["deletion_cause"] = doc.deletion_cause or "unknown"
+    if doc.excluded_at is not None:
+        item["excluded_at"] = iso_utc(doc.excluded_at)
     return item
 
 
@@ -269,6 +275,13 @@ def load_pages(account: Account, doc: DocumentRow, generation: int | None) -> Pa
     """The document's current version, or the one recorded at ``generation``."""
     if generation is None:
         version = pg.current_version(account.paths, account.index, doc.uuid)
+        if version is None and doc.excluded_at is not None:
+            raise ToolError(
+                ErrorCode.NOT_FOUND,
+                "This document is outside the sync scope, so it was never archived.",
+                "set_sync_scope decides which documents are mirrored; once it is in scope, "
+                "the next poll archives it.",
+            )
         if version is None:
             raise ToolError(
                 ErrorCode.NOT_FOUND,

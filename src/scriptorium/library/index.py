@@ -92,6 +92,10 @@ class DocumentRow:
     hash_root: str | None = None
     generation: int | None = None
     tags: tuple[str, ...] = ()  # the document's own tags, sorted (not its pages'); M2
+    excluded_at: datetime | None = None
+    """Set while the document is outside the account's sync scope (M2, §11.1): only its
+    ``.metadata`` and ``.content`` were fetched, and ``hash_root``/``generation`` still name
+    the last version archived before it left the scope (None if it never was)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +307,7 @@ def _document(row: sqlite3.Row, tags: Mapping[str, tuple[str, ...]] | None = Non
         hash_root=row["hash_root"],
         generation=row["generation"],
         tags=() if tags is None else tags.get(row["uuid"], ()),
+        excluded_at=opt_from_db_time(row["excluded_at"]),
     )
 
 
@@ -406,6 +411,8 @@ class Index:
 
         ``deleted_at``/``deletion_cause`` are taken from ``doc`` only when the row is new; on an
         update they are left alone (:meth:`mark_deleted` and :meth:`unmark_deleted` own them).
+        ``excluded_at`` is always taken from ``doc``: the sync loop decides the scope on every
+        upsert (None for a document it archived, the time it left the scope otherwise).
         A rename or move refreshes the name and path indexed with the transcripts of the
         document and of everything below it.
         """
@@ -424,13 +431,14 @@ class Index:
             ).fetchone()
             self._conn.execute(
                 "INSERT INTO documents(uuid, type, parent, name, last_modified, last_opened, "
-                "deleted_at, deletion_cause, source_kind, page_count, hash_root, generation) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "deleted_at, deletion_cause, source_kind, page_count, hash_root, generation, "
+                "excluded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(uuid) DO UPDATE SET type = excluded.type, "
                 "parent = excluded.parent, name = excluded.name, "
                 "last_modified = excluded.last_modified, last_opened = excluded.last_opened, "
                 "source_kind = excluded.source_kind, page_count = excluded.page_count, "
-                "hash_root = excluded.hash_root, generation = excluded.generation",
+                "hash_root = excluded.hash_root, generation = excluded.generation, "
+                "excluded_at = excluded.excluded_at",
                 (
                     doc.uuid,
                     doc.type,
@@ -444,6 +452,7 @@ class Index:
                     doc.page_count,
                     doc.hash_root,
                     doc.generation,
+                    _opt_time(doc.excluded_at),
                 ),
             )
             if before is None or before["name"] != doc.name or before["parent"] != parent:
@@ -477,15 +486,18 @@ class Index:
                 return None
             return _document(row, self._document_tags([uuid]))
 
-    def document_uuids(self, *, deleted: bool) -> frozenset[str]:
+    def document_uuids(self, *, deleted: bool, excluded: bool | None = None) -> frozenset[str]:
         """Every document and folder UUID: tombstoned ones with ``deleted=True``, the rest
         (the trash included) with ``deleted=False``. These are the tombstone planner's
-        ``library`` and ``tombstoned`` sets (§7 step 4)."""
+        ``library`` and ``tombstoned`` sets (§7 step 4). ``excluded`` narrows to the rows
+        outside the sync scope (True) or inside it (False)."""
         sql = (
             "SELECT uuid FROM documents WHERE deleted_at IS NOT NULL"
             if deleted
             else "SELECT uuid FROM documents WHERE deleted_at IS NULL"
         )
+        if excluded is not None:
+            sql += " AND excluded_at IS NOT NULL" if excluded else " AND excluded_at IS NULL"
         with self._lock:
             return frozenset(row["uuid"] for row in self._conn.execute(sql))
 
