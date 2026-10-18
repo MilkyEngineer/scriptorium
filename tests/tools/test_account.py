@@ -125,6 +125,11 @@ async def test_a_second_connect_is_refused_before_registering(fresh: Served) -> 
     second = await fresh.ok("connect_remarkable", {"code": CODE, "replace": True})
     assert second["account"] != first["account"]
     assert second["replaced"] == [first["account"]]
+    assert "remove that device" in second["message"]
+    # The replaced account's token is deleted with it; only the new one stays sealed.
+    box = SecretBox(fresh.settings, _uid(fresh))
+    assert box.open(device_token_name(first["account"])) is None
+    assert box.open(device_token_name(second["account"])) == SECOND_TOKEN.encode()
     status = await fresh.ok("account_status")
     assert status["account"] == second["account"]
     assert [(a["account"], a["active"]) for a in status["other_accounts"]] == [
@@ -140,7 +145,10 @@ async def test_relinking_the_same_remarkable_account_reuses_its_archive(fresh: S
     again = await fresh.ok("connect_remarkable", {"code": CODE, "replace": True})
     assert again["account"] == first["account"]
     assert again["replaced"] == []
+    assert "remove that device" in again["message"]  # the first device is orphaned
     assert len(fresh.services.store.all_accounts()) == 1
+    box = SecretBox(fresh.settings, _uid(fresh))
+    assert box.open(device_token_name(first["account"])) == fresh.registrar.token.encode()
 
 
 async def test_a_rejected_code_links_nothing(fresh: Served) -> None:
@@ -158,7 +166,13 @@ async def test_an_account_linked_to_another_user_is_refused(fresh: Served) -> No
     refused = await fresh.error("connect_remarkable", {"code": CODE}, token=other)
     assert refused["code"] == "refused"
     assert "another user" in refused["message"]
+    assert "my.remarkable.com" in refused["hint"]  # the attempt left a device to remove
+    assert len(fresh.registrar.calls) == 2
     assert (await fresh.ok("account_status", token=other))["status"] == "not_linked"
+    # Nothing was sealed for the refused user: the only secrets file is the first user's.
+    uid = _uid(fresh)
+    secrets = list(fresh.settings.data_dir.rglob("secrets.enc"))
+    assert [path.parent.name for path in secrets] == [uid]
 
 
 async def test_another_users_account_is_not_found(fresh: Served) -> None:

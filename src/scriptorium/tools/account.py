@@ -26,6 +26,7 @@ from scriptorium.accounts import (
 from scriptorium.auth.oidc import User
 from scriptorium.cloud.sync import STATE_ANOMALY, STATE_ANOMALY_REASON, STATE_LAST_FULL_LISTING_OK
 from scriptorium.db.connect import from_db_time
+from scriptorium.errors import RefusedError
 from scriptorium.jobs.kinds import RENDER_KINDS
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
 from scriptorium.tools._conventions import (
@@ -88,24 +89,39 @@ def _connect(svc: Services, user: User, code: str, replace: bool) -> dict[str, o
             "either way with a fresh code.",
         )
     token = svc.register_device(code, DEVICE_DESCRIPTION)
+    # Nothing is sealed until the link is recorded: a refusal here (the account belongs to
+    # another user) leaves no token on this server, only the new device at reMarkable.
     identity = svc.identify(token)
-    row = svc.store.link_account(uid, identity, DEVICE_DESCRIPTION, replace=replace)
-    SecretBox(svc.settings, uid).seal(device_token_name(row.acct), token.encode("ascii"))
+    try:
+        row = svc.store.link_account(uid, identity, DEVICE_DESCRIPTION, replace=replace)
+    except RefusedError as exc:
+        raise ToolError(
+            ErrorCode.REFUSED,
+            exc.message,
+            f"{exc.hint + '. ' if exc.hint else ''}This attempt registered a device named "
+            f'"{DEVICE_DESCRIPTION}" at reMarkable; remove it at {DEVICES_URL}.',
+        ) from None
+    box = SecretBox(svc.settings, uid)
+    box.seal(device_token_name(row.acct), token.encode("ascii"))
+    replaced = [r.acct for r in before if r.acct != row.acct]
+    for acct in replaced:
+        # Deactivated by link_account: its token must not outlive it (as on disconnect).
+        box.forget(device_token_name(acct))
     index = svc.index(uid, row.acct)
     with index.transaction():
         index.set_state(STATE_NEEDS_RELINK, None)
         index.set_state(STATE_TOKEN_REJECTIONS, None)
-    replaced = [r.acct for r in before if r.acct != row.acct]
-    return {
-        "linked": True,
-        "account": row.acct,
-        "replaced": replaced,
-        "message": (
-            "Linked. The first sync starts within a few minutes; account_status shows its "
-            f'progress. This registered a new device named "{DEVICE_DESCRIPTION}" at '
-            f"reMarkable; you can see and remove devices at {DEVICES_URL}."
-        ),
-    }
+    message = (
+        "Linked. The first sync starts within a few minutes; account_status shows its "
+        f'progress. This registered a new device named "{DEVICE_DESCRIPTION}" at '
+        f"reMarkable; you can see and remove devices at {DEVICES_URL}."
+    )
+    if before:
+        message += (
+            " The device this server used before is no longer used and its token was deleted "
+            f"here; remove that device at {DEVICES_URL} too (Scriptorium cannot revoke it)."
+        )
+    return {"linked": True, "account": row.acct, "replaced": replaced, "message": message}
 
 
 async def connect_remarkable(ctx: ToolContext, args: ConnectArgs) -> CallToolResult:
