@@ -119,6 +119,37 @@ def test_deny_scope_downloads_nothing_of_an_excluded_document(tmp_path: Path) ->
     assert h.state("scope_applied") == scope_fingerprint(make_scope("deny", ["private"]))
 
 
+def test_a_folder_that_lists_pages_is_decided_like_a_document(tmp_path: Path) -> None:
+    """The type is the cloud's word: a "folder" carrying a page does not pass the scope."""
+    odd = folder(F)
+    odd[f"{F}/{F}.rm"] = UNUSED_PAGE
+    cloud, h = setup(tmp_path, {F: odd, G: folder(G), B: doc(B, "work")})
+    set_scope(h, "allow", "work")
+
+    report = h.poll()
+
+    assert report.outcome == "ok"
+    assert sorted(report.committed) == sorted([B, G])  # a plain folder is still mirrored
+    assert excluded_at(h, F) is not None
+    assert sha256(UNUSED_PAGE) not in h.blob_names()
+    assert sha256(UNUSED_PAGE) not in cloud.targets()
+
+    # Unchanged and excluded, it is not let in later as a folder either: a changed folder
+    # has every listed item decided again, this one from its excluded (document) row.
+    cloud.put_documents({G: folder(G, "elsewhere")})
+    again = h.poll()
+    assert again.outcome == "ok" and again.committed == (G,)
+    assert excluded_at(h, F) is not None
+    assert sha256(UNUSED_PAGE) not in h.blob_names()
+
+    # Tagged, it is in scope like any document.
+    tagged = folder(F, "work")
+    tagged[f"{F}/{F}.rm"] = UNUSED_PAGE
+    cloud.put_documents({F: tagged})
+    assert F in h.poll().committed
+    assert sha256(UNUSED_PAGE) in h.blob_names()
+
+
 def test_an_unchanged_excluded_document_is_not_fetched_again(tmp_path: Path) -> None:
     cloud, h = setup(tmp_path, {A: doc(A, "private"), B: doc(B)})
     set_scope(h, "deny", "private")

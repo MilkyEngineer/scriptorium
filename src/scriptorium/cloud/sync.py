@@ -18,10 +18,12 @@
    again. A document already archived that leaves the scope keeps its files and
    ``hash_root``; only ``excluded_at`` is set. One that enters the scope is committed like a
    new document (or just unmarked if its archived version is current). Folders are always
-   mirrored. Every listed document is decided again when the scope changed since the last
-   fully processed poll (``sync_state.scope_applied``, set to a pending marker as soon as a
-   change is seen so an interrupted transition is redone whole), when a folder changed, or
-   when a document was un-tombstoned; otherwise only the fetched ones are. Nothing here
+   mirrored, but only folder-shaped ones: an item typed ``CollectionType`` whose index lists
+   more than its ``.metadata`` and ``.content`` is decided like a document. Every listed
+   document is decided again when the scope changed since the last fully processed poll
+   (``sync_state.scope_applied``, set to a pending marker as soon as a change is seen so an
+   interrupted transition is redone whole), when a folder changed, or when a document was
+   un-tombstoned; otherwise only the fetched ones are. Nothing here
    tombstones or removes anything. An unreadable stored scope ends the poll with
    ``backoff`` and reason ``scope_malformed`` before any cloud request: guessing ``all``
    would download what the user excluded. The decision fails closed: a document whose own
@@ -740,6 +742,7 @@ class SyncOnce:
                 folder = fact.folder
             else:
                 folder = row is not None and row.type == "CollectionType"
+            folder = folder and _scope_exempt_folder(uuid, row, indexes.get(uuid))
             me: Known | None = None
             inside: bool | None = True
             if scope.mode != "all" and not folder:
@@ -1469,6 +1472,17 @@ def _display_name(value: object, *, fallback: str) -> str:
         if unicodedata.category(ch) not in ("Cc", "Cs") and ch not in _BIDI_CONTROLS
     )[:MAX_NAME_CHARS]
     return clean if clean.strip() else fallback
+
+
+def _scope_exempt_folder(uuid: str, row: DocumentRow | None, index: DocumentIndex | None) -> bool:
+    """Whether an item whose ``.metadata`` (or archived row) says folder is mirrored whatever
+    the scope. The type is the cloud's word, so only a folder-shaped one is: a fetched index
+    that lists nothing but ``<uuid>.metadata`` and ``<uuid>.content``, or, unfetched, a row
+    that was never excluded. Anything else is decided like a document, so a "folder" cannot
+    carry pages past the scope."""
+    if index is not None:
+        return set(index.files) <= {f"{uuid}.metadata", f"{uuid}.content"}
+    return row is None or row.excluded_at is None
 
 
 def _parent(value: object) -> str | None:
