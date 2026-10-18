@@ -111,10 +111,11 @@ class Index:
     def history(self, uuid: str) -> list[HistoryRow]
     def replace_pages(self, uuid: str, pages: Sequence[PageRow]) -> None
     def page(self, uuid: str, idx: int) -> PageRow | None
-    def set_rendered(self, page_id: str, png_path: str, at: datetime) -> None
+    def page_by_id(self, document: str, page_id: str) -> PageRow | None
+    def set_rendered(self, document: str, page_id: str, content_hash: str, png_path: str, at: datetime) -> bool  # marks every document sharing (page_id, content_hash); returns whether the caller's row was one
     # transcripts (M1: lazy write-back only)
-    def put_transcript(self, page_id: str, content_hash: str, text: str, model: str, mode: str) -> None
-    def transcript(self, page_id: str, content_hash: str) -> TranscriptRow | None
+    def put_transcript(self, document: str, page_id: str, content_hash: str, text: str, model: str, mode: str) -> None
+    def transcript(self, document: str, page_id: str, content_hash: str) -> TranscriptRow | None
     # sync state
     def get_state(self, key: str) -> str | None
     def set_state(self, key: str, value: str | None) -> None
