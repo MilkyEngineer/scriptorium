@@ -43,7 +43,14 @@ from scriptorium.db.migrations import SchemaMismatch, Step, check_version
 from scriptorium.db.migrations import migrate as run_migrations
 from scriptorium.db.schema_global import SCRIPTORIUM_STEPS
 from scriptorium.errors import InvalidArgumentError, RefusedError
-from scriptorium.jobs.kinds import RENDER_KINDS, RENDER_VERDICTS
+from scriptorium.jobs.kinds import (
+    AFTER,
+    RENDER_KINDS,
+    RERUN_CAP,
+    is_render_verdict,
+    rerun_family,
+    rerun_key,
+)
 
 STATES: Final = frozenset({"queued", "leased", "done", "failed", "dead", "cancelled"})
 BACKOFF_BASE_S: Final = 30
@@ -358,26 +365,102 @@ class JobQueue:
             ).rowcount
         return dead + requeued
 
-    def revive_dead_renders(self) -> int:
-        """Re-queue ``dead`` render jobs whose run failed, not their page; returns how many.
+    def rerun(self, job: JobRow) -> JobRow | None:
+        """A fresh job re-running ``job`` under ``rerun_key``, or None when its family is capped.
 
-        Only ``render`` and ``page_image`` jobs, and only those whose ``error`` is not a
-        renderer verdict (:data:`~scriptorium.jobs.kinds.RENDER_VERDICTS`): a job that died
-        of a broken pool, expired leases or a local I/O error gets a fresh set of attempts
-        (``queued``, ``attempts`` 0, no error, runnable now). Every other job is untouched.
-        The worker calls this once at start.
+        The new job copies ``job``'s user, account, kind, payload and ``max_attempts``. If the
+        re-run already exists (another caller got there first) it is returned whatever its
+        state. Otherwise it is created only while the key's family has fewer than
+        :data:`~scriptorium.jobs.kinds.RERUN_CAP` ``:after:`` jobs, counted for all time.
         """
-        now = to_db_time(self._now())
-        kinds = ", ".join("?" * len(RENDER_KINDS))
-        verdicts = ", ".join("?" * len(RENDER_VERDICTS))
-        sql = (
-            "UPDATE jobs SET state = 'queued', attempts = 0, error = NULL, next_run_at = ?, "  # noqa: S608
-            "lease_owner = NULL, lease_expires_at = NULL, updated_at = ? "
-            f"WHERE state = 'dead' AND kind IN ({kinds}) "
-            f"AND (error IS NULL OR error NOT IN ({verdicts}))"
-        )
+        key = rerun_key(job.dedupe_key, job.id)
+        body = _json(job.payload, MAX_PAYLOAD_BYTES, "payload")
         with self._write() as conn:
-            return conn.execute(sql, (now, now, *RENDER_KINDS, *sorted(RENDER_VERDICTS))).rowcount
+            row = conn.execute("SELECT * FROM jobs WHERE dedupe_key = ?", (key,)).fetchone()
+            if row is None:
+                row = self._insert_rerun(
+                    conn,
+                    job.uid,
+                    job.acct,
+                    job.kind,
+                    job.dedupe_key,
+                    job.id,
+                    body,
+                    job.max_attempts,
+                )
+        if row is None:
+            return None
+        if row["uid"] != job.uid:
+            raise RefusedError("That job key is in use.")
+        return _row(row)
+
+    def revive_dead_renders(self) -> int:
+        """Re-run ``dead`` render jobs whose run failed, not their page; returns how many.
+
+        Only ``render`` and ``page_image`` jobs whose ``error`` is not a renderer verdict
+        (:data:`~scriptorium.jobs.kinds.RENDER_VERDICTS`) and that have never been re-run:
+        each gets a fresh ``:after:`` job (the dead row stays as it is, and its re-run marks
+        it revived), within the family's :data:`~scriptorium.jobs.kinds.RERUN_CAP`. Every
+        other job is untouched. The worker calls this once at start.
+        """
+        revived = 0
+        with self._write() as conn:
+            for row, reruns in self._dead_render_leaves(conn, "", []):
+                if is_render_verdict(row["error"]) or reruns >= RERUN_CAP:
+                    continue
+                created = self._insert_rerun(
+                    conn,
+                    row["uid"],
+                    row["acct"],
+                    row["kind"],
+                    row["dedupe_key"],
+                    row["id"],
+                    row["payload"],
+                    row["max_attempts"],
+                )
+                revived += created is not None
+        return revived
+
+    def _insert_rerun(
+        self,
+        conn: sqlite3.Connection,
+        uid: str,
+        acct: str | None,
+        kind: str,
+        key: str,
+        job_id: int,
+        payload: str,
+        max_attempts: int,
+    ) -> sqlite3.Row | None:
+        """Insert the re-run of job ``job_id`` unless its family is at its cap (in a write)."""
+        if _family_reruns(conn, rerun_family(key)) >= RERUN_CAP:
+            return None
+        now = to_db_time(self._now())
+        row: sqlite3.Row | None = conn.execute(
+            "INSERT INTO jobs(uid, acct, kind, dedupe_key, payload, state, attempts, "
+            "max_attempts, next_run_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?) RETURNING *",
+            (uid, acct, kind, rerun_key(key, job_id), payload, max_attempts, now, now, now),
+        ).fetchone()
+        return row
+
+    @staticmethod
+    def _dead_render_leaves(
+        conn: sqlite3.Connection, where: str, params: Sequence[Any]
+    ) -> list[tuple[sqlite3.Row, int]]:
+        """Dead render jobs never re-run, each with its family's re-run count."""
+        kinds = ", ".join("?" * len(RENDER_KINDS))
+        rows = conn.execute(
+            f"SELECT * FROM jobs WHERE state = 'dead' AND kind IN ({kinds}){where} ORDER BY id",  # noqa: S608
+            (*RENDER_KINDS, *params),
+        ).fetchall()
+        out: list[tuple[sqlite3.Row, int]] = []
+        for row in rows:
+            child = rerun_key(row["dedupe_key"], row["id"])
+            if conn.execute("SELECT 1 FROM jobs WHERE dedupe_key = ?", (child,)).fetchone():
+                continue
+            out.append((row, _family_reruns(conn, rerun_family(row["dedupe_key"]))))
+        return out
 
     # ---- reporting --------------------------------------------------------------------------
 
@@ -396,18 +479,30 @@ class JobQueue:
         return out
 
     def dead_renders(self, uid: str, *, acct: str | None = None) -> tuple[int, int]:
-        """``(verdicts, rerunnable)``: dead render jobs of ``uid`` split by their error."""
-        kinds = ", ".join("?" * len(RENDER_KINDS))
-        verdicts = ", ".join("?" * len(RENDER_VERDICTS))
-        sql = (
-            f"SELECT coalesce(error IN ({verdicts}), 0) AS verdict, count(*) AS n "  # noqa: S608
-            f"FROM jobs WHERE uid = ? AND state = 'dead' AND kind IN ({kinds})"
-        )
-        params: list[Any] = [*sorted(RENDER_VERDICTS), uid, *RENDER_KINDS]
+        """``(final, rerunnable)``: dead render jobs of ``uid`` that were never re-run.
+
+        ``final`` holds the renderer's verdicts and the jobs whose family is at its re-run
+        cap; ``rerunnable`` the rest, which ``page_png`` or the next worker start re-runs.
+        """
+        where, params = " AND uid = ?", [uid]
         if acct is not None:
-            sql += " AND acct = ?"
+            where += " AND acct = ?"
             params.append(acct)
+        final = rerunnable = 0
         with self._lock:
-            rows = self._conn.execute(sql + " GROUP BY verdict", params).fetchall()
-        split = {int(row["verdict"]): int(row["n"]) for row in rows}
-        return split.get(1, 0), split.get(0, 0)
+            for row, reruns in self._dead_render_leaves(self._conn, where, params):
+                if is_render_verdict(row["error"]) or reruns >= RERUN_CAP:
+                    final += 1
+                else:
+                    rerunnable += 1
+        return final, rerunnable
+
+
+def _family_reruns(conn: sqlite3.Connection, base: str) -> int:
+    """How many ``:after:`` jobs the family ``base`` has (a range scan of the unique index)."""
+    low = base + AFTER
+    high = low[:-1] + chr(ord(AFTER[-1]) + 1)  # the first string after every "<low>…"
+    row = conn.execute(
+        "SELECT count(*) FROM jobs WHERE dedupe_key >= ? AND dedupe_key < ?", (low, high)
+    ).fetchone()
+    return int(row[0])

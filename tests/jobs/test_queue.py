@@ -12,6 +12,7 @@ from scriptorium.db.connect import open_sqlite
 from scriptorium.db.migrations import SchemaMismatch
 from scriptorium.db.schema_jobs import JOBS_STEPS
 from scriptorium.errors import InvalidArgumentError, RefusedError
+from scriptorium.jobs.kinds import RERUN_CAP
 from scriptorium.jobs.queue import (
     LEASE_EXPIRED_ERROR,
     JobQueue,
@@ -422,7 +423,7 @@ def test_counts_group_by_kind_and_state(queue: JobQueue) -> None:
     assert queue.counts("0000000000000000") == {}
 
 
-# ---- dead render jobs -----------------------------------------------------------------------
+# ---- dead render jobs and re-runs -------------------------------------------------------------
 
 
 def kill(q: JobQueue, key: str, error: str, **kw: Any) -> int:
@@ -434,62 +435,104 @@ def kill(q: JobQueue, key: str, error: str, **kw: Any) -> int:
     return job_id
 
 
+def keys(q: JobQueue) -> dict[str, str]:
+    """Every job's key → state."""
+    with q._lock:
+        rows = q._conn.execute("SELECT dedupe_key, state FROM jobs").fetchall()
+    return {row["dedupe_key"]: row["state"] for row in rows}
+
+
 def test_revive_dead_renders_only_touches_run_failures(queue: JobQueue, clock: Clock) -> None:
     runs = {
-        kill(queue, "render-internal", "internal"),
-        kill(queue, "render-lease", LEASE_EXPIRED_ERROR),
-        kill(queue, "image-io", "local_io", kind="page_image"),
+        kill(queue, "render:a", "internal"),
+        kill(queue, "render:b", LEASE_EXPIRED_ERROR),
+        kill(queue, "page_image:c", "local_io", kind="page_image"),
     }
     verdicts = {
-        kill(queue, "render-invalid", "invalid_argument"),
-        kill(queue, "image-refused", "refused", kind="page_image"),
+        kill(queue, "render:d", "invalid_argument"),
+        kill(queue, "page_image:e", "refused", kind="page_image"),
     }
-    other = kill(queue, "ocr-internal", "internal", kind="ocr")
-    done = put(queue, "render-done")
+    other = kill(queue, "ocr:f", "internal", kind="ocr")
+    done = put(queue, "render:g")
     job = queue.lease("w", kinds=["render"])
     assert job is not None and job.id == done
     queue.complete(done, "w", {})
     assert queue.dead_renders(UID) == (2, 3)
+    before = keys(queue)
     clock.advance(10)
 
     assert queue.revive_dead_renders() == 3
 
+    after = keys(queue)
+    assert {k: v for k, v in after.items() if k in before} == before  # dead rows stay dead
     for job_id in runs:
-        row = queue.get(job_id, UID)
-        assert row is not None
-        assert (row.state, row.attempts, row.error) == ("queued", 0, None)
-        assert row.next_run_at == clock.now and row.lease_owner is None
-    for job_id in verdicts:
-        row = queue.get(job_id, UID)
-        assert (
-            row is not None
-            and row.state == "dead"
-            and row.error
-            in {
-                "invalid_argument",
-                "refused",
-            }
+        dead = queue.get(job_id, UID)
+        assert dead is not None and dead.state == "dead"
+        fresh = queue.enqueue(
+            uid=UID,
+            acct=dead.acct,
+            kind=dead.kind,
+            dedupe_key=f"{dead.dedupe_key}:after:{job_id}",
+            payload={},
         )
+        assert (fresh.state, fresh.attempts, fresh.error) == ("queued", 0, None)
+        assert fresh.payload == dead.payload and fresh.max_attempts == dead.max_attempts
+        assert fresh.next_run_at == clock.now
+    assert set(after) - set(before) == {
+        f"{queue.get(j, UID).dedupe_key}:after:{j}"  # type: ignore[union-attr]
+        for j in runs
+    }
+    assert all(queue.get(j, UID).state == "dead" for j in verdicts)  # type: ignore[union-attr]
     ocr = queue.get(other, UID)
     assert ocr is not None and (ocr.state, ocr.error) == ("dead", "internal")
-    finished = queue.get(done, UID)
-    assert finished is not None and finished.state == "done"
-    assert queue.dead_renders(UID) == (2, 0)
-    assert queue.revive_dead_renders() == 0  # nothing left to revive
+    assert queue.dead_renders(UID) == (2, 0)  # the revived ones are superseded
+    assert queue.revive_dead_renders() == 0  # once per job
 
 
-def test_a_revived_job_runs_again_with_fresh_attempts(queue: JobQueue, clock: Clock) -> None:
-    job_id = put(queue, "render-x", max_attempts=2)
-    for _ in range(2):
-        job = queue.lease("w")
-        assert job is not None
-        queue.fail(job_id, "w", "internal")
-        clock.advance(3600)
-    row = queue.get(job_id, UID)
-    assert row is not None and row.state == "dead"
-    assert queue.revive_dead_renders() == 1
-    again = queue.lease("w")
-    assert again is not None and again.id == job_id and again.attempts == 1
+def test_revival_is_capped_per_page_version_across_restarts(queue: JobQueue) -> None:
+    job_id = kill(queue, "render:p", "internal")
+    for n in range(RERUN_CAP):
+        assert queue.revive_dead_renders() == 1, n  # one worker start
+        job = queue.lease("w", kinds=["render"])
+        assert job is not None and job.dedupe_key == f"render:p:after:{job_id}"
+        assert queue.fail(job.id, "w", "internal").state == "dead"
+        job_id = job.id
+    assert queue.revive_dead_renders() == 0  # the family has had its three re-runs
+    assert queue.dead_renders(UID) == (1, 0)  # and its last job counts as final
+    assert len(keys(queue)) == 1 + RERUN_CAP
+
+
+def test_rerun_is_idempotent_and_capped_per_family(queue: JobQueue) -> None:
+    put(queue, "page_image:q")
+    put(queue, "pageXimage:q:after:1")  # "_" must not act as a wildcard in the family count
+    first = queue.get(1, UID)
+    assert first is not None
+    child = queue.rerun(first)
+    assert child is not None and child.dedupe_key == "page_image:q:after:1"
+    assert child.state == "queued" and child.payload == first.payload
+    again = queue.rerun(first)
+    assert again is not None and again.id == child.id  # the existing re-run, not a new one
+    chain = child
+    for _ in range(RERUN_CAP - 1):
+        nxt = queue.rerun(chain)
+        assert nxt is not None
+        chain = nxt
+    assert queue.rerun(chain) is None
+    assert sum(k.startswith("page_image:q:after:") for k in keys(queue)) == RERUN_CAP
+    other = put(queue, "render:z", uid=OTHER)
+    row = queue.get(other, OTHER)
+    assert row is not None
+    assert queue.rerun(row) is not None  # another family has its own budget
+
+
+def test_a_rerun_key_held_by_another_user_is_refused(queue: JobQueue) -> None:
+    put(queue, "render:k:after:1", uid=OTHER)
+    put(queue, "render:k")
+    first = queue.get(2, UID)
+    assert first is not None
+    put(queue, "render:k:after:2", uid=OTHER)
+    with pytest.raises(RefusedError):
+        queue.rerun(first)
 
 
 def test_dead_renders_is_scoped_to_the_user_and_account(queue: JobQueue) -> None:

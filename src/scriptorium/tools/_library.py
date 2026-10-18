@@ -27,7 +27,7 @@ from typing import Final
 
 from scriptorium.auth.oidc import User
 from scriptorium.errors import InvalidArgumentError
-from scriptorium.jobs.kinds import RenderSpec, is_render_verdict, rerun_key
+from scriptorium.jobs.kinds import RenderSpec, is_render_verdict
 from scriptorium.library import pages as pg
 from scriptorium.library import render
 from scriptorium.library.index import DocumentRow, Index
@@ -82,8 +82,6 @@ IDENTIFIER_MAX: Final = 1024
 CONNECT_URL: Final = "https://my.remarkable.com/device/browser/connect"
 MAX_PNG_BYTES: Final = 64 * 1024 * 1024
 MAX_CANDIDATES: Final = 20
-RERUNS: Final = 3
-"""How many times one call re-queues a render that finished without leaving its PNG."""
 _NAME_MAX: Final = 256
 
 
@@ -309,7 +307,10 @@ async def page_png(
     call waits up to ``PENDING_WAIT_SECONDS`` for it, then answers ``pending`` with the job.
     A dead job whose error is the renderer's verdict on the page is ``refused``; a job that
     finished without leaving the PNG, or died for any other reason (a broken pool, expired
-    leases), is re-run under a new key, at most ``RERUNS`` times per call.
+    leases), is re-run under a new key, at most ``RERUN_CAP`` times per page version for
+    all time (``JobQueue.rerun``), which also bounds the jobs one call can queue; a call
+    that finds re-runs already made follows them. A dead job whose re-runs are spent is
+    ``refused`` like a verdict.
     """
     svc = services(ctx)
     rel = pg.png_relpath(source.page_id, source.content_hash, max_side=max_side)
@@ -318,55 +319,58 @@ async def page_png(
     if data is not None:
         return data
     spec = RenderSpec(source.document, source.page_id, source.content_hash, generation, max_side)
-    key = spec.key(account.acct)
-
-    def enqueue(dedupe_key: str) -> tuple[int, str, str | None]:
-        job = svc.queue.enqueue(
-            uid=account.uid,
-            acct=account.acct,
-            kind=spec.kind,
-            dedupe_key=dedupe_key,
-            payload=spec.payload(),
-        )
-        return job.id, job.state, job.error
-
-    job_id, state, error = await asyncio.to_thread(enqueue, key)
-    ctx.audit["job"] = job_id
+    job = await asyncio.to_thread(
+        svc.queue.enqueue,
+        uid=account.uid,
+        acct=account.acct,
+        kind=spec.kind,
+        dedupe_key=spec.key(account.acct),
+        payload=spec.payload(),
+    )
+    ctx.audit["job"] = job.id
     deadline = time.monotonic() + svc.settings.pending_wait_seconds
-    reruns = 0
     while True:
         data = await asyncio.to_thread(_read_png, path)
         if data is not None:
             return data
-        if state == "dead" and is_render_verdict(error):
+        if job.state == "dead" and is_render_verdict(job.error):
             raise ToolError(
                 ErrorCode.REFUSED,
                 "This page could not be rendered.",
                 "The page may be damaged or in a format the renderer does not support.",
-                extra={"job": job_id},
+                extra={"job": job.id},
             )
-        if state in ("done", "cancelled", "dead"):
-            if reruns >= RERUNS:
+        if job.state in ("done", "cancelled", "dead"):
+            # Terminates: each step is an existing re-run (the family is finite) or a new
+            # one (at most RERUN_CAP for all time), and None once the family is spent.
+            nxt = await asyncio.to_thread(svc.queue.rerun, job)
+            if nxt is None and job.state == "dead":
+                raise ToolError(
+                    ErrorCode.REFUSED,
+                    "This page could not be rendered.",
+                    "Rendering keeps failing for this version of the page; it is not retried "
+                    "again. Editing the page on the tablet makes a new version.",
+                    extra={"job": job.id},
+                )
+            if nxt is None:
                 raise ToolError(
                     ErrorCode.NOT_FOUND,
                     "The page image could not be produced.",
                     "Try again after the next sync.",
                 )
-            reruns += 1
-            job_id, state, error = await asyncio.to_thread(enqueue, rerun_key(key, job_id))
-            ctx.audit["job"] = job_id
+            job = nxt
+            ctx.audit["job"] = job.id
             continue
         if time.monotonic() >= deadline:
             raise ToolError(
                 ErrorCode.PENDING,
                 "The page is still being rendered.",
                 "Call the tool again in a few seconds.",
-                extra={"job": job_id, "state": state},
+                extra={"job": job.id, "state": job.state},
             )
         await svc.sleep(svc.poll_interval_s)
-        job = await asyncio.to_thread(svc.queue.get, job_id, account.uid)
-        if job is not None:
-            state, error = job.state, job.error
+        fresh = await asyncio.to_thread(svc.queue.get, job.id, account.uid)
+        job = job if fresh is None else fresh
 
 
 def fit_png(data: bytes, max_side: int) -> bytes:

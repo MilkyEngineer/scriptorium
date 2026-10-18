@@ -14,6 +14,12 @@ A ``dead`` render job means one of two things. Its ``error`` is a **verdict** on
 would fail the same way; or the *run* failed (``internal``, ``lease expired``, ``local_io``,
 a broken render pool, …), and the page itself may be fine. Only the first stays dead:
 ``page_png`` re-runs the second under a new key and the worker revives such jobs at start.
+
+Re-runs are bounded for the life of the data, not per call: a key's **family** is its base
+key and every ``:after:`` key built from it, and ``JobQueue.rerun`` creates at most
+:data:`RERUN_CAP` ``:after:`` jobs per family, so a page version whose content keeps killing
+render children costs a bounded number of crashes across tool calls and worker restarts.
+A family at its cap is treated like a verdict.
 """
 
 from __future__ import annotations
@@ -30,11 +36,13 @@ __all__ = [
     "RENDER",
     "RENDER_KINDS",
     "RENDER_VERDICTS",
+    "RERUN_CAP",
     "RenderSpec",
     "is_render_verdict",
     "page_image_key",
     "parse_render_payload",
     "render_key",
+    "rerun_family",
     "rerun_key",
 ]
 
@@ -43,6 +51,9 @@ PAGE_IMAGE: Final = "page_image"
 RENDER_KINDS: Final = (RENDER, PAGE_IMAGE)
 RENDER_VERDICTS: Final = frozenset({"invalid_argument", "refused"})
 """Job errors that say the page is at fault, not the run: such a dead job stays dead."""
+RERUN_CAP: Final = 3
+"""Most ``:after:`` re-runs one key family ever gets (page_png and worker-start revival)."""
+AFTER: Final = ":after:"
 MAX_SIDE_PX: Final = 8192
 """Largest ``page_image`` longest side a job may ask for."""
 _MAX_GENERATION: Final = 2**62
@@ -102,10 +113,14 @@ def is_render_verdict(error: str | None) -> bool:
     return error in RENDER_VERDICTS
 
 
+def rerun_family(key: str) -> str:
+    """The base key ``key`` was built from (``key`` itself unless it is a re-run's)."""
+    return key.split(AFTER, 1)[0]
+
+
 def rerun_key(key: str, previous_job: int) -> str:
     """The key of a deliberate re-run after job ``previous_job`` (whatever its key)."""
-    base = key.split(":after:", 1)[0]
-    return f"{base}:after:{previous_job}"
+    return f"{rerun_family(key)}{AFTER}{previous_job}"
 
 
 def parse_render_payload(kind: str, payload: Mapping[str, Any]) -> RenderSpec:

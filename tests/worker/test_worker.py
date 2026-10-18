@@ -464,10 +464,15 @@ async def test_start_revives_render_jobs_that_died_of_their_run(linked: Linked) 
     stop = asyncio.Event()
     stop.set()
     await linked.worker.run(stop)  # start-up housekeeping only
-    revived = linked.queue.get(run_dead, linked.uid)
+    dead = linked.queue.get(run_dead, linked.uid)
+    assert dead is not None and dead.state == "dead"
+    revived = linked.queue.rerun(dead)  # the re-run the start created, returned as it is
     assert revived is not None and (revived.state, revived.attempts) == ("queued", 0)
     kept = linked.queue.get(verdict_dead, linked.uid)
     assert kept is not None and (kept.state, kept.error) == ("dead", "invalid_argument")
+    assert linked.queue.dead_renders(linked.uid) == (1, 0)
+    await linked.worker.drain_jobs()
+    assert linked.queue.get(revived.id, linked.uid).state == "done"  # type: ignore[union-attr]
 
 
 async def test_the_worker_waits_for_the_server_to_migrate(tmp_path: Path) -> None:

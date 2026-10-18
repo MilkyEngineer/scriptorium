@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
-from scriptorium.jobs.kinds import render_key
+from scriptorium.jobs.kinds import RERUN_CAP, render_key
 from scriptorium.library import pages as pg
 from scriptorium.tools._conventions import ErrorCode, ToolError
 from scriptorium.tools._library import fit_png
@@ -311,6 +311,55 @@ async def test_dead_renders_are_refused_only_for_a_verdict_and_otherwise_rerun(
             image_of(await library.call("read_page", {"document": NOTEBOOK, "page": 4}))
             again = await library.error("read_page", {"document": NOTEBOOK, "page": 2})
             assert again["code"] == "refused"  # a verdict is not re-run
+    finally:
+        linked.close()
+
+
+async def test_a_page_whose_reruns_are_spent_is_refused_without_a_new_job(
+    tmp_path: Any, issuer: FakeIssuer, make_validator: Any
+) -> None:
+    """A page version that keeps killing its renders is re-run three times for all time."""
+    from tests.worker.helpers import link
+
+    linked = link(tmp_path, settings={"pending_wait_seconds": 0.0})
+    try:
+        await linked.loop().poll_once(linked.context())
+        sources = _sources(linked, NOTEBOOK)
+        key = render_key(linked.acct, PAGES[4], sources[4].content_hash)
+        db = global_db_path(linked.settings.data_dir)
+
+        def die(dedupe_key: str) -> None:
+            conn = sqlite3.connect(db)
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE jobs SET state = 'dead', error = 'internal' WHERE dedupe_key = ?",
+                        (dedupe_key,),
+                    )
+            finally:
+                conn.close()
+
+        def count() -> int:
+            conn = sqlite3.connect(db)
+            try:
+                return int(conn.execute("SELECT count(*) FROM jobs").fetchone()[0])
+            finally:
+                conn.close()
+
+        die(key)
+        async with serve(linked.settings, issuer, make_validator, clock=linked.clock) as library:
+            for _ in range(RERUN_CAP):  # each call re-runs once; the re-run dies again
+                pending = await library.error("read_page", {"document": NOTEBOOK, "page": 5})
+                assert pending["code"] == "pending"
+                job = library.services.queue.get(pending["job"], linked.uid)
+                assert job is not None and job.dedupe_key.startswith(f"{key}:after:")
+                die(job.dedupe_key)
+            jobs = count()
+            refused = await library.error("read_page", {"document": NOTEBOOK, "page": 5})
+            assert refused["code"] == "refused"
+            assert "keeps failing" in refused["hint"]
+            assert count() == jobs  # nothing new was queued
+            assert library.services.queue.revive_dead_renders() == 0  # nor at a worker start
     finally:
         linked.close()
 
