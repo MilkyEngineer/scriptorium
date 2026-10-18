@@ -112,7 +112,7 @@ def test_breaker_percentage_boundaries(library_size: int, candidates: int, trips
     gone = ids(candidates)
     result = run(lib, lib - gone, lib - gone, max_per_poll=10_000)
     if trips:
-        assert result == TombstonePlan(NONE, NONE, ANOMALY_MASS_DELETE)
+        assert result == TombstonePlan(NONE, NONE, ANOMALY_MASS_DELETE, gone)
     else:
         assert result == TombstonePlan(gone, NONE, None)
 
@@ -135,6 +135,7 @@ def test_m1_acceptance_6_sixty_percent_missing_trips_breaker() -> None:
     result = run(lib, lib - gone, lib - gone)
     assert result.anomaly == ANOMALY_MASS_DELETE
     assert result.to_tombstone == NONE
+    assert result.tripped == gone  # what an administrator's approval must cover
 
 
 def test_an_approved_mass_delete_passes_the_breaker_once() -> None:
@@ -167,7 +168,7 @@ def test_breaker_still_reports_untombstones() -> None:
     back = ids(2, start=500)
     gone = ids(60)
     result = run(lib, lib - gone, (lib - gone) | back, tombstoned=back)
-    assert result == TombstonePlan(NONE, back, ANOMALY_MASS_DELETE)
+    assert result == TombstonePlan(NONE, back, ANOMALY_MASS_DELETE, gone)
 
 
 # ---- anomalies --------------------------------------------------------------------------------
@@ -212,7 +213,7 @@ def test_an_empty_previous_listing_is_not_evidence_of_entries() -> None:
     instead would keep an account that really was emptied in empty_root for ever."""
     small, large = ids(3), ids(6)
     assert run(small, NONE, NONE) == TombstonePlan(small, NONE, None)
-    assert run(large, NONE, NONE) == TombstonePlan(NONE, NONE, ANOMALY_MASS_DELETE)
+    assert run(large, NONE, NONE) == TombstonePlan(NONE, NONE, ANOMALY_MASS_DELETE, large)
 
 
 def test_regression_takes_precedence_over_empty_root() -> None:

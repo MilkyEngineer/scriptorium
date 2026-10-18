@@ -23,7 +23,8 @@ The rules, in the order they are applied:
    anomaly alone cannot recover the account, because the next poll recomputes the same
    candidates; ``allow_mass_delete=True`` skips the breaker for **one** plan, and the caller
    passes it only for the poll right after an administrator approved the deletion
-   (``admin_clear_anomaly(..., allow_mass_delete=true)``, §7 step 4).
+   (``admin_clear_anomaly(..., allow_mass_delete=true)``, §7 step 4). A tripped plan names
+   its candidates in ``tripped``, so the caller can check them against what was approved.
 
 An anomaly means the account goes read-only until an administrator clears it (§7 step 7);
 the plan returned with one never tombstones anything, and the caller applies no plan while
@@ -71,6 +72,8 @@ class TombstonePlan:
     to_tombstone: frozenset[str]
     to_untombstone: frozenset[str]
     anomaly: str | None
+    tripped: frozenset[str] = frozenset()
+    """With ``anomaly="mass_delete"``: the candidates that tripped the breaker."""
 
 
 _EMPTY: Final = frozenset[str]()
@@ -108,7 +111,7 @@ def plan(
 
     candidates = frozenset(library - tombstoned - previous.uuids - current.uuids)
     if not allow_mass_delete and _breaker_trips(len(candidates), len(library), max_per_poll):
-        return TombstonePlan(_EMPTY, to_untombstone, ANOMALY_MASS_DELETE)
+        return TombstonePlan(_EMPTY, to_untombstone, ANOMALY_MASS_DELETE, candidates)
     return TombstonePlan(candidates, to_untombstone, None)
 
 

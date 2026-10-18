@@ -21,11 +21,15 @@
    again). Un-tombstoning runs before step 3's commits so a returning document's old
    files are back in place before a newer version replaces them. No plan is applied
    once an anomaly is set. An administrator's one-shot approval
-   (``sync_state.allow_mass_delete``, written by ``admin_clear_anomaly``) is passed to
-   the planner as ``allow_mass_delete=True`` and consumed only by a poll whose plan was
-   acted on: the planner ran with it and either raised an anomaly or the poll reached the
-   tombstone step. A poll stopped during the listing or the commits (a budget, ``backoff``,
-   ``token_rejected``) or by an early anomaly leaves the approval for the next one.
+   (``sync_state.allow_mass_delete``, written by ``admin_clear_anomaly``) is bound to the
+   plan it was given for: JSON ``{"candidates": [...], "root_generation": n,
+   "expires_at": iso}``. The planner always runs without it first. Only if that plan trips
+   the breaker, the approval has not expired, the root generation has not gone below
+   ``root_generation``, and every tripped candidate is in ``candidates``, does the planner
+   run again with ``allow_mass_delete=True``. Any poll whose planner ran spends the
+   approval, used or not (an expired, uncovered, unparseable or unneeded one is logged as
+   ``sync.allow_mass_delete_rejected`` with a reason code and a count); a poll stopped
+   before planning (during the listing, or by an early anomaly) leaves it in place.
 7. **Failure classes.** 401/403 from the token endpoint is ``token_rejected``; 429, a
    network failure or three transient failures in a row end the poll with ``backoff``;
    an unparseable root (a ``CloudProtocolError`` or a hash mismatch) is
@@ -91,6 +95,7 @@ from scriptorium.cloud.ports import (
     IndexPort,
     Listing,
     Planner,
+    TombstonePlan,
     default_planner,
 )
 from scriptorium.cloud.protocol import (
@@ -115,7 +120,7 @@ STATE_PREVIOUS_LISTING: Final = "previous_listing"
 STATE_ANOMALY: Final = "anomaly"
 STATE_ANOMALY_REASON: Final = "anomaly_reason"
 STATE_ALLOW_MASS_DELETE: Final = "allow_mass_delete"
-"""One-shot administrator approval: ``"true"`` lets the next listing skip the breaker."""
+"""One-shot administrator approval of one breaker trip (:func:`mass_delete_approval`)."""
 STATE_TOMBSTONING_SUSPENDED_SINCE: Final = "tombstoning_suspended_since"
 """When the run of polls whose listing failed on some documents began (cleared when complete)."""
 STATE_TOMBSTONING_SUSPENDED_FAILED: Final = "tombstoning_suspended_failed"
@@ -199,8 +204,8 @@ class SyncReport:
     anomaly: str | None = None
     anomaly_reason: str | None = None
     mass_delete_approved: bool = False
-    """This poll consumed an administrator's ``allow_mass_delete`` approval (its plan,
-    made with the approval, was acted on)."""
+    """This poll's plan used an administrator's ``allow_mass_delete`` approval to pass the
+    breaker (the approval covered every tripped candidate and had not expired)."""
 
 
 class _BudgetSpentError(Exception):
@@ -315,7 +320,7 @@ class SyncOnce:
 
         previous = _load_listing(self._index.get_state(STATE_PREVIOUS_LISTING))
         last_generation = _parse_int(self._index.get_state(STATE_LAST_GENERATION))
-        approved = self._index.get_state(STATE_ALLOW_MASS_DELETE) == "true"
+        approval = self._index.get_state(STATE_ALLOW_MASS_DELETE)
         library, tombstoned = self._library_sets()
         uuids = frozenset(entry.uuid for entry in root.entries)
         run.documents_listed = len(uuids)
@@ -356,16 +361,37 @@ class SyncOnce:
         # The listing ran to its end and is incomplete only because documents failed.
         listing_failures = len(run.failed) if stop is None and not complete else 0
 
-        consumed = False
+        spent = False
         if stop is None:
-            plan = self._planner(
-                previous,
-                current,
-                library,
-                tombstoned,
-                self._settings.tombstone_max_per_poll,
-                allow_mass_delete=approved,
-            )
+            max_per_poll = self._settings.tombstone_max_per_poll
+            plan = self._planner(previous, current, library, tombstoned, max_per_poll)
+            # The planner ran: an approval is used now or never (step 4 in the docstring).
+            spent = approval is not None
+            if approval is not None:
+                rejected = _approval_rejected(
+                    approval, plan, generation=root.generation, now=self._clock()
+                )
+                if rejected is None:
+                    plan = self._planner(
+                        previous, current, library, tombstoned, max_per_poll, allow_mass_delete=True
+                    )
+                    run.mass_delete_approved = plan.anomaly is None
+                    log_event(
+                        logger,
+                        "sync.mass_delete_approved",
+                        level=logging.WARNING,
+                        acct=self._settings.acct,
+                        count=len(plan.to_tombstone),
+                    )
+                else:
+                    log_event(
+                        logger,
+                        "sync.allow_mass_delete_rejected",
+                        level=logging.WARNING,
+                        acct=self._settings.acct,
+                        reason=rejected,
+                        count=len(plan.tripped),
+                    )
             if plan.anomaly is not None:
                 # The breaker (or a check the planner shares with step 1) tripped: nothing
                 # is moved, downloaded or committed until an operator has looked.
@@ -382,18 +408,6 @@ class SyncOnce:
                 stop = self._commit_all(root, entries, indexes, blocked, run)
                 if plan.to_tombstone and stop is None:
                     self._tombstone(plan.to_tombstone, run)
-            # The plan made with the approval was acted on: it is spent. A poll stopped
-            # before its tombstone step keeps it for the next poll's plan.
-            consumed = approved and (plan.anomaly is not None or stop is None)
-            if consumed:
-                run.mass_delete_approved = True
-                log_event(
-                    logger,
-                    "sync.mass_delete_approved",
-                    level=logging.WARNING,
-                    acct=self._settings.acct,
-                    count=len(plan.to_tombstone),
-                )
 
         fully_done = complete and stop is None and not run.failed and run.anomaly is None
         self._save_listing(
@@ -401,7 +415,7 @@ class SyncOnce:
             root_hash=root.hash if fully_done else None,
             listing_failures=listing_failures,
             started_at=run.started_at,
-            consume_approval=consumed,
+            consume_approval=spent,
         )
 
         if run.anomaly is not None:
@@ -825,6 +839,65 @@ def _dump_listing(listing: Listing) -> str:
         },
         separators=(",", ":"),
     )
+
+
+def mass_delete_approval(
+    candidates: frozenset[str], *, root_generation: int, expires_at: datetime
+) -> str:
+    """The ``sync_state.allow_mass_delete`` value approving one breaker trip.
+
+    ``candidates`` are the tripped plan's candidates (``TombstonePlan.tripped``) and
+    ``root_generation`` the generation of the root that tripped it; the approval passes the
+    breaker only for a plan whose tripped candidates are all in ``candidates``, until
+    ``expires_at``.
+    """
+    return json.dumps(
+        {
+            "candidates": sorted(candidates),
+            "root_generation": root_generation,
+            "expires_at": to_db_time(expires_at),
+        },
+        separators=(",", ":"),
+    )
+
+
+def _approval_rejected(
+    raw: str, plan: TombstonePlan, *, generation: int, now: datetime
+) -> str | None:
+    """None if the stored approval lets ``plan``'s tripped candidates pass the breaker; else
+    a reason code for the log (never the candidates themselves)."""
+    if plan.anomaly != ANOMALY_MASS_DELETE:
+        return "unused"
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return "malformed"
+    if not isinstance(data, dict):
+        return "malformed"
+    candidates = data.get("candidates")
+    root_generation = data.get("root_generation")
+    expires_at = data.get("expires_at")
+    if not isinstance(candidates, list) or not all(
+        isinstance(u, str) and is_uuid(u) for u in candidates
+    ):
+        return "malformed"
+    if type(root_generation) is not int or root_generation < 0:
+        return "malformed"
+    if not isinstance(expires_at, str):
+        return "malformed"
+    try:
+        expiry = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return "malformed"
+    if expiry.tzinfo is None:
+        return "malformed"
+    if now >= expiry:
+        return "expired"
+    if generation < root_generation:
+        return "generation"
+    if not plan.tripped or not plan.tripped <= frozenset(candidates):
+        return "not_covered"
+    return None
 
 
 def _load_listing(raw: str | None) -> Listing | None:

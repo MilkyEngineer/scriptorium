@@ -35,5 +35,5 @@ def plan(
     candidates = frozenset(library - tombstoned - previous.uuids - current.uuids)
     over_share = len(candidates) > 5 and len(candidates) * 10 > len(library)
     if not allow_mass_delete and (over_share or len(candidates) > max_per_poll):
-        return TombstonePlan(_NONE, to_untombstone, "mass_delete")
+        return TombstonePlan(_NONE, to_untombstone, "mass_delete", candidates)
     return TombstonePlan(candidates, to_untombstone, None)

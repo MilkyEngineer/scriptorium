@@ -8,7 +8,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -263,13 +263,32 @@ def test_empty_root_after_a_full_one_is_an_anomaly(tmp_path: Path) -> None:
     assert_safe(h)
 
 
-def clear_anomaly(h: Harness, *, allow_mass_delete: bool = False) -> None:
+def clear_anomaly(h: Harness, *, approve: str | None = None) -> None:
     """What ``admin_clear_anomaly`` leaves in ``sync_state`` (Architecture §7 step 4)."""
     with h.index.transaction():
         h.index.set_state("anomaly", None)
         h.index.set_state("anomaly_reason", None)
-        if allow_mass_delete:
-            h.index.set_state("allow_mass_delete", "true")
+        if approve is not None:
+            h.index.set_state("allow_mass_delete", approve)
+
+
+def approval(
+    h: Harness, candidates: tuple[str, ...], *, valid_for: timedelta = timedelta(hours=1)
+) -> str:
+    """An approval of ``candidates`` at the last root generation seen, valid ``valid_for``."""
+    return sync_module.mass_delete_approval(
+        frozenset(candidates),
+        root_generation=int(h.state("last_generation")),
+        expires_at=h.clock.now + valid_for,
+    )
+
+
+def rejections(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return [
+        getattr(r, "scriptorium_fields", {})
+        for r in caplog.records
+        if r.getMessage() == "sync.allow_mass_delete_rejected"
+    ]
 
 
 def test_a_cleared_generation_regression_resumes_and_still_needs_two_listings(
@@ -321,7 +340,8 @@ def test_a_cleared_empty_root_is_believed_only_after_two_complete_listings(
     assert_safe(h)
 
 
-def test_an_approved_mass_delete_is_applied_once(tmp_path: Path) -> None:
+def _tripped(tmp_path: Path) -> tuple[FakeCloud, Harness]:
+    """Nine documents, six removed, the breaker tripped (anomaly still set)."""
     cloud = FakeCloud()
     nine(cloud)
     h = harness(httpx.MockTransport(cloud.handler), tmp_path)
@@ -329,13 +349,18 @@ def test_an_approved_mass_delete_is_applied_once(tmp_path: Path) -> None:
     cloud.remove_document(*PAGES[:6])
     h.poll()
     assert h.poll().anomaly == "mass_delete"
+    return cloud, h
+
+
+def test_an_approved_mass_delete_is_applied_once(tmp_path: Path) -> None:
+    _cloud, h = _tripped(tmp_path)
 
     clear_anomaly(h)  # cleared without approval: the same candidates trip it again
     again = h.poll()
     assert again.anomaly == "mass_delete" and not again.mass_delete_approved
     assert h.tombstoned_uuids() == set()
 
-    clear_anomaly(h, allow_mass_delete=True)
+    clear_anomaly(h, approve=approval(h, PAGES[:6]))
     approved = h.poll()
 
     assert approved.outcome == "ok" and approved.mass_delete_approved
@@ -345,7 +370,67 @@ def test_an_approved_mass_delete_is_applied_once(tmp_path: Path) -> None:
     assert_safe(h)
 
 
-def test_an_approval_is_consumed_by_the_next_listing_even_unused(tmp_path: Path) -> None:
+def test_an_approval_that_does_not_cover_the_candidates_is_rejected_and_spent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="scriptorium")
+    _cloud, h = _tripped(tmp_path)
+    # Approved for five; the listing now trips on six (a superset): not what was approved.
+    clear_anomaly(h, approve=approval(h, PAGES[:5]))
+
+    report = h.poll()
+
+    assert report.anomaly == "mass_delete" and not report.mass_delete_approved
+    assert report.tombstoned == () and h.tombstoned_uuids() == set()
+    assert h.state("allow_mass_delete") is None
+    assert rejections(caplog) == [{"reason": "not_covered", "count": 6}]
+
+
+def test_an_expired_approval_is_rejected_and_spent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="scriptorium")
+    _cloud, h = _tripped(tmp_path)
+    clear_anomaly(h, approve=approval(h, PAGES[:6], valid_for=timedelta(minutes=5)))
+    h.clock.now += timedelta(minutes=10)
+
+    report = h.poll()
+
+    assert report.anomaly == "mass_delete" and not report.mass_delete_approved
+    assert h.tombstoned_uuids() == set()
+    assert h.state("allow_mass_delete") is None
+    assert [r["reason"] for r in rejections(caplog)] == ["expired"]
+
+
+@pytest.mark.parametrize("raw", ["true", "{}", '{"candidates": "x"}', "[", "null"])
+def test_an_unreadable_approval_is_rejected_and_spent(tmp_path: Path, raw: str) -> None:
+    _cloud, h = _tripped(tmp_path)
+    clear_anomaly(h, approve=raw)
+
+    report = h.poll()
+
+    assert report.anomaly == "mass_delete" and not report.mass_delete_approved
+    assert h.tombstoned_uuids() == set()
+    assert h.state("allow_mass_delete") is None
+
+
+def test_an_approval_from_a_later_generation_is_rejected(tmp_path: Path) -> None:
+    _cloud, h = _tripped(tmp_path)
+    raw = sync_module.mass_delete_approval(
+        frozenset(PAGES[:6]),
+        root_generation=int(h.state("last_generation")) + 1,
+        expires_at=h.clock.now + timedelta(hours=1),
+    )
+    clear_anomaly(h, approve=raw)
+
+    assert h.poll().anomaly == "mass_delete"
+    assert h.state("allow_mass_delete") is None
+
+
+def test_an_unneeded_approval_is_spent_by_the_next_plan(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="scriptorium")
     cloud = FakeCloud()
     both(cloud)
     h = harness(httpx.MockTransport(cloud.handler), tmp_path)
@@ -353,8 +438,10 @@ def test_an_approval_is_consumed_by_the_next_listing_even_unused(tmp_path: Path)
 
     report = h.poll()
 
-    assert report.mass_delete_approved and report.tombstoned == ()
+    assert report.outcome == "ok"
+    assert not report.mass_delete_approved and report.tombstoned == ()
     assert h.state("allow_mass_delete") is None
+    assert [r["reason"] for r in rejections(caplog)] == ["unused"]
 
 
 def test_an_approval_survives_a_poll_that_never_reached_the_root(tmp_path: Path) -> None:
@@ -368,41 +455,47 @@ def test_an_approval_survives_a_poll_that_never_reached_the_root(tmp_path: Path)
     assert h.state("allow_mass_delete") == "true"
 
 
-def _approved_mass_delete(tmp_path: Path) -> tuple[FakeCloud, Harness]:
+def _approved_mass_delete(tmp_path: Path) -> tuple[FakeCloud, Harness, str]:
     """Nine documents, six removed, the breaker tripped and cleared with an approval."""
-    cloud = FakeCloud()
-    nine(cloud)
-    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
-    h.poll()
-    cloud.remove_document(*PAGES[:6])
-    h.poll()
-    assert h.poll().anomaly == "mass_delete"
-    clear_anomaly(h, allow_mass_delete=True)
-    return cloud, h
+    cloud, h = _tripped(tmp_path)
+    raw = approval(h, PAGES[:6])
+    clear_anomaly(h, approve=raw)
+    return cloud, h, raw
 
 
 def test_an_approval_survives_an_early_anomaly(tmp_path: Path) -> None:
-    cloud, h = _approved_mass_delete(tmp_path)
+    cloud, h, raw = _approved_mass_delete(tmp_path)
     cloud.publish(generation=1)  # a regressed root: refused before anything is listed
 
     assert h.poll().anomaly == "generation_regressed"
-    assert h.state("allow_mass_delete") == "true"
+    assert h.state("allow_mass_delete") == raw
 
 
 def test_an_approval_survives_a_poll_stopped_during_the_listing(tmp_path: Path) -> None:
-    cloud, h = _approved_mass_delete(tmp_path)
+    cloud, h, raw = _approved_mass_delete(tmp_path)
     cloud.set_file(NOTEBOOK, PAGE_101, b"synthetic page bytes: an edit")
     cloud.status[cloud.doc_hash(NOTEBOOK)] = 429  # rate limited: the listing stops
 
     stopped = h.poll()
 
     assert stopped.outcome == "backoff" and not stopped.mass_delete_approved
-    assert h.state("allow_mass_delete") == "true"
+    assert h.state("allow_mass_delete") == raw
     assert h.tombstoned_uuids() == set()
 
+    # The next poll plans, so it spends the approval; but the stopped listing was incomplete,
+    # so it has no candidates (two complete listings again) and the approval goes unused.
+    del cloud.status[cloud.doc_hash(NOTEBOOK)]
+    after = h.poll()
+    assert after.outcome == "ok" and not after.mass_delete_approved and after.tombstoned == ()
+    assert h.state("allow_mass_delete") is None
+    assert h.poll().anomaly == "mass_delete"  # the breaker trips again: approve afresh
+    assert_safe(h)
 
-def test_an_approval_survives_a_poll_stopped_by_its_budget(tmp_path: Path) -> None:
-    cloud, h = _approved_mass_delete(tmp_path)
+
+def test_an_approval_is_spent_by_a_poll_stopped_in_its_commits(tmp_path: Path) -> None:
+    """The planner ran with it, so it is spent even though the budget stopped the poll before
+    its tombstone step: the next poll trips the breaker again and needs a new approval."""
+    cloud, h, _raw = _approved_mass_delete(tmp_path)
     for name, data in (
         (PAGE_101, b"synthetic page bytes: first edit"),
         (f"{NOTEBOOK}/{PAGES[1]}.rm", b"synthetic page bytes: second edit"),
@@ -411,17 +504,14 @@ def test_an_approval_survives_a_poll_stopped_by_its_budget(tmp_path: Path) -> No
     settings = h.settings
     h.settings = SyncSettings(sync_workers=1, sync_max_poll_bytes=1)
 
-    budget = h.poll()  # planned with the approval, stopped in the commits
+    budget = h.poll()
 
     assert (budget.outcome, budget.reason) == ("partial", "byte_budget")
-    assert not budget.mass_delete_approved
-    assert h.state("allow_mass_delete") == "true"
-    assert h.tombstoned_uuids() == set()
+    assert budget.tombstoned == () and h.tombstoned_uuids() == set()
+    assert h.state("allow_mass_delete") is None
 
     h.settings = settings
-    approved = h.poll()  # the next poll that reaches its tombstone step spends it
-    assert approved.mass_delete_approved and len(approved.tombstoned) == 6
-    assert h.state("allow_mass_delete") is None
+    assert h.poll().anomaly == "mass_delete"
     assert_safe(h)
 
 
