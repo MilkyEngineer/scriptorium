@@ -1,7 +1,7 @@
 """Fake of ``library/tombstones.py:plan`` (plan §3.3), following A's rules as merged.
 
-Pure, like the real planner. Sync tests inject it (``SyncOnce(..., planner=plan)``) while
-A's module is not on this branch; after the merge they can run against both. The rules, in
+Pure, like the real planner. The cloud tests now use the real one (``SyncOnce``'s
+default); this stays importable for other workstreams. The rules, in
 A's order: generation regressed; empty root (``had_entries`` from the previous listing,
 or from the library when there is none); un-tombstone what is present; candidates only
 between two complete listings, excluding what is already tombstoned; the breaker at

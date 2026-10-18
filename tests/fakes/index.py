@@ -8,6 +8,9 @@ newest first with tombstoned rows included. ``transaction()`` snapshots the tabl
 restores them if the block raises anything, ``BaseException`` included, so a crash inside
 the commit step leaves no row behind, as SQLite's rollback would; nested blocks join the
 outermost one, as in the real index.
+
+No longer the cloud tests' default (they run on the real SQLite ``Index``); kept importable
+for other workstreams.
 """
 
 from __future__ import annotations

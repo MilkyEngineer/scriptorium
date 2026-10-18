@@ -30,7 +30,7 @@ def record(scenario: Scenario, out_dir: Path) -> Path:
                 step(cloud)
                 h.poll()
         finally:
-            h.client.close()
+            h.close()
     path = out_dir / f"{scenario.name}.json"
     save_cassette(path, recorder.cassette(description=f"Synthetic. {scenario.description}"))
     return path
