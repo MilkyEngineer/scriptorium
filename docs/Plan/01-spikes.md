@@ -127,3 +127,23 @@ Time boxes are guidance for a focused session, not deadlines.
 **Procedure.** With the S2 stub server, return from test tools: an image content block (PNG, 200 KB and 1.5 MB); an MCP resource link; a plain `https://…/dl/<token>` URL in text; a 64 KB text result; and accept a tool argument of 64 KB, 256 KB and 1 MB. Try from claude.ai web, mobile, Desktop and Claude Code. Also confirm whether `tools/list` filtering per user (admin tools) is honoured without a reconnect.
 
 **Pass criteria.** A table in the write-up of what each client shows/accepts, and resulting defaults for `MAX_INLINE_KB`, text caps, `page_image` size, and whether `/dl/` URLs are clickable on mobile.
+
+---
+
+## S7 — Cloud change notifications as a poll trigger
+
+**Gates:** the M2 "poll on notification" item (not M1). **Time box:** half a day, read-only, with the dev device token.
+
+**Why.** The tablet and the official apps do not poll: they hold a websocket open to the cloud's notifications service and learn of another device's sync within seconds. Scriptorium polls every `POLL_SECONDS` (default 600), so a note written on the tablet is reachable only after up to ten minutes. The common case this spike serves is "write on the tablet, sit down at the desk, ask about it straight away".
+
+**Procedure.**
+
+1. Discover the notifications host the way the apps do (the service-manager lookup the sync library already performs for the document storage host, with the notifications service name) and open the websocket with the device's user token. Record the handshake requirements (headers, token kind, whether the URL carries the device id) and whether the connection is accepted for a *browser* device token.
+2. Keep it open for an hour while the operator edits, creates, moves, trashes and deletes documents on the tablet and in the desktop app. Record every message shape with identifiers scrubbed: event names, which carry the new root generation or a document UUID, and what arrives for a device's own change versus another device's.
+3. Measure the lag from the tablet's sync indicator to the event, and from the event to a changed root hash being readable (the root may lag the event; note whether a poll fired immediately on the event sees the change or needs a short delay or one retry).
+4. Disconnect behaviour: idle timeouts, server-initiated closes, pings expected, behaviour across a token refresh, and whether two concurrent connections for one account are allowed (server and worker restarts overlap).
+5. Rate: count messages per hour on an idle account and during the edit session.
+
+**Pass criteria.** A scrubbed table of event shapes and lags, and a decision on the trigger design: the websocket is only a wake-up (on any event the account's loop runs a poll now, subject to a minimum gap of about 10 s and the existing byte and time budgets); polling stays the source of truth, because the two-complete-listings rule, the circuit breaker and the generation check all need full listings and a push channel can drop events or close silently; a lost connection falls back to the plain interval with backoff and is logged once. Settings proposed in the write-up (`NOTIFICATIONS=on|off`, minimum gap) go to Architecture §7 and §12.
+
+**Fail outcome.** If the service refuses browser-device tokens, needs an undocumented client identity, or delivers events for only some change kinds, record that and fall back to a shorter adaptive interval instead (poll faster for a while after a change is seen, slower when the root has not moved).
