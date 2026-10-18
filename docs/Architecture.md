@@ -655,7 +655,7 @@ Going fully cloud-free (self-hosting the reMarkable cloud with `rmfakecloud`) is
 - **Content sandboxes:** Markdown→PDF with HTML disabled and a deny-all fetcher in a resource-limited subprocess; image and PDF bombs rejected by size before decoding.
 - **Audit:** every tool call logged with user, tool, duration, outcome and non-content identifiers; never arguments, content or secrets.
 - **Data policy note:** the one-time connect code and all note transcripts pass through the user's Claude conversation; `forget_me` cannot reach into host snapshots or restic history, which age out by retention. Both are stated to users.
-- **Supply chain:** pinned `uv.lock`, image built in CI with SBOM and licence gate, Dependabot on the fork.
+- **Supply chain:** pinned `uv.lock`; GitHub Actions pinned by commit SHA and base images (`python`, `uv`) by multi-arch index digest, bumped deliberately in their own commits; image built in CI with SBOM and licence gate; Dependabot on the fork.
 
 ---
 

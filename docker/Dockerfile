@@ -6,8 +6,10 @@
 # Runs as a non-root user with a read-only root filesystem and a tmpfs on /tmp;
 # all state lives under /data.
 
-ARG PYTHON_IMAGE=python:3.12-slim
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.1
+# Base images are pinned by digest of the multi-arch index (tag kept for readability). Bump the
+# digest deliberately, in its own commit, when the base's security updates are wanted.
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336
 
 FROM ${UV_IMAGE} AS uv
 
