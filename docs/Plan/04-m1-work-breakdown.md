@@ -245,17 +245,17 @@ Demonstrated against the operator's deployment with the operator's own account (
 
 | # | Result |
 | --- | --- |
-| 1 | Partial: claude.ai mobile web and Claude Code logins (S2 steps 2–3). claude.ai web, Claude Desktop and the 403 for a non-allowlisted user: pending |
+| 1 | Partial: claude.ai web and mobile web and Claude Code logins work (S2 steps 2–3; the connector is per claude.ai account, so web and mobile share one login). Claude Desktop and the 403 for a non-allowlisted user: pending |
 | 2 | Passed: `connect_remarkable` from claude.ai; first poll 26 s later archived every document (16, then 17) in xochitl layout, all pages rendered, 0 tombstones; `list` matched the tablet |
 | 3 | Passed: a page edited on the tablet produced a second `history` row within one poll, superseded files went to `.holding/`, every baseline blob remained; `versions` + `read_page(version=<old>)` returned the pre-edit page, the current one the edit |
 | 4 | Passed: a tablet delete first appeared as `parent=trash` (mirrored, no tombstone); emptying the trash removed four documents from the cloud, which were tombstoned after two complete listings (4 of 18 is under the breaker), with `deletion_cause=unknown`, no `library/` entry left, no blob missing against the baseline manifest |
 | 5 | Passed in-process (`tests/cloud/test_sync.py`) |
 | 6 | Passed in-process (six of nine missing → `anomaly=mass_delete` in `account_status`) |
-| 7 | Pending: real `SIGKILL` mid-download (in-process sweep covered) |
+| 7 | Passed: `docker kill -s KILL` 3.6 s into a forced poll, with a blob `.incoming/*.part` in flight; on start the worker logged `archive_staging_swept` (2 entries), no partial document was ever visible in `library/`, and the poll completed (2 documents, 54 MB). Also observed live: render jobs leased at an earlier kill were requeued after their lease expired |
 | 8 | Passed in-process (outage backoff; three rejections → `needs_relink`; `connect(replace)` clears it) |
 | 9 | Passed in-process (p95 under 2 s over 100 calls); live calls measured 2–7 ms for `list`/`read_page`, 107 ms for `page_image` |
 | 10 | Passed: licence gate and read-only-rootfs smoke run in CI on the built image |
 | 11 | Passed in-process (grep over audit and logs for content, paths, codes, names, tokens); live logs over the first session contained identifiers and durations only |
 | 12 | Decided: not a per-deployment question; `set_sync_scope` (M2) lets the user choose (open question 5) |
 
-Also found live: page UUIDs are shared between documents uploaded from the same files (open question 8, fixed by account step V2); duplicating on the tablet mints fresh ones.
+Also found live: the first desktop-app upload arrived as a schema 4 document index with `0:<uuid>:<count>:<size>` as its header, which the parser refused until `ce8aded`; while it failed, `account_status` showed `tombstoning_suspended` and, with the worker down, `worker_stale`, both as designed. Also found live: page UUIDs are shared between documents uploaded from the same files (open question 8, fixed by account step V2); duplicating on the tablet mints fresh ones.
