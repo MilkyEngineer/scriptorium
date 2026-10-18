@@ -25,7 +25,11 @@
    the planner as ``allow_mass_delete=True`` and consumed by the next poll that lists.
 7. **Failure classes.** 401/403 from the token endpoint is ``token_rejected``; 429, a
    network failure or three transient failures in a row end the poll with ``backoff``;
-   an unparseable root is ``anomaly="protocol"``. ``needs_relink`` (three rejections in
+   an unparseable root (a ``CloudProtocolError`` or a hash mismatch) is
+   ``anomaly="protocol"``. Any other non-retryable status on the root pointer or root
+   index (404, 400, a refused redirect) is ``backoff`` with the error's reason: it says
+   nothing about the data, and an anomaly would freeze the account until an operator
+   clears it. ``needs_relink`` (three rejections in
    a row) and the backoff schedule are the worker's decisions, made from the report.
 
 **Budgets.** A poll downloads at most ``sync_max_poll_bytes`` of blobs and keeps starting
@@ -64,7 +68,9 @@ from typing import Any, Final, Literal
 
 from scriptorium.cloud.client import CloudClient
 from scriptorium.cloud.errors import (
+    BlobVerificationError,
     CloudError,
+    CloudProtocolError,
     RateLimitedError,
     ResponseTooLargeError,
     TokenRejectedError,
@@ -285,8 +291,10 @@ class SyncOnce:
             return self._finish(run, "token_rejected", reason=exc.reason)
         except TransientCloudError as exc:
             return self._finish(run, "backoff", reason=exc.reason, retry=exc.retry_after_s)
-        except CloudError as exc:
+        except (CloudProtocolError, BlobVerificationError) as exc:
             return self._raise_anomaly(run, ANOMALY_PROTOCOL, f"root: {exc.reason}")
+        except CloudError as exc:  # CloudNotFoundError, CloudRequestError: not a parse failure
+            return self._finish(run, "backoff", reason=exc.reason)
         run.root_hash, run.generation = root.hash, root.generation
         run.rejected_entries = root.rejected
 

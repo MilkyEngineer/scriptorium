@@ -449,6 +449,37 @@ def test_unparseable_root_is_a_protocol_anomaly(tmp_path: Path) -> None:
     assert h.blob_names() == set() and h.library_uuids() == set()
 
 
+@pytest.mark.parametrize(("status", "reason"), [(404, "not_found"), (400, "http_error")])
+def test_a_non_retryable_status_on_the_root_pointer_backs_off(
+    status: int, reason: str, tmp_path: Path
+) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    cloud.status[ROOT_KEY] = status
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+
+    report = h.poll()
+
+    assert (report.outcome, report.reason, report.anomaly) == ("backoff", reason, None)
+    assert h.state("anomaly") is None
+    assert h.blob_names() == set() and h.library_uuids() == set()
+    del cloud.status[ROOT_KEY]  # the account is not frozen: the next poll syncs
+    assert h.poll().outcome == "ok"
+    assert h.library_uuids() == {NOTEBOOK, PDF}
+
+
+def test_a_non_retryable_status_on_the_root_index_backs_off(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    cloud.status[cloud.root_hash] = 400
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+
+    report = h.poll()
+
+    assert (report.outcome, report.reason) == ("backoff", "http_error")
+    assert h.state("anomaly") is None
+
+
 def test_an_existing_anomaly_short_circuits_without_a_request(tmp_path: Path) -> None:
     cloud = FakeCloud()
     both(cloud)
