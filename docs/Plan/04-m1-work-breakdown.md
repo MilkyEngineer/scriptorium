@@ -238,3 +238,24 @@ Known gaps left on main after A–E merged; each is owned by the milestone named
 - **D (small):** switch `SyncOnce._library_sets` to `Index.document_uuids(deleted=)`; log the suffix shape of skipped names so a new xochitl file type shows up in the logs before it is lost.
 - **From the M1 adversarial review (2026-10-18), not fixed:** journal recovery with a vanished `place` source leaves `hash_root` claiming a version `library/` lacks (null that document's `hash_root` when `archive_journal_source_missing` fires, so the next poll re-commits from blobs); pin GitHub actions and the `python`/`uv` base images by digest; a `gone` render result is a done job without a PNG and burns re-runs; `admin_clear_anomaly` (M2) needs the tripped candidate set, so the breaker should persist it as `sync_state.anomaly_candidates`; a budget stop after planning spends the mass-delete approval, which is safe now that it is bound to candidates but could be kept instead. Unconfirmed: `_library_sets` via `recent(_BEGINNING)` could miss rows with a `last_modified` before the epoch (removed by the `document_uuids` switch); the abandoned poll thread after a watchdog `client.close()` may surface an untranslated httpx error as an unretrieved future; `_check_length` uses `isdigit()`; many `page_png` waiters polling SQLite every 0.25 s could saturate the default thread pool. Open design question for the operator: should a listing count as complete whenever the root parsed, even if some document indexes failed, so one broken document cannot suspend deletion mirroring (changes §7 step 2)?
 - **Operator checks before M1 closes:** acceptance #1, #2, #3, #4, #7 (real SIGKILL) and #10 against the compose stack; the lazy OCR round trip from claude.ai web and mobile; duplicate a notebook in the scratch folder to settle open question 8.
+
+## 7. M1 acceptance record (compose stack, main `df22eee`, 2026-10-18)
+
+Demonstrated against the operator's deployment with the operator's own account (scratch folder); figures are counts only.
+
+| # | Result |
+| --- | --- |
+| 1 | Partial: claude.ai mobile web and Claude Code logins (S2 steps 2–3). claude.ai web, Claude Desktop and the 403 for a non-allowlisted user: pending |
+| 2 | Passed: `connect_remarkable` from claude.ai; first poll 26 s later archived every document (16, then 17) in xochitl layout, all pages rendered, 0 tombstones; `list` matched the tablet |
+| 3 | Passed: a page edited on the tablet produced a second `history` row within one poll, superseded files went to `.holding/`, every baseline blob remained; `versions` + `read_page(version=<old>)` returned the pre-edit page, the current one the edit |
+| 4 | Passed: a tablet delete first appeared as `parent=trash` (mirrored, no tombstone); emptying the trash removed four documents from the cloud, which were tombstoned after two complete listings (4 of 18 is under the breaker), with `deletion_cause=unknown`, no `library/` entry left, no blob missing against the baseline manifest |
+| 5 | Passed in-process (`tests/cloud/test_sync.py`) |
+| 6 | Passed in-process (six of nine missing → `anomaly=mass_delete` in `account_status`) |
+| 7 | Pending: real `SIGKILL` mid-download (in-process sweep covered) |
+| 8 | Passed in-process (outage backoff; three rejections → `needs_relink`; `connect(replace)` clears it) |
+| 9 | Passed in-process (p95 under 2 s over 100 calls); live calls measured 2–7 ms for `list`/`read_page`, 107 ms for `page_image` |
+| 10 | Passed: licence gate and read-only-rootfs smoke run in CI on the built image |
+| 11 | Passed in-process (grep over audit and logs for content, paths, codes, names, tokens); live logs over the first session contained identifiers and durations only |
+| 12 | Decided: not a per-deployment question; `set_sync_scope` (M2) lets the user choose (open question 5) |
+
+Also found live: page UUIDs are shared between documents uploaded from the same files (open question 8, fixed by account step V2); duplicating on the tablet mints fresh ones.
