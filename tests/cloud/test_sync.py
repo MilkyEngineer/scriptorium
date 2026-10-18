@@ -1129,7 +1129,10 @@ def test_an_unexpected_error_fails_one_document_not_the_poll(
     assert h.index.get_state("previous_listing") is not None  # the poll finished
 
 
-def test_file_names_outside_the_allowlist_never_reach_the_archive(tmp_path: Path) -> None:
+def test_file_names_outside_the_allowlist_never_reach_the_archive(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
     cloud = FakeCloud()
     files = dict(fixture_documents()[PDF])
     data = files[f"{PDF}.pagedata"]
@@ -1151,6 +1154,15 @@ def test_file_names_outside_the_allowlist_never_reach_the_archive(tmp_path: Path
     assert report.skipped_files == 6
     assert report.outcome == "partial"
     assert h.library_files(PDF) == expected_files(PDF)
+    # Logged by shape (protocol.name_shape), never by name.
+    logged = [
+        getattr(r, "scriptorium_fields", {})
+        for r in caplog.records
+        if r.getMessage() == "sync.skipped_files"
+    ]
+    assert logged and all(f["reason"].startswith("suffix_") for f in logged)
+    assert {f["count"] for f in logged} == {1}
+    assert "escape" not in caplog.text and ".exe" not in caplog.text
 
 
 def test_root_entries_that_are_not_uuids_are_rejected(tmp_path: Path) -> None:

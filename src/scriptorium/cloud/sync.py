@@ -103,6 +103,7 @@ import secrets
 import threading
 import time
 import unicodedata
+from collections import Counter
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -198,6 +199,8 @@ MAX_NAME_CHARS: Final = 1024
 MAX_PAGES: Final = 100_000
 MAX_SEEN_CHARS: Final = 64 * 1024 * 1024
 """Largest ``scope_excluded`` value read back; a larger one is ignored (and rebuilt)."""
+MAX_SKIPPED_SHAPES: Final = 8
+"""Most distinct skipped-name shapes one poll logs (``sync.skipped_files``)."""
 _DOCUMENT_TYPES: Final = frozenset({"DocumentType", "CollectionType"})
 _ALL_FINGERPRINT: Final = scope_fingerprint(ALL)
 _FILE_TYPES: Final = frozenset({"notebook", "pdf", "epub"})
@@ -319,6 +322,8 @@ class _Run:
     anomaly_reason: str | None = None
     mass_delete_approved: bool = False
     excluded: int = 0
+    #: protocol.name_shape -> documents whose index left out a name of that shape (bounded).
+    skipped_shapes: Counter[str] = field(default_factory=Counter)
 
 
 class _Seen(NamedTuple):
@@ -644,6 +649,9 @@ class SyncOnce:
             transient.reset()
             indexes[entry.uuid] = doc_index
             run.skipped_files += doc_index.skipped
+            for shape in doc_index.skipped_shapes:
+                if shape in run.skipped_shapes or len(run.skipped_shapes) < MAX_SKIPPED_SHAPES:
+                    run.skipped_shapes[shape] += 1
         return None
 
     # ---- step 2, the scope -----------------------------------------------------------------
@@ -1247,6 +1255,17 @@ class SyncOnce:
             mass_delete_approved=run.mass_delete_approved,
             excluded=run.excluded,
         )
+        for shape, documents in sorted(run.skipped_shapes.items()):
+            # The shape of names the allowlist left out (protocol.name_shape), never a name:
+            # how a new file kind on the tablet shows up. count = documents with that shape.
+            log_event(
+                logger,
+                "sync.skipped_files",
+                level=logging.WARNING,
+                acct=self._settings.acct,
+                reason=f"suffix_{shape}",
+                count=documents,
+            )
         log_event(
             logger,
             "sync.poll",

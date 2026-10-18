@@ -12,7 +12,9 @@ not fully understand instead of guessing:
   confirmed for document indexes by S1) or SHA-256 of the body (schema-4 roots).
 * Root entry ids must be UUIDs and document file names must pass the §11.0 allowlist
   and belong to their document; anything else is counted and left out, so no
-  cloud-supplied string ever reaches a path join unchecked.
+  cloud-supplied string ever reaches a path join unchecked. What a left-out name looked
+  like is kept only as its shape (:func:`name_shape`), so a new file kind shows in the logs
+  without a cloud-supplied string reaching them.
 * Hashes are accepted in either case and returned as lowercase hex, the only spelling
   the archive and the index store (Architecture §6).
 """
@@ -39,6 +41,10 @@ MAX_BLOB_BYTES: Final = 1024 * 1024 * 1024
 MAX_POINTER_BYTES: Final = 64 * 1024
 """The root pointer JSON and the user token are both tiny."""
 MAX_GENERATION: Final = 2**63 - 1
+MAX_SHAPE_CHARS: Final = 24
+"""Longest :func:`name_shape` (a longer shape is cut and ends in ``+``)."""
+MAX_SHAPES_PER_INDEX: Final = 4
+"""Most distinct shapes a :class:`DocumentIndex` keeps of the names it left out."""
 
 _UUID_RE: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
@@ -57,6 +63,43 @@ _SCHEMA4_HEADER_RE: Final = re.compile(
 
 def is_uuid(value: str) -> bool:
     return _UUID_RE.fullmatch(value) is not None
+
+
+_SHAPE_UUID_RE: Final = re.compile(r"[0-9A-Fa-f-]{36}")
+_SHAPE_KEPT: Final = frozenset("./-_")
+
+
+def _shape_char(char: str) -> str:
+    if char in _SHAPE_KEPT:
+        return char
+    if char.isascii() and char.isalpha():
+        return "a"
+    if char.isascii() and char.isdigit():
+        return "9"
+    return "?"
+
+
+def name_shape(uuid: str, name: str) -> str:
+    """What a document file name the allowlist left out looked like, safe to log.
+
+    The part of ``name`` after the document ``uuid``, with each UUID-shaped run as ``U``,
+    ASCII letters as ``a``, ASCII digits as ``9``, ``.``, ``/``, ``-`` and ``_`` as they are
+    and anything else as ``?``, cut to :data:`MAX_SHAPE_CHARS`: ``<uuid>.newkind`` is
+    ``.aaaaaaa`` and ``<uuid>/<page>.rmx`` is ``/U.aaa``. A name that does not start with
+    the document's UUID is ``foreign``; the bare UUID is ``bare``. No letter or digit of
+    the name survives, so no cloud-chosen text reaches a log.
+    """
+    if not name.startswith(uuid):
+        return "foreign"
+    # Enough of the rest for MAX_SHAPE_CHARS shape characters, even if each is a UUID.
+    rest = name[len(uuid) : len(uuid) + 37 * MAX_SHAPE_CHARS]
+    if not rest:
+        return "bare"
+    parts = _SHAPE_UUID_RE.split(rest)
+    shape = "U".join("".join(_shape_char(c) for c in part) for part in parts)
+    if len(shape) > MAX_SHAPE_CHARS:
+        return shape[: MAX_SHAPE_CHARS - 1] + "+"
+    return shape
 
 
 def is_sha256(value: str) -> bool:
@@ -113,8 +156,10 @@ class DocumentIndex:
     """A document's files: xochitl-relative name -> (sha256, declared size).
 
     Every name passed ``is_safe_name`` and belongs to ``uuid``; ``skipped`` counts the
-    names that did not and were left out. ``body`` is the index as fetched (it matched
-    ``hash``), kept so sync can store it in ``blobs/`` beside the files it lists.
+    names that did not and were left out, and ``skipped_shapes`` holds up to
+    :data:`MAX_SHAPES_PER_INDEX` of their distinct :func:`name_shape` values, sorted.
+    ``body`` is the index as fetched (it matched ``hash``), kept so sync can store it in
+    ``blobs/`` beside the files it lists.
     """
 
     uuid: str
@@ -122,6 +167,7 @@ class DocumentIndex:
     files: Mapping[str, BlobRef]
     body: bytes = field(default=b"", repr=False)
     skipped: int = 0
+    skipped_shapes: tuple[str, ...] = ()
 
 
 def parse_index(
@@ -236,11 +282,18 @@ def parse_document_index(body: bytes, *, uuid: str, hash: str, max_files: int) -
     entries = parse_index(body, max_entries=max_files, what="document index", owner=uuid)
     if not matches_address(body, entries, hash):
         raise CloudProtocolError("document index does not match its hash")
-    files = {e.id: BlobRef(e.hash, e.size) for e in entries if is_document_file(uuid, e.id)}
+    files: dict[str, BlobRef] = {}
+    shapes: set[str] = set()
+    for e in entries:
+        if is_document_file(uuid, e.id):
+            files[e.id] = BlobRef(e.hash, e.size)
+        elif len(shapes) < MAX_SHAPES_PER_INDEX:
+            shapes.add(name_shape(uuid, e.id))
     return DocumentIndex(
         uuid=uuid,
         hash=hash,
         files=MappingProxyType(files),
         body=body,
         skipped=len(entries) - len(files),
+        skipped_shapes=tuple(sorted(shapes)),
     )

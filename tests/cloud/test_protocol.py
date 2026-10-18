@@ -10,8 +10,11 @@ import pytest
 from scriptorium.cloud.errors import CloudProtocolError, ResponseTooLargeError
 from scriptorium.cloud.protocol import (
     MAX_INDEX_BYTES,
+    MAX_SHAPE_CHARS,
+    MAX_SHAPES_PER_INDEX,
     hash_entries,
     is_document_file,
+    name_shape,
     parse_document_index,
     parse_index,
     parse_root,
@@ -169,8 +172,41 @@ def test_document_index_keeps_only_allowlisted_names_of_its_document() -> None:
 
     assert sorted(index.files) == sorted(names[:5])
     assert index.skipped == 6
+    # Up to MAX_SHAPES_PER_INDEX of the six shapes, none carrying a letter of a name.
+    assert len(index.skipped_shapes) == MAX_SHAPES_PER_INDEX
+    assert set(index.skipped_shapes) <= {
+        "foreign",
+        ".aaaaaaaaaa/U.aaa",
+        "/../U.aaaaaaaa",
+        ".aaaaaaaa/../../a",
+        "bare",
+    }
     with pytest.raises(TypeError):
         index.files["x"] = index.files[names[0]]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("suffix", "shape"),
+    [
+        (".newkind", ".aaaaaaa"),
+        (f"/{PAGE}.rmx", "/U.aaa"),
+        (f"/{PAGE.upper()}.rm", "/U.aa"),
+        (".v2_Data-1", ".a9_aaaa-9"),
+        (".Été", ".?a?"),
+        ('.a b\n"c', ".a?a??a"),
+        ("", "bare"),
+        ("." + "x" * 500, "." + "a" * (MAX_SHAPE_CHARS - 2) + "+"),
+        ("/" + PAGE * 40, "/" + "U" * (MAX_SHAPE_CHARS - 2) + "+"),
+    ],
+)
+def test_name_shape(suffix: str, shape: str) -> None:
+    assert name_shape(DOC, DOC + suffix) == shape
+    assert len(name_shape(DOC, DOC + suffix)) <= MAX_SHAPE_CHARS
+
+
+def test_name_shape_of_a_foreign_name() -> None:
+    assert name_shape(DOC, f"{OTHER}.metadata") == "foreign"
+    assert name_shape(DOC, "../../escape") == "foreign"
 
 
 def test_is_document_file() -> None:
