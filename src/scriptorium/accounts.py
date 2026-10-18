@@ -4,13 +4,25 @@ The device token lives in the user's ``secrets.enc`` under :func:`device_token_n
 worker records its view of the account in the account index's ``sync_state`` under the
 ``STATE_*`` keys below (beside the sync's own keys in :mod:`scriptorium.cloud.sync`);
 ``account_status`` reads them and ``connect_remarkable`` clears the relink state.
+
+:func:`poll_lock` is the one lock the worker and the server share about an account: the
+worker holds it for a whole poll (and for its start-up sweep), and
+``disconnect_remarkable(keep_archive=false)`` holds it while it moves the account directory
+to ``removed/``, so a poll never runs against a directory that is being moved.
 """
 
 from __future__ import annotations
 
-from typing import Final
+import os
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Final, Literal
 
-from scriptorium.users.store import ACCT_RE
+from scriptorium.users.store import ACCT_RE, AccountPaths
+
+if sys.platform != "win32":
+    import fcntl
 
 __all__ = [
     "DEVICE_DESCRIPTION",
@@ -20,8 +32,12 @@ __all__ = [
     "STATE_LAST_SYNC_AT",
     "STATE_NEEDS_RELINK",
     "STATE_TOKEN_REJECTIONS",
+    "PollLock",
     "device_token_name",
+    "poll_lock",
 ]
+
+PollLock = Literal["held", "busy", "gone"]
 
 DEVICE_DESCRIPTION: Final = "desktop-linux"
 """What ``connect_remarkable`` registers the device as (the fork's default)."""
@@ -45,3 +61,36 @@ def device_token_name(acct: str) -> str:
     if not ACCT_RE.fullmatch(acct):
         raise ValueError("not an account id")
     return f"device_token:{acct}"
+
+
+@contextmanager
+def poll_lock(paths: AccountPaths, *, blocking: bool = True) -> Iterator[PollLock]:
+    """Hold the account's poll lock (``flock`` on :attr:`AccountPaths.poll_lock`) for the block.
+
+    Yields ``"held"`` while it is held; ``"busy"`` when ``blocking`` is false and another
+    holder has it; ``"gone"`` when the account directory is not there, or was moved while
+    this call waited (the lock file it locked is no longer the one at the account's path).
+    In the last two cases nothing is held and the caller must not touch the account's files.
+    The file is opened without following a symlink. On Windows, where there is no ``flock``,
+    nothing is locked (development only).
+    """
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(paths.poll_lock, flags, 0o600)
+    except (FileNotFoundError, NotADirectoryError):
+        yield "gone"
+        return
+    try:
+        if sys.platform != "win32":
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield "busy"
+                return
+        try:
+            same = os.path.samestat(os.fstat(fd), os.stat(paths.poll_lock, follow_symlinks=False))
+        except (FileNotFoundError, NotADirectoryError):
+            same = False
+        yield "held" if same else "gone"
+    finally:
+        os.close(fd)

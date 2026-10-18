@@ -48,6 +48,8 @@ __all__ = [
     "account_paths",
     "global_db_path",
     "new_ulid",
+    "removed_account_path",
+    "removed_dir",
     "uid_for",
     "user_dir",
     "worker_heartbeat_path",
@@ -96,6 +98,12 @@ class AccountPaths:
     staging: Path
     index: Path  # root / "index.sqlite"
 
+    @property
+    def poll_lock(self) -> Path:
+        """``<root>/.poll.lock``: ``flock``-ed by the worker for a whole poll and by
+        ``disconnect_remarkable`` while it moves the directory (``accounts.poll_lock``)."""
+        return self.root / ".poll.lock"
+
     def inside(self, p: Path) -> Path:
         """``p`` resolved (symlinks followed), asserted inside :attr:`root`.
 
@@ -142,6 +150,28 @@ def account_paths(data_dir: Path, uid: str, acct: str) -> AccountPaths:
         staging=root / "staging",
         index=root / "index.sqlite",
     )
+
+
+def removed_dir(data_dir: Path, uid: str) -> Path:
+    """``<data>/users/<uid>/removed``: account directories that
+    ``disconnect_remarkable(keep_archive=false)`` moved out of ``accounts/``. Nothing under it
+    is deleted by any code path but ``admin_gc_blobs`` (§6, §11.1)."""
+    base = user_dir(data_dir, uid)
+    path = base / "removed"
+    resolve_inside(base, path)
+    return path
+
+
+def removed_account_path(data_dir: Path, uid: str, acct: str, removed_at: datetime) -> Path:
+    """``<data>/users/<uid>/removed/<acct>-<YYYYMMDDTHHMMSSZ>``: where account ``acct`` is
+    moved when it is removed at ``removed_at``. Validated like :func:`account_paths`."""
+    if removed_at.tzinfo is None:
+        raise ValueError("timestamps must be timezone-aware")
+    stamp = removed_at.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    base = removed_dir(data_dir, uid)
+    path = base / f"{_check_acct(acct)}-{stamp}"
+    resolve_inside(base, path)
+    return path
 
 
 def new_ulid(now_ms: int | None = None) -> str:

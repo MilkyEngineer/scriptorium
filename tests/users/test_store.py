@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,6 +25,8 @@ from scriptorium.users.store import (
     account_paths,
     global_db_path,
     new_ulid,
+    removed_account_path,
+    removed_dir,
     uid_for,
     user_dir,
     worker_heartbeat_path,
@@ -475,6 +477,28 @@ def test_active_and_all_accounts(db: Path, gs: GlobalStore) -> None:
 
 def test_worker_heartbeat_path(tmp_path: Path) -> None:
     assert worker_heartbeat_path(tmp_path) == tmp_path / "worker.heartbeat"
+
+
+def test_removed_paths(tmp_path: Path) -> None:
+    at = datetime(2026, 10, 18, 9, 30, 5, tzinfo=UTC)
+    base = user_dir(tmp_path, UID) / "removed"
+    assert removed_dir(tmp_path, UID) == base
+    assert removed_account_path(tmp_path, UID, ACCT, at) == base / f"{ACCT}-20261018T093005Z"
+    local = datetime(2026, 10, 18, 11, 30, 5, tzinfo=timezone(timedelta(hours=2)))
+    assert removed_account_path(tmp_path, UID, ACCT, local).name == f"{ACCT}-20261018T093005Z"
+    with pytest.raises(ValueError):
+        removed_account_path(tmp_path, UID, ACCT, datetime(2026, 10, 18))
+    with pytest.raises(InvalidArgumentError):
+        removed_account_path(tmp_path, UID, "../" + ACCT, at)
+    with pytest.raises(InvalidArgumentError):
+        removed_dir(tmp_path, "../" + UID)
+
+
+def test_a_symlinked_removed_directory_is_refused(tmp_path: Path) -> None:
+    user_dir(tmp_path, UID).mkdir(parents=True)
+    (user_dir(tmp_path, UID) / "removed").symlink_to(tmp_path)
+    with pytest.raises(PathEscapeError):
+        removed_dir(tmp_path, UID)
 
 
 # ---- OCR additions (§8.1) -------------------------------------------------------------------
