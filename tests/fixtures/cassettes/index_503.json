@@ -27,7 +27,7 @@
     "url": "https://cloud.example.com/sync/v4/root"
    },
    "response": {
-    "body": "{\"hash\": \"556e19cd0b1dc35298a0cc955a726d25a7b54df9d75a7a48ead39dd935ef5ae4\", \"generation\": 2, \"schemaVersion\": 4}",
+    "body": "{\"hash\": \"2a5c2c98a4437fd994c45711abfce2808961a48f9c4ab3e885ba4ed581c93a7a\", \"generation\": 2, \"schemaVersion\": 4}",
     "headers": {
      "content-type": "application/json"
     },
@@ -41,10 +41,10 @@
      "rm-filename": "root.docSchema"
     },
     "method": "GET",
-    "url": "https://cloud.example.com/sync/v3/files/556e19cd0b1dc35298a0cc955a726d25a7b54df9d75a7a48ead39dd935ef5ae4"
+    "url": "https://cloud.example.com/sync/v3/files/2a5c2c98a4437fd994c45711abfce2808961a48f9c4ab3e885ba4ed581c93a7a"
    },
    "response": {
-    "body": "4\n0:.:4:243633\n2fab2ee2ea8591d351343523e253f2cebdf36d13434a5997209c7f8166c5c8f9:0:00000000-0000-4000-8000-000000000001:9:165280\n5b8d4935bb74f53080b643e8dea6496748430626397e20ec3afa22cd38136b67:0:00000000-0000-4000-8000-000000000002:5:25747\n29d7cb1458d9927810182b688088208f5eb0b41031c8b3ce4bfa0b76a6664f68:0:00000000-0000-4000-8000-000000000101:5:17907\n8766557d956aee5ba622ce7d6f104681eacbd28df979801226bc1d2b07c7fe01:0:00000000-0000-4000-8000-000000000102:5:34699\n",
+    "body": "4\n0:.:4:243633\nd28a1eaf37986414d141cafc1d615acfb3f079e025aa851bcbd35e2cbd5791d3:0:00000000-0000-4000-8000-000000000001:9:165280\na938847cd184ba4ffdf326797837ae00f48362bf6f3e755fc52870a47975b33d:0:00000000-0000-4000-8000-000000000002:5:25747\nd6af61889e40733a9b09cc11fc46d56a1e14a2e311022a03cb89cba71d9b9570:0:00000000-0000-4000-8000-000000000101:5:17907\n9ad39b53c0cf5e74f07740bd2383e2fa87cdc331556f79cf9496b5491f5aaa87:0:00000000-0000-4000-8000-000000000102:5:34699\n",
     "headers": {
      "content-type": "application/octet-stream"
     },
@@ -58,7 +58,7 @@
      "rm-filename": "00000000-0000-4000-8000-000000000001.docSchema"
     },
     "method": "GET",
-    "url": "https://cloud.example.com/sync/v3/files/2fab2ee2ea8591d351343523e253f2cebdf36d13434a5997209c7f8166c5c8f9"
+    "url": "https://cloud.example.com/sync/v3/files/d28a1eaf37986414d141cafc1d615acfb3f079e025aa851bcbd35e2cbd5791d3"
    },
    "response": {
     "headers": {
@@ -74,7 +74,7 @@
      "rm-filename": "00000000-0000-4000-8000-000000000002.docSchema"
     },
     "method": "GET",
-    "url": "https://cloud.example.com/sync/v3/files/5b8d4935bb74f53080b643e8dea6496748430626397e20ec3afa22cd38136b67"
+    "url": "https://cloud.example.com/sync/v3/files/a938847cd184ba4ffdf326797837ae00f48362bf6f3e755fc52870a47975b33d"
    },
    "response": {
     "headers": {
@@ -90,7 +90,7 @@
      "rm-filename": "00000000-0000-4000-8000-000000000101.docSchema"
     },
     "method": "GET",
-    "url": "https://cloud.example.com/sync/v3/files/29d7cb1458d9927810182b688088208f5eb0b41031c8b3ce4bfa0b76a6664f68"
+    "url": "https://cloud.example.com/sync/v3/files/d6af61889e40733a9b09cc11fc46d56a1e14a2e311022a03cb89cba71d9b9570"
    },
    "response": {
     "headers": {
