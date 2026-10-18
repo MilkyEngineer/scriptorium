@@ -296,6 +296,21 @@ class Settings(BaseSettings):
     )
     ocr_max_tokens: int = Field(
         default=4096, ge=256, le=32_000, description="Output budget of one page (§8.2)."
+    # ---- OCR pipeline (§7 step 6, §6.2) ----------------------------------------------------
+    ocr_batch_min: int = Field(
+        default=10,
+        ge=1,
+        le=10_000,
+        description=(
+            "Stable pages per poll above which auto-OCR submits one Message Batches job "
+            "instead of single `ocr` jobs (§7 step 6)."
+        ),
+    )
+    ocr_user_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=16,
+        description="Most `ocr` jobs one user has leased at once (§6.2).",
     )
 
     @classmethod
