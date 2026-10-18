@@ -29,6 +29,7 @@ M1_TOOLS = {
     "trash",
     "save_transcript",
 }
+M2_TOOLS = {"search"}
 NOTEBOOK_NAME = "Scriptorium Test Notebook"
 TRANSCRIPT_MARKER = "transcript-marker-7f3a"
 PATH_MARKER = "path-marker-91c2"
@@ -38,19 +39,20 @@ CODE_MARKER = "codemarker77"
 async def test_tools_list_for_a_user_and_an_admin(library: Served) -> None:
     async with mcp_session(library.app, library.issuer.token()) as (client, _):
         tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-    assert set(tools) == M1_TOOLS | USER_TOOLS
-    for name in M1_TOOLS:
+    assert set(tools) == M1_TOOLS | M2_TOOLS | USER_TOOLS
+    for name in M1_TOOLS | M2_TOOLS:
         tool = tools[name]
         assert tool.description and len(tool.description) > 80, name
         properties = tool.input_schema.get("properties", {})
         # Tenancy: no tool takes a user id or a filesystem path.
         assert not {"user", "uid", "user_id", "path", "file", "filename"} & set(properties), name
     assert tools["list"].annotations is not None and tools["list"].annotations.read_only_hint
+    assert tools["search"].annotations is not None and tools["search"].annotations.read_only_hint
     assert tools["save_transcript"].annotations is not None
     assert not tools["save_transcript"].annotations.read_only_hint
     async with mcp_session(library.app, library.issuer.admin_token()) as (client, _):
         admin = {tool.name for tool in (await client.list_tools()).tools}
-    assert admin == M1_TOOLS | USER_TOOLS | {"admin_spike_ping"}
+    assert admin == M1_TOOLS | M2_TOOLS | USER_TOOLS | {"admin_spike_ping"}
 
 
 async def test_list_and_read_page_p95_under_two_seconds(library: Served) -> None:

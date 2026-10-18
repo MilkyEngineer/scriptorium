@@ -1,5 +1,5 @@
-"""Library tools (§11.2, §11.5, M1 subset): list, recent, read_page, read_document,
-page_image, versions, trash.
+"""Library tools (§11.2, §11.5): list, recent, search, read_page, read_document, page_image,
+versions, trash.
 
 Everything here reads the archive; nothing writes to the cloud. Page images that are not on
 disk yet are rendered by the worker (see ``_library.page_png``); the server only downscales
@@ -12,13 +12,21 @@ from __future__ import annotations
 import asyncio
 import base64
 from datetime import datetime
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 
 from mcp_types import CallToolResult, ImageContent, TextContent
 from pydantic import Field
 
 from scriptorium.library import pages as pg
-from scriptorium.library.index import ChangeRow, DocumentRow, HistoryRow, Page
+from scriptorium.library.index import (
+    ChangeRow,
+    DocumentHit,
+    DocumentRow,
+    HistoryRow,
+    Page,
+    SearchHit,
+)
+from scriptorium.library.tags import MAX_TAGS_PER_DOCUMENT
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
 from scriptorium.tools._conventions import (
     READ_ONLY,
@@ -66,6 +74,11 @@ MODEL_IMAGE_SIDE: Final = 2576
 """The Claude API's longest image side; ``read_page`` downscales taller pages to it (§8.3)."""
 CHANGED_PAGES_MAX: Final = 50
 _META_ROOM: Final = 2048
+TAG_ARG_MAX: Final = 256
+"""Longest tag name a filter accepts; stored names are cut to 64 characters, and a longer
+argument is cut the same way before it is compared."""
+SNIPPET_MAX: Final = 512
+PATH_MAX: Final = 1024
 
 
 def _account_field() -> Any:
@@ -88,6 +101,17 @@ def _page_field() -> Any:
     return Field(ge=1, le=100_000, description="Page number, from 1.")
 
 
+TagName = Annotated[str, Field(min_length=1, max_length=TAG_ARG_MAX)]
+
+
+def _tags_field(description: str) -> Any:
+    return Field(default=None, max_length=MAX_TAGS_PER_DOCUMENT, description=description)
+
+
+def _bounded(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _png_block(data: bytes) -> ImageContent:
     return ImageContent(data=base64.b64encode(data).decode("ascii"), mime_type=PNG)
 
@@ -108,15 +132,20 @@ class ListArgs(PageArgs):
     include_deleted: bool = Field(
         default=False, description="Also list items deleted from the cloud but kept here."
     )
+    tags: list[TagName] | None = _tags_field(
+        "Only items carrying any of these tags (names as list shows them); the listing then "
+        "covers everything below the folder, not just its direct children."
+    )
     account: str | None = _account_field()
 
 
 async def list_documents(ctx: ToolContext, args: ListArgs) -> CallToolResult:
     """List the folders and documents in a folder of your reMarkable library (the root by
     default), folders first, then by name. Each item has its name, type, UUID, last-modified
-    time, page count and state (live, trashed, or deleted from the cloud but kept here).
-    folder is a UUID or a path of names such as "Notes/Projects". Use next_cursor to continue
-    a long listing."""
+    time, page count, state (live, trashed, or deleted from the cloud but kept here) and
+    tags. folder is a UUID or a path of names such as "Notes/Projects". tags keeps only the
+    items tagged with any of the given names, searching everything below the folder rather
+    than one level. Use next_cursor to continue a long listing."""
     account = await use_account(ctx, args.account)
     parent: str | None = None
     if args.folder is not None:
@@ -127,6 +156,7 @@ async def list_documents(ctx: ToolContext, args: ListArgs) -> CallToolResult:
             parent,
             include_trash=args.include_trash,
             include_deleted=args.include_deleted,
+            tags=args.tags,
             cursor=args.cursor,
             limit=limit,
         )
@@ -135,6 +165,7 @@ async def list_documents(ctx: ToolContext, args: ListArgs) -> CallToolResult:
         return {
             "account": account.acct,
             "folder": parent,
+            "recursive": bool(args.tags),
             "items": [document_item(doc) for doc in page.items],
             "next_cursor": page.next_cursor,
         }
@@ -195,6 +226,84 @@ async def recent(ctx: ToolContext, args: RecentArgs) -> CallToolResult:
             "account": account.acct,
             "since": iso_utc(since),
             "items": items,
+            "next_cursor": page.next_cursor,
+        }
+
+    payload = await asyncio.to_thread(shrink_to_fit, fetch, render, args.limit)
+    items = payload["items"]
+    ctx.audit["count"] = len(items) if isinstance(items, list) else 0
+    return json_result(payload, cap=RESULT_CAP_BYTES)
+
+
+# ---- search ------------------------------------------------------------------------------------
+
+
+class SearchArgs(PageArgs):
+    query: str = Field(
+        min_length=1,
+        max_length=1000,
+        description="Words to find; every word must match. Quotes and operators are literal.",
+    )
+    folder: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=IDENTIFIER_MAX,
+        description="Only documents anywhere below this folder (UUID or path of names).",
+    )
+    tags: list[TagName] | None = _tags_field(
+        "Only results tagged with any of these names: a page matches on its own tags or its "
+        "document's, a document on its own."
+    )
+    account: str | None = _account_field()
+
+
+def _hit_item(hit: SearchHit | DocumentHit) -> dict[str, object]:
+    if isinstance(hit, SearchHit):
+        return {
+            "kind": "page",
+            "document": hit.document,
+            "name": display_name(hit.doc_name),
+            "path": _bounded(hit.doc_path, PATH_MAX),
+            "page": None if hit.idx is None else hit.idx + 1,
+            "page_id": hit.page_id,
+            "content_hash": hit.content_hash,
+            "current": hit.current,
+            "snippet": _bounded(hit.snippet, SNIPPET_MAX),
+            "tags": list(hit.tags),
+        }
+    return {
+        "kind": "document",
+        "document": hit.document,
+        "name": display_name(hit.doc_name),
+        "path": _bounded(hit.doc_path, PATH_MAX),
+        "tags": list(hit.tags),
+    }
+
+
+async def search(ctx: ToolContext, args: SearchArgs) -> CallToolResult:
+    """Search your reMarkable library: the transcripts of transcribed pages, document names,
+    folder paths and tag names, every word of query must match. Page results come first,
+    best match first, each with its document, 1-based page number (null if the page is no
+    longer in the document), a snippet, its tags, and current (false when the snippet is
+    from an older version of the page); read_page fetches the full text. Documents with no
+    transcribed page are found by name or tag and follow as document results. folder limits
+    the search to everything below a folder; tags keeps results tagged with any of the
+    given names. Use next_cursor to continue."""
+    account = await use_account(ctx, args.account)
+    folder: str | None = None
+    if args.folder is not None:
+        folder = (await use_document(ctx, account, args.folder, want=FOLDER)).uuid
+
+    def fetch(limit: int) -> Page[SearchHit | DocumentHit]:
+        return account.index.search(
+            args.query, folder=folder, tags=args.tags, cursor=args.cursor, limit=limit
+        )
+
+    def render(page: Page[SearchHit | DocumentHit]) -> dict[str, object]:
+        return {
+            "account": account.acct,
+            "folder": folder,
+            "items": [_hit_item(hit) for hit in page.items],
             "next_cursor": page.next_cursor,
         }
 
@@ -528,11 +637,12 @@ async def trash(ctx: ToolContext, args: TrashArgs) -> CallToolResult:
 
 
 def register(registry: ToolRegistry) -> None:
-    """Add the M1 library tools."""
+    """Add the library tools."""
     registry.add(
         ToolSpec.from_handler(list_documents, args=ListArgs, annotations=READ_ONLY, name="list")
     )
     registry.add(ToolSpec.from_handler(recent, args=RecentArgs, annotations=READ_ONLY))
+    registry.add(ToolSpec.from_handler(search, args=SearchArgs, annotations=READ_ONLY))
     registry.add(ToolSpec.from_handler(read_page, args=ReadPageArgs, annotations=READ_ONLY))
     registry.add(ToolSpec.from_handler(read_document, args=ReadDocumentArgs, annotations=READ_ONLY))
     registry.add(ToolSpec.from_handler(page_image, args=PageImageArgs, annotations=READ_ONLY))
@@ -547,6 +657,7 @@ __all__ = [
     "read_page",
     "recent",
     "register",
+    "search",
     "trash",
     "versions",
 ]

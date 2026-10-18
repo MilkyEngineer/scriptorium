@@ -215,13 +215,18 @@ def display_name(name: str) -> str:
 
 
 def document_item(doc: DocumentRow) -> dict[str, object]:
-    """One row of ``list``/``trash``: name, type, uuid, modified, page count, state."""
+    """One row of ``list``/``trash``: name, type, uuid, modified, page count, state, tags.
+
+    Tags are the document's (or folder's) own, sorted; display data, bounded at parse time
+    (``library/tags.py``).
+    """
     item: dict[str, object] = {
         "uuid": doc.uuid,
         "name": display_name(doc.name),
         "type": "folder" if doc.type == FOLDER else "document",
         "modified": iso_utc(doc.last_modified),
         "state": state_of(doc),
+        "tags": list(doc.tags),
     }
     if doc.type == DOCUMENT:
         item["pages"] = doc.page_count
