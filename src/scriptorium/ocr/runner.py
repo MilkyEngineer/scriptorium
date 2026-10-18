@@ -214,6 +214,16 @@ class OcrRunner:
         row = self.worker.store.account(uid, acct)
         return row is None or row.removed_at is not None
 
+    async def _context(self, uid: str, acct: str) -> AccountContext | None:
+        """The account's context; None when it is gone (``Worker.context`` refuses a removed
+        account with ``NotFoundError``)."""
+        try:
+            return await asyncio.to_thread(self.worker.context, uid, acct)
+        except NotFoundError:
+            if await asyncio.to_thread(self._gone, uid, acct):
+                return None
+            raise
+
     async def _call[T](self, job: JobRow, fn: Callable[..., T], *args: Any) -> T:
         """Run a blocking OCR call in the OCR threads, heartbeating ``job``'s lease.
 
@@ -233,7 +243,9 @@ class OcrRunner:
         worker = self.worker
         if job.acct is None or await asyncio.to_thread(self._gone, job.uid, job.acct):
             return {"state": "gone"}
-        ctx = await asyncio.to_thread(worker.context, job.uid, job.acct)
+        ctx = await self._context(job.uid, job.acct)
+        if ctx is None:
+            return {"state": "gone"}
         index = ctx.index
         row = await asyncio.to_thread(index.page_by_id, spec.document, spec.page)
         if row is None or row.content_hash != spec.hash:
@@ -264,7 +276,14 @@ class OcrRunner:
         blocked = blocked_reason(allowance, mode)
         if blocked is not None:
             raise _Defer(blocked, month_bounds(now)[1])
-        png = await self.ocr_png(ctx, spec, job)
+        try:
+            png = await self.ocr_png(ctx, spec, job)
+        except (FileNotFoundError, NotFoundError):
+            # The account directory went away under the render (a removal moves it, and
+            # write_png never recreates it): nothing to send, nothing to retry.
+            if await asyncio.to_thread(self._gone, job.uid, job.acct):
+                return {"state": "gone"}
+            raise
         if png is None:
             return {"state": "stale"}
         unfit = batches.fits(png)
@@ -429,7 +448,9 @@ class OcrRunner:
         worker = self.worker
         if job.acct is None or await asyncio.to_thread(self._gone, job.uid, job.acct):
             return {"state": "gone"}
-        ctx = await asyncio.to_thread(worker.context, job.uid, job.acct)
+        ctx = await self._context(job.uid, job.acct)
+        if ctx is None:
+            return {"state": "gone"}
         ports = self.ports
         if ports is None:
             return await self._orphan(ctx, bspec, "not_configured")
@@ -597,10 +618,17 @@ class OcrRunner:
         if await asyncio.to_thread(self._gone, ctx.uid, ctx.acct):
             return 0
         now = self.worker.clock()
+        gone = False
         try:
             return await self._scan(ctx, now)
+        except (FileNotFoundError, NotFoundError):
+            # Removed during the scan: its directory or context went away under it.
+            gone = await asyncio.to_thread(self._gone, ctx.uid, ctx.acct)
+            if gone:
+                return 0
+            raise
         finally:
-            if complete:
+            if complete and not gone:
                 await asyncio.to_thread(ctx.index.set_state, STATE_OCR_POLL_AT, to_db_time(now))
 
     async def _scan(self, ctx: AccountContext, now: datetime) -> int:
@@ -750,6 +778,24 @@ class OcrRunner:
                 queued += 1
         return queued
 
+    async def _batch_pages(
+        self, ctx: AccountContext, specs: Sequence[OcrSpec]
+    ) -> tuple[list[batches.Planned], list[OcrSpec]]:
+        """The OCR images of ``specs`` already rendered, and the specs the API would refuse."""
+        pages: list[batches.Planned] = []
+        unfit: list[OcrSpec] = []
+        for spec in specs:
+            rel = pg.png_relpath(spec.page, spec.hash)
+            base = await asyncio.to_thread(_read_png, pg.resolve_png(ctx.paths, rel))
+            if base is None:
+                continue
+            png = await self._fit(ctx, spec.page, spec.hash, base, None)
+            if batches.fits(png) is not None:
+                unfit.append(spec)
+                continue
+            pages.append(batches.Planned(spec, png))
+        return pages, unfit
+
     async def _submit_batch(
         self, ctx: AccountContext, specs: Sequence[OcrSpec], mode: BatchMode, now: datetime
     ) -> int | None:
@@ -763,18 +809,12 @@ class OcrRunner:
         ports = self.ports
         assert ports is not None
         worker = self.worker
-        pages: list[batches.Planned] = []
-        unfit: list[OcrSpec] = []
-        for spec in specs:
-            rel = pg.png_relpath(spec.page, spec.hash)
-            base = await asyncio.to_thread(_read_png, pg.resolve_png(ctx.paths, rel))
-            if base is None:
-                continue
-            png = await self._fit(ctx, spec.page, spec.hash, base, None)
-            if batches.fits(png) is not None:
-                unfit.append(spec)
-                continue
-            pages.append(batches.Planned(spec, png))
+        try:
+            pages, unfit = await self._batch_pages(ctx, specs)
+        except (FileNotFoundError, NotFoundError):
+            if await asyncio.to_thread(self._gone, ctx.uid, ctx.acct):
+                return 0  # the account went away under the scan: nothing is sent
+            raise
         planned = batches.plan(pages)
         if len(planned) <= worker.settings.ocr_batch_min:
             return None
