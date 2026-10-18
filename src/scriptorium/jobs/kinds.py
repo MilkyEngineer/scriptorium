@@ -1,0 +1,114 @@
+"""The M1 job kinds, ``render`` and ``page_image``: keys and payloads (§6.2, §8.3).
+
+The server enqueues and the worker runs, so both build keys and read payloads here. A key
+names the version of the work (§6.2): ``render:<acct>:<page>:<hash>`` renders the archive PNG
+of one page version, ``page_image:<acct>:<page>:<hash>:<px>`` renders it for ``page_image``
+at a longest side of ``px``. A deliberate re-run (the PNG cache was lost after the job
+finished) appends ``:after:<previous job id>``.
+
+Payloads hold identifiers only: the document and page UUIDs, the content hash, the
+generation whose files to render, and the size. The worker re-checks every field.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Final
+
+from scriptorium.errors import InvalidArgumentError
+from scriptorium.library.layout import is_sha256, is_uuid
+
+__all__ = [
+    "PAGE_IMAGE",
+    "RENDER",
+    "RENDER_KINDS",
+    "RenderSpec",
+    "page_image_key",
+    "parse_render_payload",
+    "render_key",
+    "rerun_key",
+]
+
+RENDER: Final = "render"
+PAGE_IMAGE: Final = "page_image"
+RENDER_KINDS: Final = (RENDER, PAGE_IMAGE)
+MAX_SIDE_PX: Final = 8192
+"""Largest ``page_image`` longest side a job may ask for."""
+_MAX_GENERATION: Final = 2**62
+
+
+@dataclass(frozen=True, slots=True)
+class RenderSpec:
+    """One page version to render; ``max_side`` is set for ``page_image`` jobs only."""
+
+    document: str
+    page: str
+    hash: str
+    generation: int
+    max_side: int | None = None
+
+    def __post_init__(self) -> None:
+        if not (is_uuid(self.document) and is_uuid(self.page) and is_sha256(self.hash)):
+            raise InvalidArgumentError("render job identifiers are malformed")
+        if type(self.generation) is not int or not 0 <= self.generation < _MAX_GENERATION:
+            raise InvalidArgumentError("render job generation is malformed")
+        if self.max_side is not None and (
+            type(self.max_side) is not int or not 1 <= self.max_side <= MAX_SIDE_PX
+        ):
+            raise InvalidArgumentError("render job size is malformed")
+
+    @property
+    def kind(self) -> str:
+        return RENDER if self.max_side is None else PAGE_IMAGE
+
+    def key(self, acct: str) -> str:
+        if self.max_side is None:
+            return render_key(acct, self.page, self.hash)
+        return page_image_key(acct, self.page, self.hash, self.max_side)
+
+    def payload(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "document": self.document,
+            "page": self.page,
+            "hash": self.hash,
+            "generation": self.generation,
+        }
+        if self.max_side is not None:
+            out["max_side"] = self.max_side
+        return out
+
+
+def render_key(acct: str, page: str, content_hash: str) -> str:
+    return f"{RENDER}:{acct}:{page}:{content_hash}"
+
+
+def page_image_key(acct: str, page: str, content_hash: str, max_side: int) -> str:
+    return f"{PAGE_IMAGE}:{acct}:{page}:{content_hash}:{max_side}"
+
+
+def rerun_key(key: str, previous_job: int) -> str:
+    """The key of a deliberate re-run after job ``previous_job`` (whatever its key)."""
+    base = key.split(":after:", 1)[0]
+    return f"{base}:after:{previous_job}"
+
+
+def parse_render_payload(kind: str, payload: Mapping[str, Any]) -> RenderSpec:
+    """The payload of a ``render`` or ``page_image`` job; ``invalid_argument`` otherwise."""
+    if kind not in RENDER_KINDS:
+        raise InvalidArgumentError("not a render job")
+    required = {"document", "page", "hash", "generation"}
+    if not isinstance(payload, Mapping) or not required <= set(payload):
+        raise InvalidArgumentError("render job payload is malformed")
+    if set(payload) - required - {"max_side"}:
+        raise InvalidArgumentError("render job payload is malformed")
+    max_side = payload.get("max_side")
+    if (kind == PAGE_IMAGE) != (max_side is not None):
+        raise InvalidArgumentError("render job payload is malformed")
+    return RenderSpec(  # every field is checked in __post_init__
+        document=payload["document"],
+        page=payload["page"],
+        hash=payload["hash"],
+        generation=payload["generation"],
+        max_side=max_side,
+    )
