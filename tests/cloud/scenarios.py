@@ -7,7 +7,12 @@ replay the same number of polls against the cassette alone, with no fake behind 
 
 from __future__ import annotations
 
+import hashlib
+import os
+import sqlite3
+import time
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,6 +20,9 @@ from typing import Any
 
 from scriptorium.cloud.client import CloudClient
 from scriptorium.cloud.sync import SyncOnce, SyncReport, SyncSettings
+from scriptorium.library.archive import Archive
+from scriptorium.library.index import Index
+from scriptorium.users.store import AccountPaths, account_paths
 from tests.cloud.fake_cloud import (
     DEVICE_TOKEN,
     NOTEBOOK,
@@ -28,8 +36,6 @@ from tests.cloud.fake_cloud import (
     sha256,
 )
 from tests.fakes.archive import FakeArchive
-from tests.fakes.index import FakeIndex
-from tests.fakes.tombstones import plan
 
 Step = Callable[[FakeCloud], None]
 
@@ -245,6 +251,8 @@ SCENARIOS: dict[str, Scenario] = {
 }
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+UID = "0123456789abcdef"
+ACCT = "01J0000000000000000000000A"
 
 
 @dataclass
@@ -258,21 +266,104 @@ class Clock:
 
 @dataclass
 class Harness:
-    """One account: a client over some transport, a fake archive and a fake index."""
+    """One account: a client over some transport, the real ``Archive`` on a temporary
+    directory and the real SQLite ``Index`` beside it (``FakeArchive`` instead only where a
+    test injects a crash).
+
+    The read helpers look at the account's directories, not at the archive's API, so a test
+    asserts what is on disk. Every poll also checks that no blob ever seen has gone.
+    """
 
     client: CloudClient
-    archive: FakeArchive
-    index: FakeIndex
+    archive: Archive | FakeArchive
+    index: Index
+    paths: AccountPaths
     clock: Clock
     settings: SyncSettings
+    seen_blobs: set[str] = field(default_factory=set)
+    monotonic: Callable[[], float] = field(default_factory=lambda: time.monotonic)
+    """What the poll's time budget is measured with; a test may move it."""
 
     def sync(self) -> SyncOnce:
         return SyncOnce(
-            self.client, self.archive, self.index, self.settings, self.clock, planner=plan
+            self.client,
+            self.archive,
+            self.index,
+            self.settings,
+            self.clock,
+            monotonic=self.monotonic,
         )
 
     def poll(self) -> SyncReport:
-        return self.sync().run()
+        try:
+            return self.sync().run()
+        finally:
+            blobs = self.blob_names()
+            assert self.seen_blobs <= blobs, "a blob disappeared"
+            self.seen_blobs |= blobs
+
+    def close(self) -> None:
+        self.client.close()
+        self.index.close()
+
+    # ---- what is on disk ------------------------------------------------------------------
+
+    def blob_names(self) -> set[str]:
+        return {p.name for p in self.paths.blobs.iterdir()} if self.paths.blobs.is_dir() else set()
+
+    def library_uuids(self) -> set[str]:
+        """Documents with entries in ``library/`` (``.holding`` and other dot names skipped)."""
+        if isinstance(self.archive, FakeArchive):
+            return set(self.archive.library)
+        return {n[:36] for n in os.listdir(self.paths.library) if not n.startswith(".")}
+
+    def library_files(self, uuid: str) -> dict[str, str]:
+        """xochitl name -> SHA-256 of the file's content, as the archive reads them."""
+        return {name: _sha(path) for name, path in self.archive.current_files(uuid).items()}
+
+    def tombstoned_uuids(self) -> set[str]:
+        if isinstance(self.archive, FakeArchive):
+            return set(self.archive.tombstones)
+        return {p.name for p in self.paths.tombstones.iterdir() if any(p.iterdir())}
+
+    def tombstone_files(self, uuid: str) -> dict[str, str]:
+        return _tree(self.paths.tombstones / uuid)
+
+    def held(self) -> list[tuple[str, str, dict[str, str]]]:
+        """``(uuid, label, files)`` for every superseded version in ``library/.holding``."""
+        root = self.paths.library / ".holding"
+        if not root.is_dir():
+            return []
+        return [
+            (doc.name, label.name, _tree(label))
+            for doc in sorted(root.iterdir())
+            for label in sorted(doc.iterdir())
+        ]
+
+    # ---- what is in the index -----------------------------------------------------------
+
+    def history_of(self, uuid: str) -> list[tuple[int, str]]:
+        """``(generation, hash_root)`` oldest first."""
+        return sorted((row.generation, row.hash_root) for row in self.index.history(uuid))
+
+    def state(self, key: str) -> str | None:
+        return self.index.get_state(key)
+
+    def sync_state(self) -> dict[str, str]:
+        """Every ``sync_state`` row, read through a second connection."""
+        with closing(sqlite3.connect(self.paths.index)) as conn:
+            return dict(conn.execute("SELECT k, v FROM sync_state").fetchall())
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _tree(top: Path) -> dict[str, str]:
+    """Relative POSIX path -> SHA-256 for every file below ``top``."""
+    if not top.is_dir():
+        return {}
+    return {p.relative_to(top).as_posix(): _sha(p) for p in top.rglob("*") if p.is_file()}
 
 
 def harness(
@@ -281,14 +372,21 @@ def harness(
     *,
     client: dict[str, Any] | None = None,
     settings: SyncSettings | None = None,
+    fake_archive: bool = False,
 ) -> Harness:
+    """A fresh account under ``tmp``. ``fake_archive=True`` is for crash injection only."""
+    paths = account_paths(tmp / "data", UID, ACCT)
+    paths.root.mkdir(parents=True)
+    archive: Archive | FakeArchive = FakeArchive(paths.root) if fake_archive else Archive(paths)
+    clock = Clock()
     return Harness(
         client=CloudClient(
             DEVICE_TOKEN, cache_dir=tmp / "cache", transport=transport, **(client or {})
         ),
-        archive=FakeArchive(tmp / "account"),
-        index=FakeIndex(),
-        clock=Clock(),
+        archive=archive,
+        index=Index.open(paths.index, migrate=True),
+        paths=paths,
+        clock=clock,
         # One blob worker: a deterministic request order for recording.
         settings=settings or SyncSettings(sync_workers=1),
     )

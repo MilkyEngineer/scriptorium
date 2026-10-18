@@ -9,6 +9,10 @@ rules the fake applies them too: ``commit`` refuses an empty file set, the bare 
 a name of another document and a missing blob; ``tombstone`` and ``untombstone`` are no-ops
 when there is nothing to move. ``inject`` raises an exception (usually
 :class:`SimulatedCrash`, standing in for SIGKILL) at a named point.
+
+The cloud tests run against the real ``Archive``; this fake is kept only for the
+crash-injection tests (``tests/cloud/test_sync.py``), which need a process to die between
+two archive calls, and stays importable for other workstreams.
 """
 
 from __future__ import annotations
@@ -21,9 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
-# Until A's layout module is merged, the mirror in cloud/ports.py is the allowlist.
-from scriptorium.cloud.ports import is_safe_name
 from scriptorium.errors import RefusedError
+from scriptorium.library.layout import is_safe_name
 
 _UUID_LEN = 36
 

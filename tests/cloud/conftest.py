@@ -33,7 +33,9 @@ def _guard(real: Callable[..., Any], name: str) -> Callable[..., Any]:
 
 @pytest.fixture(autouse=True)
 def _never_delete_archive(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("unlink", "remove", "rmdir"):
+    # os.rmdir is not guarded: it only ever removes an empty directory, which the real
+    # archive does to tidy tombstones/<uuid>/ after an un-tombstone.
+    for name in ("unlink", "remove"):
         monkeypatch.setattr(os, name, _guard(getattr(os, name), f"os.{name}"))
     monkeypatch.setattr(shutil, "rmtree", _guard(shutil.rmtree, "shutil.rmtree"))
 

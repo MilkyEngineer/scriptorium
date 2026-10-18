@@ -28,6 +28,17 @@
    an unparseable root is ``anomaly="protocol"``. ``needs_relink`` (three rejections in
    a row) and the backoff schedule are the worker's decisions, made from the report.
 
+**Budgets.** A poll downloads at most ``sync_max_poll_bytes`` of blobs and keeps starting
+work for at most ``sync_max_poll_seconds``. Both are checked before each document index,
+document and blob is started; once either is spent the poll starts nothing new, keeps what
+it has committed, and ends ``partial`` with reason ``byte_budget`` or ``time_budget``. The
+document in progress is not committed, but the blobs it fetched stay (they are
+content-addressed), so the next poll resumes where this one stopped. The byte check passes
+while nothing has been downloaded, so a poll with time left always fetches at least one blob.
+
+A poll that ends early for any reason (a budget, ``backoff``, ``token_rejected``) applies
+no tombstones: deletions wait for a poll that ran to the end.
+
 A root identical to the last fully processed one (same hash) is a complete listing of the
 same documents, so the planner still runs on it: that is what lets a deletion on a quiet
 account reach its second consecutive listing.
@@ -42,6 +53,7 @@ import io
 import json
 import logging
 import secrets
+import threading
 import time
 import unicodedata
 from collections.abc import Callable, Mapping
@@ -121,12 +133,20 @@ class SyncSettings:
     aged_after: timedelta = timedelta(days=50)
     acct: str | None = None
     """Account ULID, for log lines only."""
+    sync_max_poll_bytes: int = 2 * 1024**3
+    """``SCRIPTORIUM_SYNC_MAX_POLL_BYTES``: blob bytes one poll may download (2 GiB)."""
+    sync_max_poll_seconds: int = 20 * 60
+    """``SCRIPTORIUM_SYNC_MAX_POLL_SECONDS``: how long one poll may keep starting work."""
 
     def __post_init__(self) -> None:
         if self.tombstone_max_per_poll < 0:
             raise ValueError("tombstone_max_per_poll must not be negative")
         if not 1 <= self.sync_workers <= 64:
             raise ValueError("sync_workers must be between 1 and 64")
+        if self.sync_max_poll_bytes <= 0:
+            raise ValueError("sync_max_poll_bytes must be positive")
+        if self.sync_max_poll_seconds <= 0:
+            raise ValueError("sync_max_poll_seconds must be positive")
 
 
 @dataclass(frozen=True)
@@ -162,9 +182,18 @@ class SyncReport:
     """This poll consumed an administrator's ``allow_mass_delete`` approval."""
 
 
+class _BudgetSpentError(Exception):
+    """Raised before starting work once the poll's byte or time budget is spent."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class _Stop:
-    """Why a poll ended early: ``backoff`` or ``token_rejected``. Returned, never raised."""
+    """Why a poll ended early: ``backoff``, ``token_rejected``, or ``partial`` when a budget
+    is spent. Returned, never raised."""
 
     outcome: SyncOutcome
     reason: str
@@ -228,6 +257,7 @@ class SyncOnce:
         clock: Callable[[], datetime],
         *,
         planner: Planner | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = client
         self._archive = archive
@@ -235,11 +265,13 @@ class SyncOnce:
         self._settings = settings
         self._clock = clock
         self._planner = planner if planner is not None else default_planner()
+        self._monotonic = monotonic
+        self._lock = threading.Lock()  # the run's download counters, across blob workers
 
     # ---- the poll ------------------------------------------------------------------------
 
     def run(self) -> SyncReport:
-        run = _Run(started_at=self._clock(), started_mono=time.monotonic())
+        run = _Run(started_at=self._clock(), started_mono=self._monotonic())
         anomaly = self._index.get_state(STATE_ANOMALY)
         if anomaly:
             run.anomaly = anomaly
@@ -331,7 +363,7 @@ class SyncOnce:
                 blocked = self._untombstone(plan.to_untombstone, run)
                 entries = {entry.uuid: entry for entry in root.entries}
                 stop = self._commit_all(root, entries, indexes, blocked, run)
-                if plan.to_tombstone:
+                if plan.to_tombstone and stop is None:
                     self._tombstone(plan.to_tombstone, run)
 
         fully_done = complete and stop is None and not run.failed and run.anomaly is None
@@ -382,6 +414,10 @@ class SyncOnce:
                 run.documents_unchanged += 1
                 continue
             try:
+                self._check_budget(run)
+            except _BudgetSpentError as exc:
+                return _Stop("partial", exc.reason)
+            try:
                 doc_index = self._client.document_index(entry.uuid, entry.hash)
             except (TokenRejectedError, RateLimitedError) as exc:
                 return _Stop.from_error(exc)
@@ -414,7 +450,12 @@ class SyncOnce:
             if uuid in blocked:
                 continue
             try:
+                self._check_budget(run)
                 self._commit_one(root, entries[uuid], indexes[uuid], run)
+            except _BudgetSpentError as exc:
+                # Not a failure of this document: it is left for the next poll, and the
+                # blobs it already fetched stay in blobs/.
+                return _Stop("partial", exc.reason)
             except (TokenRejectedError, RateLimitedError) as exc:
                 self._fail(run, uuid, exc.reason)
                 return _Stop.from_error(exc)
@@ -491,28 +532,38 @@ class SyncOnce:
         workers = min(self._settings.sync_workers, len(missing))
         if workers <= 1:
             for sha, name, size in missing:
-                self._count(run, self._fetch_one(sha, name, size))
+                self._fetch_one(sha, name, size, run)
             return
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sync-blob") as pool:
-            futures = [pool.submit(self._fetch_one, sha, name, size) for sha, name, size in missing]
+            futures = [
+                pool.submit(self._fetch_one, sha, name, size, run) for sha, name, size in missing
+            ]
             try:
                 for future in as_completed(futures):
-                    self._count(run, future.result())
+                    future.result()
             except BaseException:
                 for future in futures:
                     future.cancel()
                 raise
 
-    def _fetch_one(self, sha256: str, name: str, size: int) -> int:
-        """Download one blob into ``blobs/``; returns its actual size (``size`` is a cap)."""
+    def _fetch_one(self, sha256: str, name: str, size: int, run: _Run) -> None:
+        """Download one blob into ``blobs/`` (``size`` is a cap) and count what it took."""
+        self._check_budget(run)
         with self._client.open_blob(sha256, max_bytes=size, filename=name) as stream:
             path = self._archive.put_blob(sha256, stream)
-        return path.stat().st_size
+        actual = path.stat().st_size
+        with self._lock:
+            run.blobs_downloaded += 1
+            run.bytes_downloaded += actual
 
-    @staticmethod
-    def _count(run: _Run, size: int) -> None:
-        run.blobs_downloaded += 1
-        run.bytes_downloaded += size
+    def _check_budget(self, run: _Run) -> None:
+        """Raise :class:`_BudgetSpentError` once this poll's bytes or time are used up."""
+        with self._lock:
+            spent = run.bytes_downloaded
+        if spent >= self._settings.sync_max_poll_bytes:
+            raise _BudgetSpentError("byte_budget")
+        if self._monotonic() - run.started_mono >= self._settings.sync_max_poll_seconds:
+            raise _BudgetSpentError("time_budget")
 
     # ---- the documents row -----------------------------------------------------------------
 
@@ -674,7 +725,7 @@ class SyncOnce:
             reason=reason,
             count=len(run.committed),
             bytes=run.bytes_downloaded,
-            duration_ms=round((time.monotonic() - run.started_mono) * 1000, 1),
+            duration_ms=round((self._monotonic() - run.started_mono) * 1000, 1),
         )
         return report
 
