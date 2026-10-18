@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -305,6 +306,42 @@ async def test_a_failed_move_leaves_the_archive_readable(
     assert linked.paths.root.is_dir()
     listed = await library.ok("list", {"account": linked.acct})
     assert {item["uuid"] for item in listed["items"]} == {NOTEBOOK, PDF}
+    # Once the cause is fixed, a new dry run and execute finish the job.
+    monkeypatch.undo()
+    done = await _execute(library, (await _dry_run(library))["confirmation_token"])
+    assert done["removed"] is True and not linked.paths.root.exists()
+
+
+async def test_a_failure_before_the_move_puts_the_account_back(
+    library: Served, linked: Linked, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(box: object, name: str) -> None:
+        raise OSError("synthetic")
+
+    monkeypatch.setattr(SecretBox, "forget", fail)
+    failed = await _execute(library, (await _dry_run(library))["confirmation_token"])
+
+    assert (failed["code"], failed["reason"]) == ("refused", "move_failed")
+    row = linked.store.account(linked.uid, linked.acct)
+    assert row is not None and row.removed_at is None  # never removed with its directory here
+    assert linked.paths.root.is_dir()
+    monkeypatch.undo()
+    done = await _execute(library, (await _dry_run(library))["confirmation_token"])
+    assert done["removed"] is True
+    assert SecretBox(linked.settings, linked.uid).open(device_token_name(linked.acct)) is None
+
+
+async def test_a_removal_waits_for_a_connect_of_the_same_user(
+    library: Served, linked: Linked
+) -> None:
+    token = (await _dry_run(library))["confirmation_token"]
+    async with library.services.connect_lock(linked.uid):
+        pending = asyncio.create_task(_execute(library, token))
+        await asyncio.sleep(0.3)
+        assert not pending.done()
+        assert linked.paths.root.is_dir()
+    done = await pending
+    assert done["removed"] is True
 
 
 async def test_an_archive_kept_at_disconnect_can_be_removed_later(

@@ -22,6 +22,7 @@ import logging
 import os
 import stat
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Final, Literal
@@ -323,7 +324,18 @@ def _busy() -> ToolError:
     )
 
 
-def _remove(svc: Services, user: User, token: str) -> dict[str, object]:
+@dataclass(frozen=True)
+class _Removal:
+    """A verified execute step: the account it removes and when it was asked."""
+
+    uid: str
+    row: AccountRow
+    paths: AccountPaths
+    token: str
+    now: datetime
+
+
+def _removal_checked(svc: Services, user: User, token: str) -> _Removal:
     refuse_spent_token(svc.store, token)  # before the target: a used token's account is gone
     uid, row = _removal_target(svc, user)
     now = svc.clock()
@@ -331,28 +343,45 @@ def _remove(svc: Services, user: User, token: str) -> dict[str, object]:
         svc.settings, token, uid=uid, tool=REMOVE_TOOL, args=_bound_args(row.acct), now=now
     )
     paths = account_paths(svc.settings.data_dir, uid, row.acct)
-    deadline = time.monotonic() + REMOVE_LOCK_WAIT_S
-    while True:
-        # Not blocking: a long first sync would otherwise hold this thread for its duration.
-        with poll_lock(paths, blocking=False) as state:
-            if state == "held":
-                return _remove_locked(svc, uid, row, paths, token, now)
-            if state == "gone":
-                raise ToolError(
-                    ErrorCode.REFUSED,
-                    "This account's archive is not where it should be.",
-                    "Call account_status; if the account is still listed, ask the operator "
-                    "to check the server.",
-                )
-        if time.monotonic() >= deadline:
-            raise _busy()  # the token is not spent: it can be used again
-        time.sleep(_REMOVE_LOCK_STEP_S)
+    return _Removal(uid, row, paths, token, now)
 
 
-def _remove_locked(
-    svc: Services, uid: str, row: AccountRow, paths: AccountPaths, token: str, now: datetime
-) -> dict[str, object]:
+def _try_remove(svc: Services, removal: _Removal) -> dict[str, object] | None:
+    """Remove the account if no poll holds its lock; None if one does (nothing changed)."""
+    # Not blocking: a long first sync would otherwise hold a pool thread for its duration.
+    with poll_lock(removal.paths, blocking=False) as state:
+        if state == "held":
+            return _remove_locked(svc, removal)
+        if state == "gone":
+            raise ToolError(
+                ErrorCode.REFUSED,
+                "This account's archive is not where it should be.",
+                "Call account_status; if the account is still listed, ask the operator "
+                "to check the server.",
+            )
+    return None
+
+
+async def _remove(svc: Services, user: User, token: str) -> dict[str, object]:
+    """The execute step, under the user's connect lock (so a concurrent connect_remarkable
+    cannot seal a token for the account being removed, and one user runs one removal at a
+    time). While a poll runs, it waits on the event loop, not in a pool thread."""
+    uid = await asyncio.to_thread(svc.uid, user)
+    async with svc.connect_lock(uid):
+        removal = await asyncio.to_thread(_removal_checked, svc, user, token)
+        deadline = time.monotonic() + REMOVE_LOCK_WAIT_S
+        while True:
+            payload = await asyncio.to_thread(_try_remove, svc, removal)
+            if payload is not None:
+                return payload
+            if time.monotonic() >= deadline:
+                raise _busy()  # the token is not spent: it can be used again
+            await asyncio.sleep(_REMOVE_LOCK_STEP_S)
+
+
+def _remove_locked(svc: Services, removal: _Removal) -> dict[str, object]:
     """Under the poll lock: no poll runs and none starts until the directory has moved."""
+    uid, row, paths, now = removal.uid, removal.row, removal.paths, removal.now
     try:
         destination = removal_destination(svc.settings.data_dir, uid, row.acct, at=now)
     except RefusedError:
@@ -361,15 +390,16 @@ def _remove_locked(
             "This account's archive cannot be moved aside on this server.",
             "Nothing was changed. Ask the operator to check the server logs.",
         ) from None
-    spend_confirmation_token(svc.store, token, now=now)
+    spend_confirmation_token(svc.store, removal.token, now=now)
     # Removed before the move, so nothing reopens the account (and recreates its directory)
-    # meanwhile; the token goes with it, as on any disconnect.
+    # meanwhile; the token goes with it, as on any disconnect. Any failure from here on
+    # puts the account back, so it is never left removed with its directory in place.
     svc.store.mark_removed(uid, row.acct, at=now)
-    SecretBox(svc.settings, uid).forget(device_token_name(row.acct))
-    svc.evict_index(uid, row.acct)
     try:
+        SecretBox(svc.settings, uid).forget(device_token_name(row.acct))
+        svc.evict_index(uid, row.acct)
         move_aside(paths, destination)
-    except OSError as exc:
+    except Exception as exc:
         svc.store.unmark_removed(uid, row.acct)
         log_event(
             logger,
@@ -381,7 +411,8 @@ def _remove_locked(
         raise ToolError(
             ErrorCode.REFUSED,
             "The account was disconnected, but its archive could not be moved.",
-            "It stays readable with list(account=...). Ask the operator to check the logs.",
+            "It stays readable with list(account=...). Call disconnect_remarkable with "
+            "keep_archive=false again to retry, or ask the operator to check the logs.",
             extra={"reason": "move_failed"},
         ) from None
     log_event(logger, "account_moved", acct=row.acct)
@@ -418,7 +449,7 @@ async def disconnect_remarkable(ctx: ToolContext, args: DisconnectArgs) -> CallT
     if args.confirmation_token is None:
         payload = await asyncio.to_thread(_removal_dry_run, svc, ctx.user)
     else:
-        payload = await asyncio.to_thread(_remove, svc, ctx.user, args.confirmation_token)
+        payload = await _remove(svc, ctx.user, args.confirmation_token)
     ctx.audit["acct"] = payload["account"]
     return json_result(payload, cap=RESULT_CAP_BYTES)
 
