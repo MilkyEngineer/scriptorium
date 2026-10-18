@@ -119,7 +119,10 @@ jobs:
           docker run --rm --read-only --tmpfs /tmp scriptorium:ci worker || status=$?
           test "$status" -eq 2
           key="$(docker run --rm --read-only --tmpfs /tmp scriptorium:ci gen-master-key)"
+          # /data must be a real local filesystem (the server refuses overlay), so the
+          # smoke container gets a named volume, as compose gives it a host directory.
           docker run -d --name smoke --read-only --tmpfs /tmp -p 127.0.0.1:8000:8000 \
+            -v scriptorium-ci-data:/data \
             -e SCRIPTORIUM_PUBLIC_URL=http://localhost:8000/mcp \
             -e SCRIPTORIUM_OIDC_ISSUER=https://auth.example.com/realms/ci \
             -e SCRIPTORIUM_OIDC_ALLOWED_USERS=ci-user \

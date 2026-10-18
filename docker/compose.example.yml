@@ -66,9 +66,13 @@ services:
     # Let a running download/commit finish before SIGKILL.
     stop_grace_period: 60s
     healthcheck:
-      # The worker has no listener; its heartbeat check (§13) arrives with the worker
-      # itself. Until then the image's /healthz probe must not run for this service.
-      disable: true
+      # The worker has no listener: it rewrites /data/worker.heartbeat every 30 s and
+      # this probe fails once that file is older than 3 minutes.
+      test: ["CMD", "scriptorium", "healthcheck", "--worker"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   # ---- optional: only if you have no OIDC issuer.  `docker compose --profile keycloak up -d` ----
   keycloak:

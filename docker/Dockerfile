@@ -88,7 +88,7 @@ USER ${PUID}:${PGID}
 EXPOSE 8000
 
 # Probes /healthz on the local listener. The worker has no listener: compose
-# overrides (or disables) the healthcheck for the worker service.
+# overrides the healthcheck for the worker service with `healthcheck --worker`.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["scriptorium", "healthcheck"]
 

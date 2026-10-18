@@ -622,9 +622,9 @@ async def test_client_ip_on_request_state(issuer: FakeIssuer) -> None:
 # ---- the command line (serve's entry point) -----------------------------------------------
 
 
-def test_worker_is_a_stub(capsys: pytest.CaptureFixture[str]) -> None:
-    assert cli.main(["worker"]) == 2
-    assert "not implemented" in capsys.readouterr().err
+def test_worker_refuses_bad_config(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["worker"]) == 2  # the environment is empty under test
+    assert "SCRIPTORIUM_PUBLIC_URL" in capsys.readouterr().err
 
 
 def test_gen_master_key_is_a_fernet_key(capsys: pytest.CaptureFixture[str]) -> None:
