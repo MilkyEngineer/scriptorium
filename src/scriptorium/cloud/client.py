@@ -424,8 +424,18 @@ class CloudClient:
 
     @staticmethod
     def _check_length(response: httpx.Response, limit: int, what: str) -> None:
+        """Refuse a body whose declared length is over ``limit`` before reading any of it.
+
+        The header is the cloud's (attacker-controlled): only plain ASCII digits count, and
+        they are compared by length before ``int`` (whose digit limit and Unicode digits,
+        such as a Latin-1 superscript, would otherwise raise). Anything else is ignored; the
+        streamed read enforces ``limit`` regardless.
+        """
         declared = response.headers.get("content-length")
-        if declared is not None and declared.isdigit() and int(declared) > limit:
+        if declared is None or not (declared.isascii() and declared.isdigit()):
+            return
+        digits = declared.lstrip("0")
+        if len(digits) > len(str(limit)) or (digits and int(digits) > limit):
             raise ResponseTooLargeError(f"{what} is larger than {limit} bytes")
 
     def _read(self, response: httpx.Response, limit: int, what: str) -> bytes:

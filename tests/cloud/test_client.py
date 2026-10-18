@@ -294,6 +294,24 @@ def test_a_declared_content_length_over_the_cap_is_refused_up_front(
         make(cloud, tmp_path).root()
 
 
+@pytest.mark.parametrize("declared", ["1" * 25, "1" * 5000, "0" * 40 + str(10**9)])
+def test_a_long_declared_length_is_refused_without_parsing_it_whole(
+    tmp_path: Path, cloud: FakeCloud, declared: str
+) -> None:
+    cloud.headers[cloud.root_hash] = {"content-length": declared}
+    with pytest.raises(ResponseTooLargeError):
+        make(cloud, tmp_path).root()
+
+
+@pytest.mark.parametrize("declared", ["\N{SUPERSCRIPT TWO}", "-1", "1e9", " ", "0" * 40])
+def test_a_malformed_declared_length_is_ignored(
+    tmp_path: Path, cloud: FakeCloud, declared: str
+) -> None:
+    # Latin-1 bytes reach the header as text (a superscript two passes str.isdigit).
+    cloud.headers[cloud.root_hash] = {"content-length": declared.encode("latin-1")}  # type: ignore[dict-item]
+    assert make(cloud, tmp_path).root().entries  # the streamed read's own limit decides
+
+
 def test_too_many_root_entries_are_refused(tmp_path: Path, cloud: FakeCloud) -> None:
     with pytest.raises(ResponseTooLargeError):
         make(cloud, tmp_path, max_root_entries=1).root()
