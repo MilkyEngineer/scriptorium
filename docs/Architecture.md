@@ -301,7 +301,7 @@ All state under one volume, `/data`. `/data` must be a local POSIX filesystem (e
         <uuid>.textconversion/<page-uuid>.json  # the tablet's handwriting conversion
         .holding/<uuid>/<generation>/           # superseded entries of the same shapes; never unlinked
       tombstones/<uuid>/          # same layout (all of the above); moved here when the document leaves the cloud; NEVER auto-purged
-      pages/<uuid>/<page-uuid>.png
+      pages/<page-uuid>/<content-hash>.png        # archive render, 1×; <content-hash>.<N>px.png = cached downscales (§8.3)
       staging/<uuid>.<job>/       # in-progress downloads; swept on worker start
       index.sqlite                # documents, pages, history, transcripts, FTS5, links
   snapshots/                      # read-only mount of host snapshots (zfs/btrfs), or the restic cache
@@ -379,7 +379,7 @@ When a user links an account and neither key applies, `account_status` and the f
 
 ### 8.2 Transcription contract
 
-- Input: the page PNG (§8.3), the prompt from `src/scriptorium/ocr/prompt.md` (versioned; the version is stored with the transcript). Output: Markdown.
+- Input: the page PNG (§8.3), the prompt from `src/scriptorium/ocr/prompt.md` (versioned; the version is stored with the transcript). Output: Markdown. The lazy-mode instruction that `read_page` returns with the image is `tools/ocr.py:LAZY_INSTRUCTION`.
 - Rules in the prompt: verbatim text, keep structure (headings, lists, `- [ ]` for boxes and arrows, tables where ruled), `[?]` for illegible words, describe sketches in one bracketed line, never summarise.
 - Model: `OCR_MODEL` (default `claude-sonnet-5-5`); `max_tokens` 4096; extended thinking off, or the lowest effort setting the model accepts; 3 retries with backoff on 429/529.
 - Cache key: `(page uuid, content_hash)`. Re-transcription only when the hash changes or `transcribe(force=true)`.
@@ -390,7 +390,7 @@ When a user links an account and neither key applies, `account_status` and the f
 Paper Pro Move geometry (verified in **S3**, `docs/Spikes/S3.md`): the panel is 954 × 1696 px; `.rm` v6 strokes are in **device-independent units** with x centred on 0 and y from the top, where the Move's screen spans 820 × 1458 units (`SceneInfo.paper_size`), i.e. 954/820 ≈ 1.163 px per unit, the same physical unit as earlier devices (≈ 226 per inch). Ink is **not confined to the paper rectangle**: a scrolled page extends below 1458 and a zoomed-out page extends beyond ±410, so the renderer always draws the union of the paper rectangle and the ink bounding box. Annotated PDFs are different again: the PDF page is laid out at its physical size, **1 pt = 226/72 units**, origin at the page's top centre (a Letter page is 1921 × 2486 units), and the `.rm` for such pages reports the legacy 1404 × 1872 paper size, which must be ignored. Colours: strokes may carry an explicit RGBA (`color_rgba`) that overrides the palette id; highlighters and the shader blend with multiply. Rendering targets:
 
 - Archive PNG (`pages/`): native 1× (1.163 px per unit; 954 × 1696 px for an unscrolled page, taller or wider when the ink extends), which also satisfies the Claude API's 2576 px limit for ordinary pages and costs about 2.2 k image tokens per page; pages whose extent exceeds 2576 px are downscaled for OCR only.
-- `page_image(scale)`: `scale ∈ [0.25, 2]` at the tool (the library accepts 0.1–4), rendered on demand from the `.rm`, downscaled to a longest side of 1024 px (`page_image_bytes`, Lanczos, deterministic) and cached by `(hash, scale)`.
+- `page_image(scale)`: `scale ∈ [0.25, 2]` at the tool, snapped to steps of 0.25, so there are eight sizes with a longest side of 256–2048 px (default 1024 px); a free-form scale would let one user mint unbounded cache files and render jobs. When the archive PNG is at least that large the server downscales it (`page_image_bytes`, Lanczos, deterministic) under a two-slot semaphore and caches the result as `pages/<page>/<hash>.<N>px.png`; otherwise a worker `page_image` job renders at that scale. `read_page`'s OCR copy (longest side ≤ 2576 px) is cached the same way. The server only ever decodes PNGs the worker wrote, refuses by header any PNG above the renderer's canvas budget, and never renders from `.rm` itself. A missing render is enqueued (dedupe `render:<acct>:<page>:<hash>`); the tool waits `PENDING_WAIT_SECONDS` then answers `pending` with the job id; a dead job answers `refused`.
 - Templates (grids, lines) are not in the document store, so backgrounds render blank; a bundled set of the stock templates may be layered later (MIT-compatible sources only).
 - Layers are composited in order; highlighter uses multiply blending; extended-height and zoomed-out pages render at their full extent, the ink bounding box grown by a 20-unit margin before it is unioned with the page rectangle (the S3 goldens depend on that margin). Golden PNGs for the S3 fixture live in `tests/fixtures/move-test-notebook/golden/`.
 - Annotated PDFs (`library/render.py`, byte-identical to the S3 reference): the caller cuts the one page out with `extract_pdf_page` so only a single-page PDF crosses into the render pool; pypdfium2 rasterises it at 226/72 × 1.163 × scale px per point and the raster is Lanczos-resized to the exact pixel size of the page rectangle; the ink is rasterised by resvg with the viewBox in units; highlighter and shader strokes multiply with the page so PDF text stays readable under them, and all other ink is alpha-composited over it. `render_pdf_page` uses the same geometry without ink, so a page is the same size whether or not it carries annotations. PDFs that do not embed their fonts render with PDFium's built-in substitutes; the image ships no extra fonts, so such text can look different from the tablet (S3 records the measured effect).
@@ -449,7 +449,7 @@ What restore cannot bring back: device settings, Wi-Fi, templates, splash screen
 ### 11.0 Conventions (binding for every tool)
 
 - **User context** comes from the bearer token; no tool accepts a user id or a filesystem path. `tools/list` is filtered per request (admin tools, `push_ink`).
-- **Document identifiers**: a UUID, or a `/`-separated path of visible names from the root (`Notes/Projects/2026-10`). Ambiguous paths return `ambiguous` with the candidate UUIDs. Folders likewise. Cloud-supplied names are display data only; filesystem names are always UUIDs plus one fixed xochitl suffix. The allowlist is `SAFE_NAME_PATTERN` in `library/layout.py`, matched against the whole string with `re.fullmatch` (a `$` anchor would let a trailing newline through): `(?P<doc>[0-9a-f-]{36})(?:\.(?:metadata|content|pagedata|pdf|epub)|/[0-9a-f-]{36}(?:\.rm|-metadata\.json)|\.highlights/[0-9a-f-]{36}\.json|\.thumbnails/[0-9a-f-]{36}\.(?:png|jpg)|\.textconversion/[0-9a-f-]{36}\.json)?`. Any other name in a document index is skipped and counted, never stored (`<uuid>.local`, `.epubindex` and `.cache/` have not been seen in a cloud index; add them here first if they appear). Every resolved path is asserted to stay inside the account root.
+- **Document identifiers**: a UUID, or a `/`-separated path of visible names from the root (`Notes/Projects/2026-10`). Ambiguous paths return `ambiguous` with up to 20 candidate UUIDs (identifiers only, never names). Folders likewise. A page number outside the document returns `invalid_argument` with the page count. Cloud-supplied names are display data only; filesystem names are always UUIDs plus one fixed xochitl suffix. The allowlist is `SAFE_NAME_PATTERN` in `library/layout.py`, matched against the whole string with `re.fullmatch` (a `$` anchor would let a trailing newline through): `(?P<doc>[0-9a-f-]{36})(?:\.(?:metadata|content|pagedata|pdf|epub)|/[0-9a-f-]{36}(?:\.rm|-metadata\.json)|\.highlights/[0-9a-f-]{36}\.json|\.thumbnails/[0-9a-f-]{36}\.(?:png|jpg)|\.textconversion/[0-9a-f-]{36}\.json)?`. Any other name in a document index is skipped and counted, never stored (`<uuid>.local`, `.epubindex` and `.cache/` have not been seen in a cloud index; add them here first if they appear). Every resolved path is asserted to stay inside the account root.
 - **Pages** are 1-based in every tool.
 - **Pagination**: list-like tools take `limit` (≤ 100, default 50) and `cursor`, and return `next_cursor`. Text results are capped at 32 KB (Claude Code persists results of about 64 KB to a file and shows the model a 2 KB preview; S6); `read_document` paginates by page range.
 - **Timestamps** are ISO 8601 UTC in and out.
@@ -463,8 +463,8 @@ What restore cannot bring back: device settings, Wi-Fi, templates, splash screen
 
 | Tool | Purpose |
 | --- | --- |
-| `connect_remarkable(code, replace=false)` | Exchange a one-time code from https://my.remarkable.com/device/browser/connect for a device token; store encrypted; start polling. Refuses if that cloud account is linked to another user, or if this user already has an active account and `replace` is false. Each call registers a new device at reMarkable; the tool says so and points at the device list there. |
-| `disconnect_remarkable(keep_archive=true, confirmation_token=null)` | Stop polling and delete the device token locally. Scriptorium cannot revoke it at reMarkable; the response tells the user to remove the device at my.remarkable.com. |
+| `connect_remarkable(code, replace=false)` | Exchange a one-time code from https://my.remarkable.com/device/browser/connect for a device token; store encrypted; start polling. Refuses if that cloud account is linked to another user, or if this user already has an active account and `replace` is false. Each call registers a new device at reMarkable; the tool says so and points at the device list there. The token is sealed only after the link is recorded; with `replace=true` the replaced account is deactivated in the same transaction, its device token is forgotten, and the reply tells the user to remove the old device too. |
+| `disconnect_remarkable(keep_archive=true, confirmation_token=null)` | Stop polling and delete the device token locally; the archive stays. Scriptorium cannot revoke it at reMarkable; the response tells the user to remove the device at my.remarkable.com. `keep_archive=false` is `refused` until the confirmation-token flow exists (M2); passing a token meanwhile is `invalid_argument`. |
 | `account_status()` | Link state, last successful sync, document/page counts, OCR mode and spend, quota usage, pending jobs, warnings (`needs_relink`, `anomaly`, render failures). |
 | `set_claude_api_key(key, monthly_cap_usd=null)` / `clear_claude_api_key()` | Per-user OCR key (encrypted). |
 | `set_auto_ocr(folders: [id], enabled)` | Folders to transcribe automatically. |
@@ -478,10 +478,10 @@ What restore cannot bring back: device settings, Wi-Fi, templates, splash screen
 | `list(folder=null, include_trash=false, include_deleted=false, account=null, cursor, limit)` | Children of a folder (root by default): name, type, uuid, modified, page count, state. |
 | `recent(since, limit, cursor)` | Documents/pages changed since a timestamp. |
 | `search(query, folder=null, limit, cursor)` | FTS over transcripts, names and paths; returns page refs with snippets (the "current" flag says whether the hit is the page's present version). Only transcribed pages are in the FTS index, so documents with no transcript are matched by name (case-insensitive substring over `documents`) and returned as document refs after the page hits. Every whitespace-separated term is quoted: FTS5 operators are never interpreted. |
-| `read_page(document, page)` | Transcript (triggers OCR per mode on cache miss; in lazy mode returns the image and asks the client to transcribe). |
-| `read_document(document, format="markdown" \| "pdf", pages=null)` | Whole document: sectioned Markdown of transcripts (paginated), or a rendered PDF via signed download URL. |
-| `page_image(document, page, scale=1)` | PNG of the page for Claude to look at (an image block, which every client delivers to the model), plus a Markdown `/dl/` link with a filename for the person, because claude.ai mobile shows image blocks as text and resource links are invisible on claude.ai, Desktop and mobile (S6). Default size about 200 KB (longest side 1024 px). |
-| `versions(document)` / `read_page(document, page, version=<generation>)` | Version history (§6). |
+| `read_page(document, page, version=null)` | Transcript when one exists (≤ 30 KB so it fits the 32 KB result cap); otherwise triggers OCR per mode, and in lazy mode returns the image (longest side ≤ 2576 px) with the lazy instruction. |
+| `read_document(document, format="markdown" \| "pdf", pages=null)` | Whole document: sectioned Markdown of transcripts (paginated), or a rendered PDF via signed download URL (`format="pdf"` is `invalid_argument` until M3). |
+| `page_image(document, page, scale=1)` | PNG of the page for Claude to look at (an image block, which every client delivers to the model), plus a Markdown `/dl/` link with a filename for the person, because claude.ai mobile shows image blocks as text and resource links are invisible on claude.ai, Desktop and mobile (S6). Default size about 200 KB (longest side 1024 px); `scale` snaps to 0.25 steps (§8.3); no `version=` in M1. |
+| `versions(document, cursor, limit)` / `read_page(document, page, version=<generation>)` | Version history (§6), newest first, paginated. |
 | `link_page(document, page, kind, ref)` / `links(document, page)` | Store or list external references (opaque strings ≤ 1 KB). |
 
 ### 11.3 OCR
@@ -489,7 +489,7 @@ What restore cannot bring back: device settings, Wi-Fi, templates, splash screen
 | Tool | Purpose |
 | --- | --- |
 | `transcribe(document, pages=[], force=false)` | Enqueue OCR (user/server mode) or return images (lazy mode). |
-| `save_transcript(document, page, content_hash, text, model)` | Lazy-mode write-back; `stale_hash` if the page changed. |
+| `save_transcript(document, page, content_hash, text, model)` | Lazy-mode write-back; `stale_hash` unless `content_hash` is the page's current hash; text ≤ 30 KB, printable model name; refused when another document's page has the same id with a different hash (open question 8). |
 | `ocr_status()` | Queue depth, last errors, spend this month against each applicable cap. |
 
 ### 11.4 Push
@@ -541,10 +541,12 @@ Environment variables, all prefixed `SCRIPTORIUM_`. Secrets may be given as `*_F
 | `OIDC_UNSAFE_USER_CLAIM` | `false` | Required to use an `OIDC_USER_CLAIM` other than `sub` (§5.2) |
 | `SPIKE_TOOLS` | `false` | Registers the `spike_*` test tools used by S6; never on in production |
 | `ALLOW_ALL_ISSUER_USERS` | `false` | Explicit opt-out of the allowlist |
-| `POLL_SECONDS` | `600` | |
+| `POLL_SECONDS` | `600` | 30–86400, jittered ±10 % |
 | `SYNC_CONCURRENCY` / `SYNC_WORKERS` / `RENDER_WORKERS` | `2` / `4` / `2` | |
 | `SYNC_MAX_POLL_BYTES` | `2147483648` | Blob bytes one poll may download (2 GiB); > 0 (§7) |
-| `SYNC_MAX_POLL_SECONDS` | `1200` | How long one poll may keep starting work; > 0 (§7) |
+| `SYNC_MAX_POLL_SECONDS` | `1200` | How long one poll may keep starting work; 10–86400 (§7) |
+| `POLL_TIMEOUT_SECONDS` | `1800` | Watchdog: past this the worker closes the account's cloud client and backs off; 60–86400 and must exceed `SYNC_MAX_POLL_SECONDS` (checked at start) |
+| `PENDING_WAIT_SECONDS` | `20` | How long `read_page`/`page_image` wait for a render before answering `pending`; 0–60 |
 | `TOMBSTONE_MAX_PER_POLL` | `50` | Circuit breaker (§7) |
 | `BLOB_RETENTION_DAYS` | `365` | Eligibility for manual GC only |
 | `ANTHROPIC_API_KEY` | unset | Server-wide OCR key (§8) |
@@ -623,7 +625,7 @@ The default `docker compose up` starts only `scriptorium` and `scriptorium-worke
 | `:9100/metrics` | not published | |
 
 - **Cloudflare Tunnel** is an alternative that avoids port-forwarding but terminates TLS at Cloudflare; the direct route is preferred because note content then only transits Anthropic ↔ your host.
-- **Health:** `GET /healthz` (server) and a worker heartbeat row in SQLite; the container health check uses both.
+- **Health:** `GET /healthz` (server); the worker rewrites `<data>/worker.heartbeat` every 30 s and `scriptorium healthcheck --worker` fails once it is older than 180 s (the compose example wires it).
 - **Backups of the backup:** host-level backup of `/srv/scriptorium` (data, the Keycloak DB if the profile is used, `secrets/` kept separately) or the restic strategy to an off-site repo.
 - **Image:** `python:3.12-slim` base, `uv` sync, apt `libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core fonts-noto-cjk` for WeasyPrint (≈ +100 MB), non-root user (`PUID`/`PGID` build args or `user:` in compose), read-only root filesystem, `/data` and `/tmp` writable, multi-arch (amd64, arm64 — resvg-py and pypdfium2 ship aarch64 wheels). Published to `ghcr.io/milkyengineer/scriptorium`, tagged by semver; `1` tracks the latest 1.x.
 - **CI:** GitHub Actions — ruff, mypy, pytest with cassettes, image build, SBOM, licence gate, push on tag.

@@ -227,3 +227,12 @@ Follow-ups E inherits from A–D (all on main as of 2026-10-18):
 | 10 licence gate, read-only rootfs | already in CI |
 | 11 audit rows contain no arguments or content | B/E audit test with a grep over a synthetic day |
 | 12 data-policy answer | operator, before any real library is linked |
+
+## 6. Deferred from M1 (recorded at integration, 2026-10-18)
+
+Known gaps left on main after A–E merged; each is owned by the milestone named.
+
+- **M2:** confirmation tokens (`disconnect_remarkable(keep_archive=false)` is `refused` until then); `admin_clear_anomaly`; per-user caps on queued jobs and fair leasing across users in `jobs/queue.py` (today one user can queue about two `page_image` jobs per page version, bounded by the scale snapping); a renderer version in the render dedupe key so a renderer fix can re-render pages whose job died.
+- **M3:** `read_document(format="pdf")`; `page_image(version=)`; `MAX_INLINE_KB` (config default 256, Architecture §12 says 64 — settle it with the push tools, which are its only consumer).
+- **D (small):** switch `SyncOnce._library_sets` to `Index.document_uuids(deleted=)`; log the suffix shape of skipped names so a new xochitl file type shows up in the logs before it is lost.
+- **Operator checks before M1 closes:** acceptance #1, #2, #3, #4, #7 (real SIGKILL) and #10 against the compose stack; the lazy OCR round trip from claude.ai web and mobile; duplicate a notebook in the scratch folder to settle open question 8.
