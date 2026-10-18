@@ -294,9 +294,13 @@ All state under one volume, `/data`. `/data` must be a local POSIX filesystem (e
       blobs/<sha256>              # content-addressed blobs from the cloud; retained → version history
       library/                    # materialised current view in xochitl layout, original UUIDs
         <uuid>.metadata  <uuid>.content  <uuid>.pagedata
-        <uuid>/<page-uuid>.rm
+        <uuid>/<page-uuid>.rm  <uuid>/<page-uuid>-metadata.json
         <uuid>.pdf | .epub        # source file for annotated documents
-      tombstones/<uuid>/          # same layout; moved here when the document leaves the cloud; NEVER auto-purged
+        <uuid>.highlights/<page-uuid>.json      # highlighter selections on PDF/EPUB pages
+        <uuid>.thumbnails/<page-uuid>.png|.jpg  # the cloud's own thumbnails
+        <uuid>.textconversion/<page-uuid>.json  # the tablet's handwriting conversion
+        .holding/<uuid>/<generation>/           # superseded entries of the same shapes; never unlinked
+      tombstones/<uuid>/          # same layout (all of the above); moved here when the document leaves the cloud; NEVER auto-purged
       pages/<uuid>/<page-uuid>.png
       staging/<uuid>.<job>/       # in-progress downloads; swept on worker start
       index.sqlite                # documents, pages, history, transcripts, FTS5, links
@@ -351,7 +355,7 @@ Per linked account, a loop with interval `SCRIPTORIUM_POLL_SECONDS` (default 600
 
 Trash: documents whose parent is `trash` stay in the cloud root and are mirrored like any other; `list` hides them unless `include_trash=true`; `trash()` lists both trashed and tombstoned documents; restore recreates parent folders from tombstones when they are missing.
 
-Concurrency: one worker process, an asyncio task per account, bounded by `SYNC_CONCURRENCY` (default 2); within an account, blob downloads use `SYNC_WORKERS` (default 4). There is exactly one retry layer — Scriptorium's — and the library's internal retries are disabled. Rendering runs in a process pool (`RENDER_WORKERS`, default 2).
+Concurrency: one worker process, an asyncio task per account, bounded by `SYNC_CONCURRENCY` (default 2); within an account, blob downloads use `SYNC_WORKERS` (default 4). Each poll is bounded by `SYNC_MAX_POLL_BYTES` (blob bytes, default 2 GiB; document indexes do not count) and `SYNC_MAX_POLL_SECONDS` (default 1200), both checked before each document index fetch, document commit and blob download: once either is spent the poll starts nothing new, keeps what it committed, leaves the document in progress uncommitted (its fetched blobs stay, content-addressed, so the next poll resumes there), does not save `last_root_hash`, and returns `partial` with reason `byte_budget` or `time_budget`. The budgets are soft: downloads already running finish, so a poll can overshoot by up to `SYNC_WORKERS` blobs. A poll that ends early for any reason (budget, `backoff`, `token_rejected`) applies no tombstones; deletions wait for a poll that runs to the end. The worker treats a budget `partial` as "more to do" and polls again soon rather than waiting the full `POLL_SECONDS`. There is exactly one retry layer — Scriptorium's — and the library's internal retries are disabled. Rendering runs in a process pool (`RENDER_WORKERS`, default 2).
 
 **Writes (push, restore) are worker jobs** and are idempotent: the job fixes the document UUID and blob set at enqueue time; blob uploads are naturally idempotent; the root commit is a single generation-gated **upsert by UUID** — on a generation mismatch the mutation is re-applied to the fresh root; on retry, if the root already holds the UUID with the expected hash, the job is `done`. Root commits send `broadcast: true` so tablets pull promptly.
 
@@ -445,7 +449,7 @@ What restore cannot bring back: device settings, Wi-Fi, templates, splash screen
 ### 11.0 Conventions (binding for every tool)
 
 - **User context** comes from the bearer token; no tool accepts a user id or a filesystem path. `tools/list` is filtered per request (admin tools, `push_ink`).
-- **Document identifiers**: a UUID, or a `/`-separated path of visible names from the root (`Notes/Projects/2026-10`). Ambiguous paths return `ambiguous` with the candidate UUIDs. Folders likewise. Cloud-supplied names are display data only; filesystem names are always UUIDs (allowlist `^[0-9a-f-]{36}(\.(metadata|content|pagedata|pdf|epub))?$`), and every resolved path is asserted to stay inside the account root.
+- **Document identifiers**: a UUID, or a `/`-separated path of visible names from the root (`Notes/Projects/2026-10`). Ambiguous paths return `ambiguous` with the candidate UUIDs. Folders likewise. Cloud-supplied names are display data only; filesystem names are always UUIDs plus one fixed xochitl suffix. The allowlist is `SAFE_NAME_PATTERN` in `library/layout.py`, matched against the whole string with `re.fullmatch` (a `$` anchor would let a trailing newline through): `(?P<doc>[0-9a-f-]{36})(?:\.(?:metadata|content|pagedata|pdf|epub)|/[0-9a-f-]{36}(?:\.rm|-metadata\.json)|\.highlights/[0-9a-f-]{36}\.json|\.thumbnails/[0-9a-f-]{36}\.(?:png|jpg)|\.textconversion/[0-9a-f-]{36}\.json)?`. Any other name in a document index is skipped and counted, never stored (`<uuid>.local`, `.epubindex` and `.cache/` have not been seen in a cloud index; add them here first if they appear). Every resolved path is asserted to stay inside the account root.
 - **Pages** are 1-based in every tool.
 - **Pagination**: list-like tools take `limit` (≤ 100, default 50) and `cursor`, and return `next_cursor`. Text results are capped at 32 KB (Claude Code persists results of about 64 KB to a file and shows the model a 2 KB preview; S6); `read_document` paginates by page range.
 - **Timestamps** are ISO 8601 UTC in and out.
@@ -539,6 +543,8 @@ Environment variables, all prefixed `SCRIPTORIUM_`. Secrets may be given as `*_F
 | `ALLOW_ALL_ISSUER_USERS` | `false` | Explicit opt-out of the allowlist |
 | `POLL_SECONDS` | `600` | |
 | `SYNC_CONCURRENCY` / `SYNC_WORKERS` / `RENDER_WORKERS` | `2` / `4` / `2` | |
+| `SYNC_MAX_POLL_BYTES` | `2147483648` | Blob bytes one poll may download (2 GiB); > 0 (§7) |
+| `SYNC_MAX_POLL_SECONDS` | `1200` | How long one poll may keep starting work; > 0 (§7) |
 | `TOMBSTONE_MAX_PER_POLL` | `50` | Circuit breaker (§7) |
 | `BLOB_RETENTION_DAYS` | `365` | Eligibility for manual GC only |
 | `ANTHROPIC_API_KEY` | unset | Server-wide OCR key (§8) |
