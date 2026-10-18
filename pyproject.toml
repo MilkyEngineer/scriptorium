@@ -17,6 +17,7 @@ dependencies = [
     "remarkable-mcp[render] @ git+https://github.com/MilkyEngineer/remarkable-mcp@scriptorium-s3",
     "anyio>=4.5,<5",
     "pillow>=11,<14",  # imported directly by library/render.py (§4.4)
+    "anthropic>=1.12,<2",  # imported by ocr/client.py only (§8.2, §4.4)
 ]
 
 [project.scripts]
