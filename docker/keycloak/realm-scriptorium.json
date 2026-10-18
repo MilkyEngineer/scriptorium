@@ -391,7 +391,13 @@
   ],
   "scopeMappings": [
     {
-      "clientScope": "scriptorium",
+      "client": "scriptorium-claude",
+      "roles": [
+        "scriptorium-admin"
+      ]
+    },
+    {
+      "client": "scriptorium-claude-code",
       "roles": [
         "scriptorium-admin"
       ]

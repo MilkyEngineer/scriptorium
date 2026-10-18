@@ -207,8 +207,18 @@ def test_scriptorium_scope_mappers(realm: dict[str, Any]) -> None:
 
 
 def test_admin_role_reaches_token_without_full_scope(realm: dict[str, Any]) -> None:
-    mappings = [m for m in realm["scopeMappings"] if m.get("clientScope") == "scriptorium"]
-    assert any("scriptorium-admin" in m["roles"] for m in mappings)
+    """The role scope mapping sits on each client, so it never gates a scope.
+
+    Keycloak applies a client scope that has role scope mappings only to users who
+    hold one of those roles. Mapped on the ``scriptorium`` scope, as the first live
+    realm had it, every non-admin got a token without the audience (401 at
+    Scriptorium) instead of the allowlist's 403.
+    """
+    for mapping in realm["scopeMappings"]:
+        assert "clientScope" not in mapping, "a role scope mapping on a client scope gates it"
+    for client_id in CLIENT_REDIRECTS:
+        mappings = [m for m in realm["scopeMappings"] if m.get("client") == client_id]
+        assert any("scriptorium-admin" in m["roles"] for m in mappings), client_id
 
 
 def test_basic_scope_carries_sub(realm: dict[str, Any]) -> None:

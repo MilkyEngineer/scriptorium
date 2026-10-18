@@ -52,14 +52,19 @@ the scopes listed in it (plus `offline_access`, which it always creates itself):
 
 | Scope | Realm default? | Carries |
 | --- | --- | --- |
-| `scriptorium` | **default** | audience mapper (`aud` += `${SCRIPTORIUM_AUDIENCE}`), realm-roles mapper (`realm_access.roles`, multivalued, access token), `email`, `email_verified`; scope mapping for `scriptorium-admin` |
+| `scriptorium` | **default** | audience mapper (`aud` += `${SCRIPTORIUM_AUDIENCE}`), realm-roles mapper (`realm_access.roles`, multivalued, access token), `email`, `email_verified`. No role scope mappings (see below) |
 | `basic` | default | `sub`, `auth_time` (without it access tokens have no `sub`) |
 | `profile`, `email`, `roles`, `web-origins`, `acr` | default | Keycloak's built-in mappers |
 | `offline_access` | optional | created by Keycloak at import; request `scope=offline_access` for refresh tokens that survive the 12 h SSO idle |
 
-The scope mapping matters because Full Scope Allowed is off: a role reaches
-`realm_access.roles` only if some scope maps it, so `scriptorium-admin` is mapped by
-the `scriptorium` scope and appears regardless of the client's setting.
+Role scope mappings. Full Scope Allowed is off, so a role reaches
+`realm_access.roles` only if some scope mapping lets it through: each client maps
+`scriptorium-admin` (`scopeMappings[].client`). The mapping must **not** sit on the
+`scriptorium` client scope: Keycloak applies a client scope that has role scope
+mappings only to users who hold one of those roles, so mapped there it withheld the
+whole scope, audience included, from every non-admin, who then got `401
+missing_aud` from Scriptorium instead of the allowlist's `403`. `move-admin-scope-
+mapping.sh` fixes a realm imported before this change.
 
 The absent built-ins (`address`, `phone`, `microprofile-jwt`, `organization`,
 `service_account`) are left out on purpose: nothing here needs them.
@@ -155,6 +160,18 @@ export to a **fresh** installation, either:
 - delete the realm in the admin console and restart Keycloak so `--import-realm`
   recreates it. This also deletes its users and sessions: re-run `create-admin.sh`,
   and every Claude client has to log in again.
+
+Realm fixes that ship with Scriptorium come as `kcadm.sh` scripts next to this
+README, run inside the Keycloak container with the bootstrap admin from its
+environment, for example:
+
+```
+docker compose exec -T keycloak sh -s < docker/keycloak/move-admin-scope-mapping.sh
+```
+
+| Script | Applies to realms imported before | What it changes |
+| --- | --- | --- |
+| `move-admin-scope-mapping.sh` | 2026-10-18 | moves the `scriptorium-admin` role scope mapping from the `scriptorium` client scope to the two clients, so non-admin users receive the audience |
 
 ## Port-agnostic loopback redirects (Claude Code)
 
