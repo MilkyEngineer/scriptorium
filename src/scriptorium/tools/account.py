@@ -38,6 +38,7 @@ from scriptorium.accounts import (
     STATE_NEEDS_RELINK,
     STATE_TOKEN_REJECTIONS,
     device_token_name,
+    is_anomaly_reason,
     move_aside,
     poll_lock,
     removal_destination,
@@ -777,7 +778,11 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
             {
                 "code": ErrorCode.SYNC_ANOMALY.value,
                 "anomaly": state[STATE_ANOMALY],
-                "reason": state[STATE_ANOMALY_REASON],
+                "reason": (
+                    state[STATE_ANOMALY_REASON]
+                    if is_anomaly_reason(state[STATE_ANOMALY_REASON])
+                    else None
+                ),
                 "message": "Sync is paused in read-only mode; the archive is still served.",
                 "hint": "An administrator must look at it and clear it.",
             }
