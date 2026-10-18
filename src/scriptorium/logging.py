@@ -124,6 +124,9 @@ def configure_logging(level: str = "info") -> None:
     # Libraries that log request details (URLs, session ids, headers) at INFO.
     for name in ("mcp", "httpx", "httpx2", "httpcore", "httpcore2", "uvicorn.error"):
         logging.getLogger(name).setLevel(max(numeric, logging.WARNING))
+    # rmscene warns "Some data has not been read" once per page written by newer firmware:
+    # content-free, but one line per rendered page.
+    logging.getLogger("rmscene").setLevel(max(numeric, logging.ERROR))
     # uvicorn's access log prints full paths, which include /dl/<token> capabilities;
     # the server logs requests itself with the token redacted.
     access = logging.getLogger("uvicorn.access")
