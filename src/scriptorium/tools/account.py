@@ -427,10 +427,10 @@ def _remove_locked(svc: Services, removal: _Removal) -> dict[str, object]:
         ) from None
     spend_confirmation_token(svc.store, removal.token, now=now)
     # Removed before the move, so nothing reopens the account (and recreates its directory)
-    # meanwhile; the token goes with it, as on any disconnect.
+    # meanwhile. The steps that can be undone come first: until the rename, a failure puts
+    # the account back whole, device token included.
     svc.store.mark_removed(uid, row.acct, at=now)
     try:
-        SecretBox(svc.settings, uid).forget(device_token_name(row.acct))
         svc.evict_index(uid, row.acct)
         move_aside(paths, destination)
     except Exception as exc:
@@ -438,14 +438,39 @@ def _remove_locked(svc: Services, removal: _Removal) -> dict[str, object]:
         if failed is not None:
             raise failed from None
     log_event(logger, "account_moved", acct=row.acct)
+    # Last, as on any disconnect. If it fails the account stays removed (its directory is in
+    # removed/, and no loop polls a removed account); the caller is told, not refused.
+    forget_failed = False
+    try:
+        SecretBox(svc.settings, uid).forget(device_token_name(row.acct))
+    except Exception as exc:
+        forget_failed = True
+        log_event(
+            logger,
+            "account_token_forget_failed",
+            level=logging.ERROR,
+            acct=row.acct,
+            reason=type(exc).__name__,
+        )
+    if forget_failed:
+        done = (
+            "Polling stopped and the archive was moved out of Scriptorium's reach, but the "
+            "device token could not be deleted from this server: ask the operator to check "
+            "the server logs."
+        )
+    else:
+        done = (
+            "Polling stopped, the device token was deleted from this server and the archive "
+            "was moved out of Scriptorium's reach."
+        )
     return {
         "removed": True,
         "account": row.acct,
         "archive_kept": False,
+        "token_forget_failed": forget_failed,
         "message": (
-            "Polling stopped, the device token was deleted from this server and the archive "
-            "was moved out of Scriptorium's reach. Scriptorium cannot revoke the token at "
-            f'reMarkable: remove the device named "{DEVICE_DESCRIPTION}" at {DEVICES_URL}.'
+            f"{done} Scriptorium cannot revoke the token at reMarkable: remove the device "
+            f'named "{DEVICE_DESCRIPTION}" at {DEVICES_URL}.'
         ),
     }
 

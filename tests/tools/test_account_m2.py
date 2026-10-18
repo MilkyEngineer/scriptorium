@@ -21,6 +21,7 @@ from scriptorium.auth.oidc import OIDCValidator
 from scriptorium.cloud.scope import SETTING_SYNC_SCOPE
 from scriptorium.errors import NotFoundError
 from scriptorium.tools import account as account_tools
+from scriptorium.tools._services import Services
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import AccountPaths
 from tests.cloud.fake_cloud import NOTEBOOK, PDF
@@ -216,6 +217,7 @@ async def test_executing_moves_the_account_aside_and_deletes_nothing(
 
     assert done["removed"] is True and done["account"] == linked.acct
     assert done["archive_kept"] is False and "my.remarkable.com" in done["message"]
+    assert done["token_forget_failed"] is False
     assert not linked.paths.root.exists()
     moved = _moved_to(linked)
     assert moved.name.startswith(f"{linked.acct}-") and moved.name.endswith("Z")
@@ -384,23 +386,56 @@ async def test_an_archive_gone_from_both_places_stays_removed(
     await _assert_stays_removed(library, linked)
 
 
-async def test_a_failure_before_the_move_puts_the_account_back(
+async def test_a_failure_before_the_move_puts_the_account_back_with_its_token(
     library: Served, linked: Linked, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fail(box: object, name: str) -> None:
+    def fail(svc: object, uid: str, acct: str) -> None:
         raise OSError("synthetic")
 
-    monkeypatch.setattr(SecretBox, "forget", fail)
+    monkeypatch.setattr(Services, "evict_index", fail)
     failed = await _execute(library, (await _dry_run(library))["confirmation_token"])
 
     assert (failed["code"], failed["reason"]) == ("refused", "move_failed")
     row = linked.store.account(linked.uid, linked.acct)
     assert row is not None and row.removed_at is None  # never removed with its directory here
     assert linked.paths.root.is_dir()
+    # The token is forgotten only once the directory has moved, so it is still here.
+    assert SecretBox(linked.settings, linked.uid).open(device_token_name(linked.acct))
     monkeypatch.undo()
     done = await _execute(library, (await _dry_run(library))["confirmation_token"])
-    assert done["removed"] is True
+    assert done["removed"] is True and done["token_forget_failed"] is False
     assert SecretBox(linked.settings, linked.uid).open(device_token_name(linked.acct)) is None
+
+
+async def test_a_token_that_cannot_be_forgotten_leaves_the_account_removed(
+    library: Served,
+    linked: Linked,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+
+    def fail(box: object, name: str) -> None:
+        raise OSError("synthetic")
+
+    monkeypatch.setattr(SecretBox, "forget", fail)
+
+    done = await _execute(library, (await _dry_run(library))["confirmation_token"])
+
+    # Not an error: the archive has moved, so the removal stands and the caller is told.
+    assert done["removed"] is True and done["token_forget_failed"] is True
+    assert "could not be deleted" in done["message"] and "operator" in done["message"]
+    assert _moved_to(linked).is_dir()
+    await _assert_stays_removed(library, linked)
+    monkeypatch.undo()
+    assert SecretBox(linked.settings, linked.uid).open(device_token_name(linked.acct))
+    assert linked.store.active_accounts() == []  # so no loop ever uses it
+    logged = [
+        (r.getMessage(), getattr(r, "scriptorium_fields", {}))
+        for r in caplog.records
+        if r.name == "scriptorium.tools.account"
+    ]
+    assert ("account_token_forget_failed", {"acct": linked.acct, "reason": "OSError"}) in logged
 
 
 async def test_a_removal_waits_for_a_connect_of_the_same_user(
