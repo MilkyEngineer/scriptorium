@@ -23,7 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 
 from scriptorium.auth.oidc import User
 from scriptorium.errors import InvalidArgumentError
@@ -211,7 +211,18 @@ async def use_document(
 # ---- listing rows ----------------------------------------------------------------------------
 
 
-def state_of(doc: DocumentRow) -> str:
+class _Stateful(Protocol):
+    """What :func:`state_of` reads: a ``DocumentRow`` or a ``ChangeRow``."""
+
+    @property
+    def parent(self) -> str | None: ...
+    @property
+    def deleted_at(self) -> datetime | None: ...
+    @property
+    def excluded_at(self) -> datetime | None: ...
+
+
+def state_of(doc: _Stateful) -> str:
     """``deleted`` (tombstoned), ``excluded`` (outside the sync scope), ``trashed`` or
     ``live``, in that order of precedence."""
     if doc.deleted_at is not None:

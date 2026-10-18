@@ -110,6 +110,7 @@ class ChangeRow:
     page_count: int
     generation: int | None
     deleted_at: datetime | None
+    excluded_at: datetime | None = None  # outside the sync scope (M2, §11.1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,7 +619,8 @@ class Index:
     def recent(self, since: datetime, cursor: str | None, limit: int) -> Page[ChangeRow]:
         """Documents and folders with ``last_modified >= since``, newest first, then by UUID.
 
-        Tombstoned and trashed rows are included (``deleted_at``, ``parent`` say which).
+        Tombstoned, trashed and excluded rows are included (``deleted_at``, ``parent``,
+        ``excluded_at`` say which).
         """
         _check_limit(limit)
         where = "last_modified >= ?"
@@ -630,7 +632,7 @@ class Index:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT uuid, type, parent, name, last_modified, page_count, generation, "  # noqa: S608
-                f"deleted_at FROM documents WHERE {where} "  # fixed clauses, values bound
+                f"deleted_at, excluded_at FROM documents WHERE {where} "  # fixed, values bound
                 "ORDER BY last_modified DESC, uuid LIMIT ?",
                 (*params, limit + 1),
             ).fetchall()
@@ -644,6 +646,7 @@ class Index:
                 page_count=r["page_count"],
                 generation=r["generation"],
                 deleted_at=opt_from_db_time(r["deleted_at"]),
+                excluded_at=opt_from_db_time(r["excluded_at"]),
             )
             for r in rows[:limit]
         ]

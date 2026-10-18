@@ -194,9 +194,7 @@ def _change_item(account: Account, row: ChangeRow, since: datetime) -> dict[str,
         "name": display_name(row.name),
         "type": "folder" if row.type == FOLDER else "document",
         "modified": iso_utc(row.last_modified),
-        "state": "deleted"
-        if row.deleted_at is not None
-        else ("trashed" if row.parent == "trash" else "live"),
+        "state": state_of(row),
     }
     if row.type == DOCUMENT:
         item["pages"] = row.page_count
@@ -213,8 +211,8 @@ def _change_item(account: Account, row: ChangeRow, since: datetime) -> dict[str,
 async def recent(ctx: ToolContext, args: RecentArgs) -> CallToolResult:
     """List documents and folders changed since a time, newest first, with the pages of
     each document that changed (1-based page numbers). since is ISO 8601 UTC, e.g.
-    2026-10-17T09:00:00Z. Deleted and trashed items are included and marked. Use next_cursor
-    to continue."""
+    2026-10-17T09:00:00Z. Deleted, trashed and excluded (outside the sync scope) items are
+    included and marked. Use next_cursor to continue."""
     since = parse_iso_utc(args.since)
     account = await use_account(ctx, args.account)
 

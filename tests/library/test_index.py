@@ -363,6 +363,13 @@ def test_recent_includes_tombstones(index: Index) -> None:
     assert change.deleted_at == T0
 
 
+def test_recent_carries_the_exclusion(index: Index) -> None:
+    index.upsert_document(doc(1, "outside", excluded_at=T0))
+    index.upsert_document(doc(2, "inside"))
+    changes = {c.uuid: c.excluded_at for c in index.recent(T0, None, 5).items}
+    assert changes == {uid(1): T0, uid(2): None}
+
+
 # ---- history ------------------------------------------------------------------------------
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import sqlite3
 from datetime import timedelta
@@ -172,6 +173,19 @@ async def test_recent_reports_changed_pages(library: Served, linked: Linked) -> 
     assert notebook["changed_pages"] == [1]
     assert notebook["changed_page_count"] == 1
     assert (await library.error("recent", {"since": "yesterday"}))["code"] == "invalid_argument"
+
+
+async def test_recent_marks_an_excluded_document(library: Served, linked: Linked) -> None:
+    """recent reports the same state as list: excluded, not live."""
+    index = linked.index()
+    row = index.document(NOTEBOOK)
+    assert row is not None
+    index.upsert_document(dataclasses.replace(row, excluded_at=linked.clock.now))
+    changes = await library.ok("recent", {"since": "2000-01-01T00:00:00Z"})
+    states = {item["uuid"]: item["state"] for item in changes["items"]}
+    assert states == {NOTEBOOK: "excluded", PDF: "live"}
+    listed = await library.ok("list")
+    assert {i["uuid"]: i["state"] for i in listed["items"]}[NOTEBOOK] == "excluded"
 
 
 # ---- read_page --------------------------------------------------------------------------------
