@@ -356,3 +356,19 @@ class JobQueue:
                 (LEASE_EXPIRED_ERROR, now, now, now),
             ).rowcount
         return dead + requeued
+
+    # ---- reporting --------------------------------------------------------------------------
+
+    def counts(self, uid: str, *, acct: str | None = None) -> dict[str, dict[str, int]]:
+        """``{kind: {state: n}}`` over the jobs of ``uid`` (and ``acct``), for status tools."""
+        sql = "SELECT kind, state, count(*) AS n FROM jobs WHERE uid = ?"
+        params: list[Any] = [uid]
+        if acct is not None:
+            sql += " AND acct = ?"
+            params.append(acct)
+        with self._lock:
+            rows = self._conn.execute(sql + " GROUP BY kind, state", params).fetchall()
+        out: dict[str, dict[str, int]] = {}
+        for row in rows:
+            out.setdefault(str(row["kind"]), {})[str(row["state"])] = int(row["n"])
+        return out

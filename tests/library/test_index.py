@@ -733,3 +733,29 @@ def test_page_by_id_and_guarded_set_rendered(index: Index) -> None:
     assert index.set_rendered(uid(100), "pages/a.png", T0, content_hash="a") is True
     assert index.page(uid(1), 0) == pr(0, 0, "a", rendered_at=T0, png_path="pages/a.png")
     assert index.set_rendered(uid(199), "pages/x.png", T0, content_hash="a") is False
+
+
+def test_counts(index: Index) -> None:
+    assert index.counts() == dict.fromkeys(
+        ("documents", "folders", "trashed", "tombstoned", "pages", "rendered", "transcripts"), 0
+    )
+    index.upsert_document(folder(1, "Notes"))
+    index.upsert_document(doc(2, "A", parent=uid(1)))
+    index.upsert_document(doc(3, "B"))
+    index.upsert_document(doc(4, "Binned", parent="trash"))
+    index.upsert_document(doc(5, "Gone"))
+    index.mark_deleted(uid(5), "unknown", T0)
+    index.replace_pages(
+        uid(2), [PageRow(uid(100), uid(2), 0, "a"), PageRow(uid(101), uid(2), 1, "b")]
+    )
+    index.set_rendered(uid(100), "pages/a.png", T0)
+    index.put_transcript(uid(100), "a", "text", "model", "lazy")
+    assert index.counts() == {
+        "documents": 2,
+        "folders": 1,
+        "trashed": 1,
+        "tombstoned": 1,
+        "pages": 2,
+        "rendered": 1,
+        "transcripts": 1,
+    }

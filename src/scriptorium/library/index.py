@@ -672,6 +672,33 @@ class Index:
             ).fetchall()
         return [_page(r) for r in rows]
 
+    def counts(self) -> dict[str, int]:
+        """Totals for ``account_status``: documents, folders, trashed, tombstoned, pages,
+        rendered pages and transcripts. Documents and folders exclude trashed and tombstoned
+        rows."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT "
+                "sum(type = 'DocumentType' AND deleted_at IS NULL AND parent IS NOT ?) AS docs, "
+                "sum(type = 'CollectionType' AND deleted_at IS NULL AND parent IS NOT ?) AS dirs, "
+                "sum(deleted_at IS NULL AND parent = ?) AS trashed, "
+                "sum(deleted_at IS NOT NULL) AS tombstoned FROM documents",
+                (TRASH, TRASH, TRASH),
+            ).fetchone()
+            pages = self._conn.execute(
+                "SELECT count(*) AS n, count(rendered_at) AS r FROM pages"
+            ).fetchone()
+            transcripts = self._conn.execute("SELECT count(*) AS n FROM transcripts").fetchone()
+        return {
+            "documents": int(row["docs"] or 0),
+            "folders": int(row["dirs"] or 0),
+            "trashed": int(row["trashed"] or 0),
+            "tombstoned": int(row["tombstoned"] or 0),
+            "pages": int(pages["n"]),
+            "rendered": int(pages["r"]),
+            "transcripts": int(transcripts["n"]),
+        }
+
     def page_by_id(self, page_id: str) -> PageRow | None:
         """The current page with this page UUID, whichever document lists it."""
         with self._lock:

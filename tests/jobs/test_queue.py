@@ -406,3 +406,17 @@ def test_naive_clock_is_refused(path: Path) -> None:
     with JobQueue.open(path, migrate=True, clock=lambda: datetime(2026, 1, 1)) as q:
         with pytest.raises(ValueError, match="timezone"):
             q.lease("w")
+
+
+def test_counts_group_by_kind_and_state(queue: JobQueue) -> None:
+    put(queue, "a")
+    put(queue, "b")
+    put(queue, "c", kind="page_image")
+    put(queue, "d", acct="01J0000000000000000000000B")
+    put(queue, "e", uid=OTHER)
+    job = queue.lease("w", kinds=["page_image"])
+    assert job is not None
+    queue.complete(job.id, "w", {})
+    assert queue.counts(UID) == {"render": {"queued": 3}, "page_image": {"done": 1}}
+    assert queue.counts(UID, acct="01J0000000000000000000000B") == {"render": {"queued": 1}}
+    assert queue.counts("0000000000000000") == {}
