@@ -29,7 +29,7 @@ M1_TOOLS = {
     "trash",
     "save_transcript",
 }
-M2_TOOLS = {"search"}
+M2_TOOLS = {"search", "set_claude_api_key", "clear_claude_api_key"}
 NOTEBOOK_NAME = "Scriptorium Test Notebook"
 TRANSCRIPT_MARKER = "transcript-marker-7f3a"
 PATH_MARKER = "path-marker-91c2"

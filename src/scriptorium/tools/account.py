@@ -1,9 +1,14 @@
-"""Account tools (§11.1, M1 subset): connect_remarkable, disconnect_remarkable, account_status.
+"""Account tools (§11.1): connect_remarkable, disconnect_remarkable, account_status, and the
+user's own Claude API key (set_claude_api_key, clear_claude_api_key).
 
 ``connect_remarkable`` is the one cloud write in M1: it exchanges a one-time code for a device
 token (a new device at reMarkable on every call). The token is sealed with the master keys and
 never leaves this process again; the worker picks the account up from the registry on its
 next supervision pass.
+
+A Claude API key is checked with the cheapest API call before it is sealed (SecretBox name
+``claude_api_key``) and is never returned, logged or audited afterwards, not even a prefix:
+results say only whether a key is stored (§8.1).
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ import asyncio
 from typing import Final
 
 from mcp_types import CallToolResult
-from pydantic import Field
+from pydantic import ConfigDict, Field, SecretStr, field_validator
 
 from scriptorium.accounts import (
     DEVICE_DESCRIPTION,
@@ -31,13 +36,18 @@ from scriptorium.cloud.sync import (
     STATE_TOMBSTONING_SUSPENDED_FAILED,
     STATE_TOMBSTONING_SUSPENDED_SINCE,
 )
+from scriptorium.config import API_KEY_RE
 from scriptorium.db.connect import from_db_time
-from scriptorium.errors import RefusedError
+from scriptorium.errors import RefusedError, ScriptoriumError
+from scriptorium.ocr.errors import OcrRefused, OcrUnavailable
+from scriptorium.ocr.ledger import month_bounds
+from scriptorium.ocr.modes import USER_KEY_SECRET, read_user_key, resolve, server_key_permitted
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
 from scriptorium.tools._conventions import (
     READ_ONLY,
     RESULT_CAP_BYTES,
     ErrorCode,
+    NoArgs,
     ToolArgs,
     ToolError,
     invalid_argument,
@@ -53,17 +63,18 @@ from scriptorium.tools._library import (
     open_account,
     services,
 )
-from scriptorium.tools._services import Services
+from scriptorium.tools._services import KEY_CHECK_WINDOW_S, Services
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import worker_heartbeat_path
 from scriptorium.worker import HEARTBEAT_STALE_SECONDS, heartbeat_age, read_heartbeat
 
 DEVICES_URL: Final = "https://my.remarkable.com/"
+CONSOLE_URL: Final = "https://console.anthropic.com/settings/keys"
 OCR_LAZY_NOTE: Final = (
     "Pages are transcribed by your own Claude session: read_page returns a page's image "
-    "with instructions, and save_transcript stores the result. Background transcription "
-    "with an API key arrives in a later release."
+    "with instructions, and save_transcript stores the result."
 )
+MAX_OWN_CAP_USD: Final = 100_000.0
 
 
 # ---- connect_remarkable ----------------------------------------------------------------------
@@ -196,6 +207,226 @@ async def disconnect_remarkable(ctx: ToolContext, args: DisconnectArgs) -> CallT
     accounts = payload["disconnected"]
     if isinstance(accounts, list) and len(accounts) == 1:
         ctx.audit["acct"] = accounts[0]
+    return json_result(payload, cap=RESULT_CAP_BYTES)
+
+
+# ---- OCR: the user's own Claude API key ----------------------------------------------------
+
+
+def _usd(value: float | None) -> float | None:
+    return None if value is None else round(value, 4)
+
+
+def _ocr_note(reason: str, resets: str, cap_usd: float | None) -> str:
+    day = resets[:10]
+    if reason == "user_key":
+        cap = f", up to ${cap_usd:g} a month" if cap_usd is not None else ""
+        return f"Pages are transcribed in the background with your own Claude API key{cap}."
+    if reason == "server_key":
+        return (
+            "Pages are transcribed in the background with this server's Claude API key, "
+            "within a monthly allowance per user."
+        )
+    if reason == "key_unreadable":
+        return (
+            "Your stored Claude API key cannot be decrypted on this server, so nothing is "
+            "transcribed in the background. Store it again with set_claude_api_key, or remove "
+            "it with clear_claude_api_key."
+        )
+    more = {
+        "no_key": "To transcribe in the background, store your own key with set_claude_api_key.",
+        "server_key_not_allowed": "This server has a Claude API key an administrator can let "
+        "you use (they need your user id from account_status); or store your own key with "
+        "set_claude_api_key.",
+        "cap_reached_global": f"This server's monthly OCR budget is spent until {day} (UTC); "
+        "your own key (set_claude_api_key) is not affected by it.",
+        "cap_reached_user": f"Your monthly allowance on this server's key is spent until {day} "
+        "(UTC); your own key (set_claude_api_key) is not affected by it.",
+        "user_cap_reached": f"The monthly cap you set on your own key is spent until {day} "
+        "(UTC); call set_claude_api_key again with a higher monthly_cap_usd to raise it.",
+    }
+    return f"{OCR_LAZY_NOTE} {more[reason]}" if reason in more else OCR_LAZY_NOTE
+
+
+def ocr_summary(svc: Services, uid: str) -> dict[str, object]:
+    """``account_status.ocr`` (§8.1, §11.1): the mode and why, this UTC month's spend, and the
+    caps that apply to this user. Says whether a key is stored, never anything about it."""
+    settings, store, ledger = svc.settings, svc.store, svc.ledger
+    now = svc.clock()
+    start, end = month_bounds(now)
+    box = SecretBox(settings, uid)
+    try:
+        has_key = read_user_key(box) is not None  # presence only; the key is dropped here
+        resolution = resolve(settings, store, box, ledger, uid, now)
+        mode, reason = resolution.mode, str(resolution.reason)
+        del resolution
+    except ScriptoriumError as exc:
+        if exc.code != "internal":
+            raise
+        # resolve() fails closed rather than spend the server key for this user (§8.1).
+        mode, reason, has_key = "lazy", "key_unreadable", True
+    own = ledger.month(uid=uid, mode="user", at=now)
+    server = ledger.month(uid=uid, mode="server", at=now)
+    allowance = ledger.allowance(settings, store, uid, now)
+    row = store.user(uid)
+    own_cap = row.ocr_cap_usd if row is not None else None
+    permitted = (
+        settings.anthropic_api_key is not None
+        and row is not None
+        and server_key_permitted(settings, row)
+    )
+    return {
+        "mode": mode,
+        "reason": reason,
+        "own_key_stored": has_key,
+        "month": start.strftime("%Y-%m"),
+        "resets_at": iso_utc(end),
+        "spend_this_month": {
+            "usd": _usd(own.cost_usd + server.cost_usd),
+            "pages": own.pages + server.pages,
+            "own_key": {"usd": _usd(own.cost_usd), "pages": own.pages},
+            "server_key": {"usd": _usd(server.cost_usd), "pages": server.pages},
+        },
+        "caps": {
+            "own_key": (
+                {"monthly_cap_usd": own_cap, "remaining_usd": _usd(allowance.own_remaining_usd)}
+                if has_key
+                else None
+            ),
+            "server_key": (
+                {
+                    "monthly_cap_usd": settings.ocr_user_monthly_cap_usd,
+                    "remaining_usd": _usd(allowance.user_remaining_usd),
+                    "server_budget_spent": allowance.global_remaining_usd <= 0,
+                }
+                if permitted
+                else None
+            ),
+        },
+        "note": _ocr_note(reason, iso_utc(end), own_cap),
+    }
+
+
+class SetKeyArgs(ToolArgs):
+    # A rejected key must not reach an error string, even one that is never sent anywhere.
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    key: SecretStr = Field(
+        min_length=20,
+        max_length=512,
+        description=f"Your Claude API key from {CONSOLE_URL}. Stored encrypted; never shown again.",
+    )
+    monthly_cap_usd: float | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_OWN_CAP_USD,
+        allow_inf_nan=False,
+        strict=True,
+        description="Stop background transcription with this key after this many US dollars "
+        "in a UTC calendar month; null for no cap (the key's own Console limits still apply).",
+    )
+
+    @field_validator("key", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("key")
+    @classmethod
+    def _shape(cls, value: SecretStr) -> SecretStr:
+        if not API_KEY_RE.fullmatch(value.get_secret_value()):
+            raise ValueError("this is not a Claude API key (letters, digits, - and _ only)")
+        return value
+
+
+def _key_refusal(exc: OcrRefused, model: str) -> ToolError:
+    if exc.reason == "bad_key":
+        message, hint = "The Claude API rejected this key.", f"Check the key at {CONSOLE_URL}."
+    elif exc.reason == "billing":
+        message = "The Claude account behind this key has a billing problem."
+        hint = "Check billing in the Claude Console, then try again."
+    elif exc.reason in ("forbidden", "model_unavailable"):
+        message = f"This key cannot use the OCR model {model}."
+        hint = f"Use a key from a workspace that can use {model}."
+    else:
+        message, hint = f"The key could not be checked: {exc.message}.", "Try again later."
+    return ToolError(ErrorCode.REFUSED, f"{message} Nothing was stored.", hint)
+
+
+def _set_key(svc: Services, user: User, key: SecretStr, cap_usd: float | None) -> dict[str, object]:
+    uid = svc.uid(user)
+    if not svc.allow_key_check(uid):
+        raise ToolError(
+            ErrorCode.REFUSED,
+            "Too many keys were checked recently. Nothing was stored.",
+            f"Try again in {KEY_CHECK_WINDOW_S // 60} minutes.",
+        )
+    model = svc.settings.ocr_model
+    try:
+        client = svc.ocr_client(svc.settings, key)
+        try:
+            client.validate_key()
+        finally:
+            client.close()
+    except OcrRefused as exc:
+        raise _key_refusal(exc, model) from None
+    except OcrUnavailable:
+        raise ToolError(
+            ErrorCode.REFUSED,
+            "The Claude API could not check the key just now. Nothing was stored.",
+            "Try again in a few minutes.",
+        ) from None
+    # The cap first: if sealing then fails, a cap without a key is harmless, while a key
+    # without the cap its owner asked for would spend more than they allowed.
+    svc.store.set_user_ocr_cap(uid, cap_usd)
+    SecretBox(svc.settings, uid).seal(USER_KEY_SECRET, key.get_secret_value().encode("ascii"))
+    cap = f" up to ${cap_usd:g} a month" if cap_usd is not None else ""
+    return {
+        "stored": True,
+        "monthly_cap_usd": cap_usd,
+        "ocr": ocr_summary(svc, uid),
+        "message": (
+            "The key works and is stored encrypted on this server; it is never shown again. "
+            f"Pages are transcribed in the background with it{cap}, and the spend appears in "
+            "account_status. It replaces any key you stored before; clear_claude_api_key "
+            f"removes it. You can also revoke it at any time at {CONSOLE_URL}."
+        ),
+    }
+
+
+async def set_claude_api_key(ctx: ToolContext, args: SetKeyArgs) -> CallToolResult:
+    """Store your own Claude API key so that your pages are transcribed in the background
+    with it, optionally capped at monthly_cap_usd US dollars per UTC calendar month. The key
+    is checked with a free API call first and then stored encrypted on this server; no tool
+    ever shows it again. A dedicated key with its own spend limit in the Claude Console is
+    best, since the key passes through this conversation. Calling again replaces the key and
+    the cap."""
+    payload = await asyncio.to_thread(
+        _set_key, services(ctx), ctx.user, args.key, args.monthly_cap_usd
+    )
+    return json_result(payload, cap=RESULT_CAP_BYTES)
+
+
+def _clear_key(svc: Services, user: User) -> dict[str, object]:
+    uid = svc.uid(user)
+    SecretBox(svc.settings, uid).forget(USER_KEY_SECRET)
+    svc.store.set_user_ocr_cap(uid, None)
+    return {
+        "cleared": True,
+        "ocr": ocr_summary(svc, uid),
+        "message": (
+            "Your Claude API key is no longer stored on this server; transcripts and the spend "
+            f"record are kept. To revoke the key itself, delete it at {CONSOLE_URL}."
+        ),
+    }
+
+
+async def clear_claude_api_key(ctx: ToolContext, args: NoArgs) -> CallToolResult:
+    """Delete your Claude API key from this server, together with the monthly cap you set on
+    it. Transcripts made with it and the record of what it spent are kept. Pages are then
+    transcribed with this server's key if you may use it, or by your own Claude session.
+    Safe to call when no key is stored."""
+    payload = await asyncio.to_thread(_clear_key, services(ctx), ctx.user)
     return json_result(payload, cap=RESULT_CAP_BYTES)
 
 
@@ -339,7 +570,7 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
         },
         "library": counts,
         "jobs": {"pending": pending, "dead": dead},
-        "ocr": {"mode": "lazy", "note": OCR_LAZY_NOTE},
+        "ocr": ocr_summary(svc, account.uid),
         "quota": None,
         "worker": worker,
     }
@@ -350,16 +581,17 @@ def _account_status(svc: Services, user: User, acct: str | None) -> dict[str, ob
     rows = svc.store.accounts(uid)
     if not rows:
         return {
+            "user": uid,
             "linked": False,
             "status": "not_linked",
             "message": (
                 f"No reMarkable account is linked. Get a one-time code from {CONNECT_URL} "
                 "and call connect_remarkable with it."
             ),
-            "ocr": {"mode": "lazy", "note": OCR_LAZY_NOTE},
+            "ocr": ocr_summary(svc, uid),
         }
     account = open_account(svc, user, acct)
-    payload = _status(svc, account)
+    payload = {"user": uid, **_status(svc, account)}
     payload["other_accounts"] = [
         {"account": r.acct, "active": r.active, "linked_at": iso_utc(r.linked_at)}
         for r in rows
@@ -371,9 +603,11 @@ def _account_status(svc: Services, user: User, acct: str | None) -> dict[str, ob
 async def account_status(ctx: ToolContext, args: StatusArgs) -> CallToolResult:
     """Show the state of your linked reMarkable account: whether it is linked, when it last
     synced, how many documents, pages and transcripts are archived, pending and failed page
-    renders, the OCR mode, and warnings (the account needs relinking, sync is paused by an
-    anomaly such as a mass deletion, the worker is not running). Works before linking too:
-    it then explains how to connect."""
+    renders, how pages are transcribed (the OCR mode and why, this month's spend and the caps
+    that apply), and warnings (the account needs relinking, sync is paused by an anomaly such
+    as a mass deletion, the worker is not running). Also shows your user id, which an
+    administrator needs to change your settings. Works before linking too: it then explains
+    how to connect."""
     payload = await asyncio.to_thread(_account_status, services(ctx), ctx.user, args.account)
     acct = payload.get("account")
     if isinstance(acct, str):
@@ -382,7 +616,7 @@ async def account_status(ctx: ToolContext, args: StatusArgs) -> CallToolResult:
 
 
 def register(registry: ToolRegistry) -> None:
-    """Add the M1 account tools."""
+    """Add the account tools."""
     registry.add(
         ToolSpec.from_handler(
             connect_remarkable,
@@ -398,6 +632,28 @@ def register(registry: ToolRegistry) -> None:
         )
     )
     registry.add(ToolSpec.from_handler(account_status, args=StatusArgs, annotations=READ_ONLY))
+    registry.add(
+        ToolSpec.from_handler(
+            set_claude_api_key,
+            args=SetKeyArgs,
+            annotations=tool_annotations(read_only=False, idempotent=True, open_world=True),
+        )
+    )
+    registry.add(
+        ToolSpec.from_handler(
+            clear_claude_api_key,
+            args=NoArgs,
+            annotations=tool_annotations(read_only=False, destructive=True, idempotent=True),
+        )
+    )
 
 
-__all__ = ["account_status", "connect_remarkable", "disconnect_remarkable", "register"]
+__all__ = [
+    "account_status",
+    "clear_claude_api_key",
+    "connect_remarkable",
+    "disconnect_remarkable",
+    "ocr_summary",
+    "register",
+    "set_claude_api_key",
+]
