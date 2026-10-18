@@ -73,6 +73,24 @@ def test_serve_and_worker_refuse_an_unsafe_data_dir(
     assert not global_db_path(settings.data_dir).exists()  # nothing was opened
 
 
+@pytest.mark.parametrize(("entries", "warned"), [("*", True), ("0123456789abcdef", False)])
+def test_a_wildcard_server_key_list_is_warned_about_at_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    entries: str,
+    warned: bool,
+) -> None:
+    import argparse
+
+    settings = make_settings(data_dir=_data(tmp_path), server_key_users=entries)
+    monkeypatch.setattr(config, "load_settings", lambda: settings)
+    caplog.set_level(logging.WARNING)
+    assert cli._start(argparse.Namespace(log_level=None)) is settings
+    events = [r.getMessage() for r in caplog.records if r.name == "scriptorium.config"]
+    assert events == (["server_key_open_to_all"] if warned else [])
+
+
 def test_serve_migrates_before_the_first_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

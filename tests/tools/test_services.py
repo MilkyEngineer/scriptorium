@@ -54,3 +54,47 @@ def test_uid_is_created_once_and_cached(tmp_path: Path) -> None:
         assert (data / "users" / uid / "accounts" / "01J0000000000000000000000A").is_dir()
     finally:
         services.close()
+
+
+def test_uid_records_the_email_digest_only_while_listed(tmp_path: Path) -> None:
+    import dataclasses
+    import hashlib
+
+    data = tmp_path / "data"
+    data.mkdir()
+    listed = make_settings(data_dir=data, server_key_users="Reader@Example.com")
+    services = Services.open(listed)
+    try:
+        user = dataclasses.replace(_user(), email="reader@example.COM", email_verified=True)
+        uid = services.uid(user)
+        row = services.store.user(uid)
+        assert row is not None
+        assert row.server_key_email_sha256 == hashlib.sha256(b"reader@example.com").hexdigest()
+        # An unverified email (or none) clears it on the next request.
+        services.uid(dataclasses.replace(user, email_verified=False))
+        row = services.store.user(uid)
+        assert row is not None and row.server_key_email_sha256 is None
+    finally:
+        services.close()
+    unlisted = Services.open(make_settings(data_dir=data, server_key_users="other@example.com"))
+    try:
+        services.store.set_server_key_email(uid, "ab" * 32)
+        unlisted.uid(user)
+        row = unlisted.store.user(uid)
+        assert row is not None and row.server_key_email_sha256 is None
+    finally:
+        unlisted.close()
+
+
+def test_key_checks_are_rate_limited_per_user(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    now = [0.0]
+    services = Services.open(make_settings(data_dir=data), monotonic=lambda: now[0])
+    try:
+        assert [services.allow_key_check("a" * 16) for _ in range(6)] == [True] * 5 + [False]
+        assert services.allow_key_check("b" * 16)  # per user
+        now[0] = 15 * 60 + 1
+        assert services.allow_key_check("a" * 16)
+    finally:
+        services.close()

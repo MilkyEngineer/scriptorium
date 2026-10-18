@@ -16,11 +16,14 @@ import hashlib
 import logging
 import tempfile
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
+
+from pydantic import SecretStr
 
 from scriptorium.auth.oidc import User
 from scriptorium.cloud.client import CloudClient
@@ -29,14 +32,21 @@ from scriptorium.db.connect import utc_now
 from scriptorium.jobs.queue import JobQueue
 from scriptorium.library.index import Index
 from scriptorium.logging import log_event, uid_prefix
+from scriptorium.ocr.client import OcrClient, client_for
+from scriptorium.ocr.ledger import SpendLedger
+from scriptorium.ocr.modes import listed_email_digest
 from scriptorium.users.store import GlobalStore, account_paths, global_db_path
 
-__all__ = ["IMAGE_SLOTS", "Services", "identity_of"]
+__all__ = ["IMAGE_SLOTS", "KEY_CHECKS_PER_WINDOW", "KEY_CHECK_WINDOW_S", "Services", "identity_of"]
 
 logger = logging.getLogger(__name__)
 
 IMAGE_SLOTS: Final = 2
 """Page images the server downscales at once (per process)."""
+KEY_CHECKS_PER_WINDOW: Final = 5
+KEY_CHECK_WINDOW_S: Final = 15 * 60
+"""``set_claude_api_key`` validates at most this many keys per user per window: each check is
+a call to the Claude API, and the tool must not become a key-guessing oracle."""
 
 
 def identity_of(device_token: str) -> str | None:
@@ -65,8 +75,13 @@ class Services:
     """How often a tool waiting for a render looks for its PNG."""
     image_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(IMAGE_SLOTS))
     """Bounds the server's own PNG decoding (downscales), which can take ~200 MB a page."""
+    ocr_client: Callable[[Settings, SecretStr], OcrClient] = client_for
+    """Builds the Claude API client for a key (``set_claude_api_key`` validates with it)."""
+    monotonic: Callable[[], float] = time.monotonic
     _indexes: dict[tuple[str, str], Index] = field(default_factory=dict, repr=False)
-    _users: dict[str, str] = field(default_factory=dict, repr=False)
+    _users: dict[str, tuple[str, str | None]] = field(default_factory=dict, repr=False)
+    _ledger: SpendLedger | None = field(default=None, repr=False)
+    _key_checks: dict[str, list[float]] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _connect_locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
@@ -95,16 +110,46 @@ class Services:
         self.queue.close()
 
     def uid(self, user: User) -> str:
-        """The user's storage id; creates the users row on first sight (§5.1)."""
+        """The user's storage id; creates the users row on first sight (§5.1).
+
+        Also keeps ``users.server_key_email_sha256`` in step with the token: the digest of the
+        user's verified email while SERVER_KEY_USERS lists it, else nothing (§8.1).
+        """
+        digest = listed_email_digest(self.settings, user)
         with self._lock:
             known = self._users.get(user.uid_hash)
-        if known is not None:
-            return known
-        row = self.store.ensure_user(user)
+        if known is not None and known[1] == digest:
+            return known[0]
+        if known is None:
+            row = self.store.ensure_user(user)
+            uid, stored = row.uid, row.server_key_email_sha256
+            log_event(logger, "user_seen", uid=uid_prefix(user.uid_hash))
+        else:
+            uid, stored = known[0], known[1]
+        if stored != digest:
+            self.store.set_server_key_email(uid, digest)
         with self._lock:
-            self._users[user.uid_hash] = row.uid
-        log_event(logger, "user_seen", uid=uid_prefix(user.uid_hash))
-        return row.uid
+            self._users[user.uid_hash] = (uid, digest)
+        return uid
+
+    @property
+    def ledger(self) -> SpendLedger:
+        """OCR spend in ``scriptorium.sqlite`` (migrated by :meth:`open`)."""
+        with self._lock:
+            if self._ledger is None:
+                self._ledger = SpendLedger(global_db_path(self.settings.data_dir))
+            return self._ledger
+
+    def allow_key_check(self, uid: str) -> bool:
+        """Take one of the user's key validations for this window; False when none are left."""
+        now = self.monotonic()
+        with self._lock:
+            recent = [t for t in self._key_checks.get(uid, ()) if now - t < KEY_CHECK_WINDOW_S]
+            allowed = len(recent) < KEY_CHECKS_PER_WINDOW
+            if allowed:
+                recent.append(now)
+            self._key_checks[uid] = recent
+            return allowed
 
     def connect_lock(self, uid: str) -> asyncio.Lock:
         """The lock that serialises ``connect_remarkable`` for one user (event loop only).

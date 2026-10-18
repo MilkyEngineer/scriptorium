@@ -43,12 +43,29 @@ def _start(args: argparse.Namespace) -> Settings | None:
         print(f"scriptorium: {exc}", file=sys.stderr)
         return None
     configure_logging(args.log_level or settings.log_level)
+    _warn_about_settings(settings)
     try:
         require_local_data_dir(settings.data_dir)
     except UnsafeDataDir as exc:  # FUSE, network, overlay or unwritable: never risk SQLite
         print(f"scriptorium: {exc}", file=sys.stderr)
         return None
     return settings
+
+
+def _warn_about_settings(settings: Settings) -> None:
+    """Settings that are valid but that an operator should see at every start."""
+    import logging
+
+    from scriptorium.logging import log_event
+
+    if "*" in settings.server_key_users:
+        # §8.1: accepted but discouraged; every user of the issuer may spend the server key.
+        log_event(
+            logging.getLogger("scriptorium.config"),
+            "server_key_open_to_all",
+            level=logging.WARNING,
+            reason="server_key_users_wildcard",
+        )
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

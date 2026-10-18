@@ -123,8 +123,17 @@ def configure_logging(level: str = "info") -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(numeric)
-    # Libraries that log request details (URLs, session ids, headers) at INFO.
-    for name in ("mcp", "httpx", "httpx2", "httpcore", "httpcore2", "uvicorn.error"):
+    # Libraries that log request details (URLs, session ids, headers) at INFO; the anthropic
+    # SDK logs whole request bodies (page images, the prompt) at DEBUG.
+    for name in (
+        "mcp",
+        "httpx",
+        "httpx2",
+        "httpcore",
+        "httpcore2",
+        "uvicorn.error",
+        "anthropic",
+    ):
         logging.getLogger(name).setLevel(max(numeric, logging.WARNING))
     # rmscene warns "Some data has not been read" once per page written by newer firmware:
     # content-free, but one line per rendered page.
