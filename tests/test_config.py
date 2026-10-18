@@ -39,7 +39,7 @@ def test_loads_from_environment(env: pytest.MonkeyPatch) -> None:
     assert settings.oidc_user_claim == "sub"
     assert settings.oidc_name_claim == "preferred_username"
     assert settings.log_level == "info"
-    assert settings.max_inline_kb == 256
+    assert settings.max_inline_kb == 64
     assert settings.spike_tools is False
     assert settings.allow_all_issuer_users is False
 

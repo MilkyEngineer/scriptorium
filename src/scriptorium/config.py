@@ -173,7 +173,7 @@ class Settings(BaseSettings):
         ),
     )
     log_level: LogLevel = "info"
-    max_inline_kb: int = Field(default=256, ge=1, le=16 * 1024)
+    max_inline_kb: int = Field(default=64, ge=1, le=16 * 1024)
     spike_tools: bool = False
 
     # ---- sync worker (§7) -----------------------------------------------------------------
