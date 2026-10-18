@@ -888,11 +888,15 @@ def test_counts(index: Index) -> None:
     index.upsert_document(doc(3, "B"))
     index.upsert_document(doc(4, "Binned", parent="trash"))
     index.upsert_document(doc(5, "Gone"))
+    index.replace_pages(uid(5), [PageRow(uid(200), uid(5), 0, "z")])
+    index.set_rendered(uid(5), uid(200), "z", "pages/z.png", T0)
     index.mark_deleted(uid(5), "unknown", T0)
     index.replace_pages(
         uid(2), [PageRow(uid(100), uid(2), 0, "a"), PageRow(uid(101), uid(2), 1, "b")]
     )
     index.set_rendered(uid(2), uid(100), "a", "pages/a.png", T0)
+    # The tombstoned document keeps its page and render but is not counted below.
+    assert index.pages(uid(5)) and index.pages(uid(5))[0].rendered_at is not None
     index.put_transcript(uid(2), uid(100), "a", "text", "model", "lazy")
     assert index.counts() == {
         "documents": 2,

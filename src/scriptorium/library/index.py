@@ -683,7 +683,10 @@ class Index:
     def counts(self) -> dict[str, int]:
         """Totals for ``account_status``: documents, folders, trashed, tombstoned, pages,
         rendered pages and transcripts. Documents and folders exclude trashed and tombstoned
-        rows."""
+        rows; pages and rendered pages are those of documents that are not tombstoned
+        (trashed ones included, as they are still in the mirror), so the page total
+        tracks the documents a user sees. Tombstoned documents keep their pages and
+        renders; they are just not counted here."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT "
@@ -694,7 +697,8 @@ class Index:
                 (TRASH, TRASH, TRASH),
             ).fetchone()
             pages = self._conn.execute(
-                "SELECT count(*) AS n, count(rendered_at) AS r FROM pages"
+                "SELECT count(*) AS n, count(p.rendered_at) AS r FROM pages AS p "
+                "JOIN documents AS d ON d.uuid = p.document WHERE d.deleted_at IS NULL"
             ).fetchone()
             transcripts = self._conn.execute("SELECT count(*) AS n FROM transcripts").fetchone()
         return {
