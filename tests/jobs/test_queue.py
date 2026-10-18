@@ -667,3 +667,117 @@ def test_record_dead_names_finished_work(queue: JobQueue) -> None:
         )
     with pytest.raises(InvalidArgumentError):
         queue.record_dead(uid=UID, acct=acct, kind="ocr", dedupe_key="ocr:y", payload={}, error="")
+
+
+# ---- priority (M2) ----------------------------------------------------------------------------
+
+DOC_A = "00000000-0000-4000-8000-00000000000a"
+DOC_B = "00000000-0000-4000-8000-00000000000b"
+ACCT = "01J0000000000000000000000A"
+
+
+def doc_job(q: JobQueue, key: str, document: str, **kw: Any) -> int:
+    payload = {"document": document, "page": key}
+    return put(q, key, payload=payload, **kw)
+
+
+def priority_of(q: JobQueue, job_id: int, uid: str = UID) -> int:
+    row = q.get(job_id, uid)
+    assert row is not None
+    return row.priority
+
+
+def test_lease_takes_higher_priority_first_then_the_oldest(queue: JobQueue, clock: Clock) -> None:
+    low = put(queue, "low", priority=-1)
+    clock.advance(1)
+    first = put(queue, "first")
+    clock.advance(1)
+    second = put(queue, "second")
+    order = []
+    while (job := queue.lease("w")) is not None:
+        order.append(job.id)
+    assert order == [first, second, low]
+
+
+def test_a_failed_low_priority_job_still_waits_behind_normal_ones(
+    queue: JobQueue, clock: Clock
+) -> None:
+    low = put(queue, "low", priority=-1)
+    job = queue.lease("w")
+    assert job is not None and job.id == low
+    queue.fail(low, "w", "internal")
+    clock.advance(3600)
+    normal = put(queue, "normal")
+    leased = queue.lease("w")
+    assert leased is not None and leased.id == normal
+
+
+def test_deprioritise_lowers_only_the_documents_waiting_jobs(queue: JobQueue) -> None:
+    running = doc_job(queue, "running", DOC_A)
+    assert queue.lease("w") is not None  # leased: keeps running at its priority
+    waiting = doc_job(queue, "waiting", DOC_A)
+    image = doc_job(queue, "image", DOC_A, kind="page_image")
+    other_doc = doc_job(queue, "other", DOC_B)
+    other_user = doc_job(queue, "theirs", DOC_A, uid=OTHER)
+    other_acct = doc_job(queue, "acct-b", DOC_A, acct="01J0000000000000000000000B")
+    ocr = doc_job(queue, "ocr", DOC_A, kind="ocr")
+    kinds = ("render", "page_image")
+    assert queue.deprioritise(uid=UID, acct=ACCT, document=DOC_A, kinds=kinds) == 2
+    assert (priority_of(queue, waiting), priority_of(queue, image)) == (-1, -1)
+    assert priority_of(queue, running) == 0
+    assert priority_of(queue, other_doc) == priority_of(queue, other_acct) == 0
+    assert priority_of(queue, ocr) == 0
+    assert priority_of(queue, other_user, OTHER) == 0
+    # Idempotent, and an empty kinds list touches nothing.
+    assert queue.deprioritise(uid=UID, acct=ACCT, document=DOC_A, kinds=kinds) == 0
+    assert queue.deprioritise(uid=UID, acct=ACCT, document=DOC_B, kinds=()) == 0
+    with pytest.raises(InvalidArgumentError):
+        queue.deprioritise(uid=UID, acct=ACCT, document="", kinds=kinds)
+
+
+def test_enqueue_raises_a_waiting_jobs_priority_but_never_lowers_it(queue: JobQueue) -> None:
+    job_id = put(queue, "k", priority=-1)
+    same = queue.enqueue(uid=UID, acct=ACCT, kind="render", dedupe_key="k", payload={}, priority=-1)
+    assert same.priority == -1
+    raised = queue.enqueue(uid=UID, acct=ACCT, kind="render", dedupe_key="k", payload={})
+    assert (raised.id, raised.priority) == (job_id, 0)
+    again = queue.enqueue(
+        uid=UID, acct=ACCT, kind="render", dedupe_key="k", payload={}, priority=-1
+    )
+    assert again.priority == 0
+    with pytest.raises(RefusedError):  # another user's key is refused, not raised
+        queue.enqueue(uid=OTHER, acct=ACCT, kind="render", dedupe_key="k", payload={})
+    assert priority_of(queue, job_id) == 0
+
+
+def test_enqueue_leaves_a_finished_jobs_priority_alone(queue: JobQueue) -> None:
+    job_id = put(queue, "k", priority=-1)
+    job = queue.lease("w")
+    assert job is not None and job.id == job_id
+    queue.complete(job_id, "w", {})
+    row = queue.enqueue(uid=UID, acct=ACCT, kind="render", dedupe_key="k", payload={})
+    assert (row.state, row.priority) == ("done", -1)
+
+
+@pytest.mark.parametrize("bad", [11, -11, True, 0.5])
+def test_priority_is_bounded(queue: JobQueue, bad: Any) -> None:
+    with pytest.raises(InvalidArgumentError):
+        put(queue, "k", priority=bad)
+
+
+def test_reruns_run_at_normal_priority_and_revivals_keep_theirs(queue: JobQueue) -> None:
+    kill(queue, "render:revive", "internal")
+    low = put(queue, "render:low", priority=-1, max_attempts=1)
+    job = queue.lease("w")
+    assert job is not None and job.id == low
+    dead = queue.fail(low, "w", "internal")
+    rerun = queue.rerun(dead)
+    assert rerun is not None and rerun.priority == 0
+    with queue._lock:
+        queue._conn.execute("UPDATE jobs SET priority = -1 WHERE dedupe_key = 'render:revive'")
+    assert queue.revive_dead_renders() == 1  # render:low was re-run already
+    with queue._lock:
+        rows = queue._conn.execute(
+            "SELECT priority FROM jobs WHERE dedupe_key LIKE 'render:revive:after:%'"
+        ).fetchall()
+    assert [r["priority"] for r in rows] == [-1]

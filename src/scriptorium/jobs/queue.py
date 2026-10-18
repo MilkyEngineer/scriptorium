@@ -21,6 +21,14 @@ The server enqueues, the worker leases and runs. Life of a job::
   (``queued``, or ``failed`` waiting for its retry).
 - ``record_dead`` writes a job straight into ``dead``, for a verdict reached without one
   (an OCR batch item the API refused), so its key names finished work like any other.
+- **Priority** (M2, §6.2). ``lease`` takes the runnable job with the highest ``priority``,
+  then the oldest: ``ORDER BY priority DESC, created_at, id``. Everything is enqueued at
+  :data:`PRIORITY_NORMAL` (0) except renders of tombstoned, trashed or excluded documents
+  (:data:`PRIORITY_LOW`, -1), and :meth:`JobQueue.deprioritise` lowers a document's waiting
+  jobs when it is tombstoned, so a large deleted document never delays live pages. An
+  ``enqueue`` that finds its job still waiting at a lower priority raises it (a user asking
+  for a page of a deleted document is not kept behind the whole queue); nothing else ever
+  raises one.
 
 Times come from an injected clock (``Callable[[], datetime]``, timezone-aware) so tests are
 deterministic. Nothing here logs payloads, results or errors: they may carry identifiers the
@@ -61,6 +69,10 @@ MAX_PAYLOAD_BYTES: Final = 64 * 1024
 MAX_RESULT_BYTES: Final = 64 * 1024
 MAX_ERROR_CHARS: Final = 1024
 LEASE_EXPIRED_ERROR: Final = "lease expired"
+PRIORITY_NORMAL: Final = 0
+PRIORITY_LOW: Final = -1
+"""Renders of tombstoned, trashed or excluded documents: leased after every normal job."""
+_PRIORITIES: Final = range(-10, 11)
 
 
 class LeaseLostError(RefusedError):
@@ -88,6 +100,7 @@ class JobRow:
     error: str | None
     created_at: datetime
     updated_at: datetime
+    priority: int = PRIORITY_NORMAL
 
 
 def backoff_seconds(attempts: int) -> int:
@@ -124,7 +137,14 @@ def _row(r: sqlite3.Row) -> JobRow:
         error=r["error"],
         created_at=from_db_time(r["created_at"]),
         updated_at=from_db_time(r["updated_at"]),
+        priority=r["priority"],
     )
+
+
+def _check_priority(priority: int) -> int:
+    if isinstance(priority, bool) or not isinstance(priority, int) or priority not in _PRIORITIES:
+        raise InvalidArgumentError("priority must be an integer from -10 to 10.")
+    return priority
 
 
 class JobQueue:
@@ -209,31 +229,41 @@ class JobQueue:
         payload: Mapping[str, Any],
         max_attempts: int = 5,
         run_at: datetime | None = None,
+        priority: int = PRIORITY_NORMAL,
     ) -> JobRow:
         """Queue a job, or return the existing job with the same ``dedupe_key``.
 
-        See the module docstring for the dedupe convention. A key that belongs to another
-        ``uid`` is ``refused``.
+        See the module docstring for the dedupe convention and priorities. A key that belongs
+        to another ``uid`` is ``refused``. An existing job of the same user that is still
+        waiting (``queued`` or ``failed``) at a lower priority is raised to ``priority``.
         """
         if not uid or not kind or not dedupe_key:
             raise InvalidArgumentError("uid, kind and dedupe_key are required.")
         if max_attempts < 1:
             raise InvalidArgumentError("max_attempts must be at least 1.")
+        _check_priority(priority)
         body = _json(payload, MAX_PAYLOAD_BYTES, "payload")
         now = to_db_time(self._now())
         next_run = now if run_at is None else to_db_time(run_at)
         with self._write() as conn:
             row = conn.execute(
                 "INSERT INTO jobs(uid, acct, kind, dedupe_key, payload, state, attempts, "
-                "max_attempts, next_run_at, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?) "
+                "max_attempts, next_run_at, created_at, updated_at, priority) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(dedupe_key) DO NOTHING RETURNING *",
-                (uid, acct, kind, dedupe_key, body, max_attempts, next_run, now, now),
+                (uid, acct, kind, dedupe_key, body, max_attempts, next_run, now, now, priority),
             ).fetchone()
             if row is None:
                 row = conn.execute(
                     "SELECT * FROM jobs WHERE dedupe_key = ?", (dedupe_key,)
                 ).fetchone()
+                if row["uid"] != uid:
+                    raise RefusedError("That job key is in use.")
+                if row["state"] in ("queued", "failed") and row["priority"] < priority:
+                    row = conn.execute(
+                        "UPDATE jobs SET priority = ?, updated_at = ? WHERE id = ? RETURNING *",
+                        (priority, now, row["id"]),
+                    ).fetchone()
         if row["uid"] != uid:
             raise RefusedError("That job key is in use.")
         return _row(row)
@@ -275,6 +305,36 @@ class JobQueue:
             raise RefusedError("That job key is in use.")
         return _row(row)
 
+    def deprioritise(self, *, uid: str, acct: str, document: str, kinds: Sequence[str]) -> int:
+        """Lower to :data:`PRIORITY_LOW` the waiting jobs of ``document``; returns how many.
+
+        Only jobs of ``uid`` and ``acct`` whose kind is in ``kinds``, whose ``payload.document``
+        is ``document`` and that are ``queued`` or ``failed`` (a leased job keeps running). The
+        worker calls this when it tombstones a document.
+        """
+        if not uid or not acct or not document:
+            raise InvalidArgumentError("uid, acct and document are required.")
+        if not kinds:
+            return 0
+        marks = ", ".join("?" * len(kinds))
+        with self._write() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET priority = ?, updated_at = ? "  # noqa: S608
+                f"WHERE uid = ? AND acct = ? AND kind IN ({marks}) "
+                "AND state IN ('queued', 'failed') AND priority > ? "
+                "AND json_extract(payload, '$.document') = ?",
+                (
+                    PRIORITY_LOW,
+                    to_db_time(self._now()),
+                    uid,
+                    acct,
+                    *kinds,
+                    PRIORITY_LOW,
+                    document,
+                ),
+            )
+            return int(cur.rowcount)
+
     def cancel(self, job_id: int, uid: str) -> bool:
         """Cancel a job of ``uid`` that is not running (``queued`` or ``failed``)."""
         with self._write() as conn:
@@ -303,7 +363,8 @@ class JobQueue:
         ttl_s: int = 60,
         per_uid: Mapping[str, int] | None = None,
     ) -> JobRow | None:
-        """Claim the oldest runnable job (``queued``, or ``failed`` past its backoff).
+        """Claim the next runnable job (``queued``, or ``failed`` past its backoff): the one
+        with the highest priority, oldest first.
 
         One ``BEGIN IMMEDIATE`` transaction around ``UPDATE … WHERE id = (SELECT … LIMIT 1)
         RETURNING *``: two workers can never claim the same job. Increments ``attempts``.
@@ -337,7 +398,8 @@ class JobQueue:
             "UPDATE jobs SET state = 'leased', lease_owner = ?, lease_expires_at = ?, "  # noqa: S608
             "attempts = attempts + 1, updated_at = ? "
             "WHERE id = (SELECT c.id FROM jobs AS c WHERE c.state IN ('queued', 'failed') "
-            f"AND c.next_run_at <= ?{filters} ORDER BY c.created_at, c.id LIMIT 1) "
+            f"AND c.next_run_at <= ?{filters} "
+            "ORDER BY c.priority DESC, c.created_at, c.id LIMIT 1) "
             "RETURNING *"
         )
         with self._write() as conn:
@@ -444,6 +506,7 @@ class JobQueue:
                     job.id,
                     body,
                     job.max_attempts,
+                    max(job.priority, PRIORITY_NORMAL),
                 )
         if row is None:
             return None
@@ -474,6 +537,7 @@ class JobQueue:
                     row["id"],
                     row["payload"],
                     row["max_attempts"],
+                    row["priority"],
                 )
                 revived += created is not None
         return revived
@@ -488,6 +552,7 @@ class JobQueue:
         job_id: int,
         payload: str,
         max_attempts: int,
+        priority: int,
     ) -> sqlite3.Row | None:
         """Insert the re-run of job ``job_id`` unless its family is at its cap (in a write)."""
         if _family_reruns(conn, rerun_family(key)) >= RERUN_CAP:
@@ -495,9 +560,20 @@ class JobQueue:
         now = to_db_time(self._now())
         row: sqlite3.Row | None = conn.execute(
             "INSERT INTO jobs(uid, acct, kind, dedupe_key, payload, state, attempts, "
-            "max_attempts, next_run_at, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?) RETURNING *",
-            (uid, acct, kind, rerun_key(key, job_id), payload, max_attempts, now, now, now),
+            "max_attempts, next_run_at, created_at, updated_at, priority) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?) RETURNING *",
+            (
+                uid,
+                acct,
+                kind,
+                rerun_key(key, job_id),
+                payload,
+                max_attempts,
+                now,
+                now,
+                now,
+                priority,
+            ),
         ).fetchone()
         return row
 
