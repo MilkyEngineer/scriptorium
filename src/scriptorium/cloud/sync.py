@@ -470,12 +470,12 @@ class SyncOnce:
         # The listing ran to its end and is incomplete only because documents failed.
         listing_failures = len(run.failed) if stop is None and not complete else 0
 
-        spent = False
+        spent: str | None = None
         if stop is None:
             max_per_poll = self._settings.tombstone_max_per_poll
             plan = self._planner(previous, current, library, tombstoned, max_per_poll)
             # The planner ran: an approval is used now or never (step 4 in the docstring).
-            spent = approval is not None
+            spent = approval
             if approval is not None:
                 rejected = _approval_rejected(
                     approval, plan, generation=root.generation, now=self._clock()
@@ -560,10 +560,14 @@ class SyncOnce:
         root_hash: str | None,
         listing_failures: int = 0,
         started_at: datetime | None = None,
-        consume_approval: bool = False,
+        consume_approval: str | None = None,
         scope_applied: str | None = None,
     ) -> None:
         """Record this poll's listing for the next one; consume the approval if told to.
+
+        ``consume_approval`` is the approval this poll read and planned with: it is removed
+        only if it is still the stored one, so an approval an administrator wrote while this
+        poll ran is left for the next poll.
 
         A complete listing clears the ``tombstoning_suspended_*`` keys; one that failed on
         ``listing_failures`` documents sets them (keeping the first poll's time).
@@ -591,7 +595,10 @@ class SyncOnce:
             self._index.set_state(STATE_LAST_ROOT_HASH, root_hash)
             if scope_applied is not None:
                 self._index.set_state(STATE_SCOPE_APPLIED, scope_applied)
-            if consume_approval:
+            if (
+                consume_approval is not None
+                and self._index.get_state(STATE_ALLOW_MASS_DELETE) == consume_approval
+            ):
                 self._index.set_state(STATE_ALLOW_MASS_DELETE, None)
 
     # ---- step 2 --------------------------------------------------------------------------

@@ -445,6 +445,28 @@ def test_an_unneeded_approval_is_spent_by_the_next_plan(
     assert [r["reason"] for r in rejections(caplog)] == ["unused"]
 
 
+def test_an_approval_written_while_a_poll_runs_is_left_for_the_next(tmp_path: Path) -> None:
+    """The poll spends the approval it read, never one an administrator wrote meanwhile."""
+    _cloud, h = _tripped(tmp_path)
+    clear_anomaly(h, approve=approval(h, PAGES[:5]))  # does not cover the six
+    fresh = approval(h, PAGES[:6])
+    planner = sync_module.default_planner()
+
+    def admin_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        plan = planner(*args, **kwargs)
+        h.index.set_state("allow_mass_delete", fresh)  # admin_clear_anomaly, mid-poll
+        return plan
+
+    sync = SyncOnce(h.client, h.archive, h.index, h.settings, h.clock, planner=admin_meanwhile)
+    assert sync.run().anomaly == "mass_delete"
+    assert h.state("allow_mass_delete") == fresh
+
+    clear_anomaly(h)
+    approved = h.poll()
+    assert approved.mass_delete_approved and approved.tombstoned == tuple(sorted(PAGES[:6]))
+    assert h.state("allow_mass_delete") is None
+
+
 def test_an_approval_survives_a_poll_that_never_reached_the_root(tmp_path: Path) -> None:
     cloud = FakeCloud()
     both(cloud)
