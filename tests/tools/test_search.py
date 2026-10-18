@@ -23,6 +23,10 @@ from tests.worker.helpers import Linked
 
 FOLDER = "00000000-0000-4000-8000-0000000000a1"
 INSIDE = "00000000-0000-4000-8000-0000000000a2"
+TAGGED = "00000000-0000-4000-8000-0000000000a3"
+D1 = "00000000-0000-4000-8000-0000000000a4"
+F2 = "00000000-0000-4000-8000-0000000000a5"
+D2 = "00000000-0000-4000-8000-0000000000a6"
 QUERY_MARKER = "querymarker4b7e"
 TAG_MARKER = "tag-marker-c81d"
 SEARCH_BOUND_S = 0.5
@@ -108,6 +112,7 @@ async def test_untranscribed_documents_are_found_by_name(library: Served) -> Non
             "name": "Scriptorium Test PDF",
             "path": "",
             "tags": [],
+            "folder_tags": [],
         }
     ]
 
@@ -136,7 +141,7 @@ async def test_search_filters_by_tag_and_folder(library: Served, linked: Linked)
     assert len(everything["items"]) == 3
     # Page 3 carries its own tag and the document's.
     page3 = next(i for i in everything["items"] if i.get("page") == 3)
-    assert page3["tags"] == ["retro", "review"]
+    assert page3["tags"] == ["retro", "review"] and page3["folder_tags"] == []
 
     retro = await library.ok("search", {"query": "meeting", "tags": ["retro"]})
     assert [(i["document"], i["page"]) for i in retro["items"]] == [(NOTEBOOK, 3)]
@@ -145,7 +150,10 @@ async def test_search_filters_by_tag_and_folder(library: Served, linked: Linked)
     below = await library.ok("search", {"query": "meeting", "folder": "Archive"})
     assert below["folder"] == FOLDER
     assert [(i["document"], i["page"]) for i in below["items"]] == [(INSIDE, 1)]
-    assert (await library.ok("search", {"query": "meeting", "tags": ["shelf"]}))["items"] == []
+    # A folder's tag covers what is in it (the live M2 acceptance case).
+    (shelved,) = (await library.ok("search", {"query": "meeting", "tags": ["shelf"]}))["items"]
+    assert (shelved["document"], shelved["page"]) == (INSIDE, 1)
+    assert shelved["tags"] == ["review"] and shelved["folder_tags"] == ["shelf"]
 
     # Tag names are searchable as text; an untranscribed document is found by its own tags.
     by_tag = await library.ok("search", {"query": "retro"})
@@ -205,6 +213,7 @@ async def test_list_shows_tags_and_filters_recursively(library: Served, linked: 
     root = await library.ok("list")
     tags = {item["uuid"]: item["tags"] for item in root["items"]}
     assert tags == {FOLDER: ["shelf"], NOTEBOOK: ["review"], PDF: []}
+    assert all(item["folder_tags"] == [] for item in root["items"])
     assert root["recursive"] is False
     review = await library.ok("list", {"tags": ["review"]})
     assert review["recursive"] is True
@@ -217,7 +226,73 @@ async def test_list_shows_tags_and_filters_recursively(library: Served, linked: 
     # A page tag finds its document (the item shows the document's own tags).
     retro = (await library.ok("list", {"tags": ["retro"]}))["items"]
     assert [(item["uuid"], item["tags"]) for item in retro] == [(NOTEBOOK, ["review"])]
+    # A folder's tag covers what is in it.
+    shelf = (await library.ok("list", {"tags": ["shelf"]}))["items"]
+    assert [(i["uuid"], i["tags"], i["folder_tags"]) for i in shelf] == [
+        (FOLDER, ["shelf"], []),
+        (INSIDE, ["review"], ["shelf"]),
+    ]
     assert (await library.error("list", {"tags": ["\x00"]}))["code"] == "invalid_argument"
+
+
+async def _nest_library(linked: Linked) -> None:
+    """``Tagged`` (folder, tagged ``team``) > ``D1`` (tagged ``own``), ``F2`` (folder) > ``D2``:
+    the shape of the live M2 acceptance run, one level deeper."""
+
+    def notebook(uuid: str, name: str, parent: str, **content: Any) -> dict[str, bytes]:
+        files = renamed(fixture_documents()[NOTEBOOK], NOTEBOOK, uuid)
+        files[f"{uuid}.metadata"] = _metadata(name, parent=parent)
+        files[f"{uuid}.content"] = _content(**content)
+        return files
+
+    def folder(name: str, parent: str, tags: list[str]) -> dict[str, bytes]:
+        return {
+            "metadata": _metadata(name, parent=parent, kind="CollectionType"),
+            "content": json.dumps({"tags": [{"name": t} for t in tags]}).encode(),
+        }
+
+    tagged, f2 = folder("Tagged", "", ["team"]), folder("F2", TAGGED, [])
+    linked.cloud.put_documents(
+        {
+            TAGGED: {
+                f"{TAGGED}.metadata": tagged["metadata"],
+                f"{TAGGED}.content": tagged["content"],
+            },
+            F2: {f"{F2}.metadata": f2["metadata"], f"{F2}.content": f2["content"]},
+            D1: notebook(D1, "First", TAGGED, tags=[{"name": "own"}]),
+            D2: notebook(D2, "Second", F2),
+        }
+    )
+    await linked.sync()
+
+
+async def test_list_and_search_inherit_folder_tags(library: Served, linked: Linked) -> None:
+    await _nest_library(linked)
+    team = (await library.ok("list", {"tags": ["team"]}))["items"]
+    shape = [(i["uuid"], i["type"], i["tags"], i["folder_tags"]) for i in team]
+    assert shape == [
+        (F2, "folder", [], ["team"]),
+        (TAGGED, "folder", ["team"], []),
+        (D1, "document", ["own"], ["team"]),  # untranscribed: found all the same
+        (D2, "document", [], ["team"]),
+    ]
+    inside = (await library.ok("list", {"folder": "Tagged/F2", "tags": ["team"]}))["items"]
+    assert [i["uuid"] for i in inside] == [D2]
+
+    await _transcribe(library, D2, 1, "quarterly budget")
+    (hit,) = (await library.ok("search", {"query": "budget", "tags": ["team"]}))["items"]
+    assert (hit["kind"], hit["document"], hit["page"]) == ("page", D2, 1)
+    assert hit["tags"] == [] and hit["folder_tags"] == ["team"]
+    assert hit["path"] == "Tagged/F2"
+    (first,) = (await library.ok("search", {"query": "first", "tags": ["team"]}))["items"]
+    assert first["kind"] == "document" and first["document"] == D1
+    assert first["tags"] == ["own"] and first["folder_tags"] == ["team"]
+
+    # Untagging the folder on the tablet takes the inherited tag away.
+    linked.cloud.set_file(TAGGED, f"{TAGGED}.content", json.dumps({"tags": []}).encode())
+    await linked.sync()
+    assert (await library.ok("list", {"tags": ["team"]}))["items"] == []
+    assert (await library.ok("search", {"query": "budget", "tags": ["team"]}))["items"] == []
 
 
 # ---- check 5: latency over a few thousand transcripts -----------------------------------------
@@ -228,7 +303,7 @@ PAGES_PER_DOC = 10
 
 def _populate(linked: Linked) -> int:
     """3000 synthetic transcripts in 300 documents under 10 folders; about 2 % mention the
-    query word, every 10th document is tagged."""
+    query word, every 10th document is tagged, and so is folder F3."""
     rng = random.Random(5)
     vocabulary = [f"w{n}" + "".join(rng.choices("aeioulnrst", k=4)) for n in range(2000)]
     index = linked.index()
@@ -243,6 +318,10 @@ def _populate(linked: Linked) -> int:
                     linked.clock(),
                 )
             )
+            if f == 3:
+                index.replace_tags(
+                    f"00000000-0000-4000-8001-{f:012x}", TagSet(frozenset({"benchfolder"}))
+                )
         for d in range(DOCS):
             uuid = f"00000000-0000-4000-8002-{d:012x}"
             parent = f"00000000-0000-4000-8001-{d % 10:012x}"
@@ -282,6 +361,8 @@ async def test_search_answers_within_500_ms_over_thousands_of_transcripts(
     calls: list[tuple[str, dict[str, Any]]] = [
         ("retro", {}),
         ("retro", {"tags": ["bench"]}),
+        ("retro", {"tags": ["benchfolder"]}),
+        ("notebook", {"tags": ["benchfolder"]}),
         ("retro", {"folder": "F3"}),
         ("notebook", {}),
     ]

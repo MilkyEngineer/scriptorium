@@ -31,14 +31,17 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Literal, Protocol, cast, get_args
 
-from scriptorium.library.tags import MAX_TAG_LEN, MAX_TAGS_PER_DOCUMENT, normalise_tag
+from scriptorium.library.tags import (
+    MAX_ANCESTOR_DEPTH,
+    MAX_TAG_LEN,
+    MAX_TAGS_PER_DOCUMENT,
+    normalise_tag,
+)
 
 SETTING_SYNC_SCOPE: Final = "sync_scope"
 MAX_SCOPE_TAGS: Final = 100
 MAX_TAG_SCAN: Final = 100_000
 """Entries of a ``tags`` list read for the scope; a longer list makes the tags unknown."""
-MAX_ANCESTOR_DEPTH: Final = 128
-"""Folders walked above a document; a deeper chain makes its folder tags unknown."""
 MAX_SETTING_CHARS: Final = 64 * 1024
 TRASH: Final = "trash"
 

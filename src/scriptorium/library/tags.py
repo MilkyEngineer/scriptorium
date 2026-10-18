@@ -36,6 +36,7 @@ from typing import Any, Final
 from scriptorium.library.layout import is_uuid
 
 __all__ = [
+    "MAX_ANCESTOR_DEPTH",
     "MAX_TAGS_PER_DOCUMENT",
     "MAX_TAG_LEN",
     "TagSet",
@@ -45,6 +46,10 @@ __all__ = [
 
 MAX_TAGS_PER_DOCUMENT: Final = 100
 MAX_TAG_LEN: Final = 64
+MAX_ANCESTOR_DEPTH: Final = 128
+"""Folders walked above an item for the tags they pass down (a folder's tags apply to
+everything below it): the sync scope (``cloud/scope.py``) and the ``tags`` filters of
+``list`` and ``search`` (``library/index.py``) stop here."""
 _MAX_SCAN: Final = 100_000
 """Entries of ``tags``/``pageTags``/``cPages`` looked at; the JSON itself is size-capped."""
 _REJECTED_CATEGORIES: Final = frozenset({"Cc", "Cs", "Zl", "Zp"})

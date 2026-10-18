@@ -133,9 +133,9 @@ class ListArgs(PageArgs):
         default=False, description="Also list items deleted from the cloud but kept here."
     )
     tags: list[TagName] | None = _tags_field(
-        "Only items carrying any of these tags (names as list shows them), on the item itself "
-        "or on one of its pages; the listing then covers everything below the folder, not "
-        "just its direct children."
+        "Only items carrying any of these tags (names as list shows them), on the item itself, "
+        "on one of its pages, or on a folder above it; the listing then covers everything "
+        "below the folder, not just its direct children."
     )
     account: str | None = _account_field()
 
@@ -143,11 +143,12 @@ class ListArgs(PageArgs):
 async def list_documents(ctx: ToolContext, args: ListArgs) -> CallToolResult:
     """List the folders and documents in a folder of your reMarkable library (the root by
     default), folders first, then by name. Each item has its name, type, UUID, last-modified
-    time, page count, state (live, trashed, or deleted from the cloud but kept here) and
-    tags. folder is a UUID or a path of names such as "Notes/Projects". tags keeps only the
-    items tagged with any of the given names (on the item or one of its pages), searching
-    everything below the folder rather than one level. Use next_cursor to continue a long
-    listing."""
+    time, page count, state (live, trashed, or deleted from the cloud but kept here), its
+    own tags and folder_tags (the tags of every folder above it). folder is a UUID or a path
+    of names such as "Notes/Projects". tags keeps only the items tagged with any of the given
+    names (on the item, one of its pages, or a folder above it, since a folder's tags apply to
+    everything in it), searching everything below the folder rather than one level. Use
+    next_cursor to continue a long listing."""
     account = await use_account(ctx, args.account)
     parent: str | None = None
     if args.folder is not None:
@@ -168,7 +169,7 @@ async def list_documents(ctx: ToolContext, args: ListArgs) -> CallToolResult:
             "account": account.acct,
             "folder": parent,
             "recursive": bool(args.tags),
-            "items": [document_item(doc) for doc in page.items],
+            "items": [document_item(doc, folder_tags=True) for doc in page.items],
             "next_cursor": page.next_cursor,
         }
 
@@ -251,8 +252,9 @@ class SearchArgs(PageArgs):
         description="Only documents anywhere below this folder (UUID or path of names).",
     )
     tags: list[TagName] | None = _tags_field(
-        "Only results tagged with any of these names: a page matches on its own tags or its "
-        "document's, a document on its own or any of its pages'."
+        "Only results tagged with any of these names: a page matches on its own tags, its "
+        "document's or a folder's above it; a document on its own, any of its pages' or a "
+        "folder's above it."
     )
     account: str | None = _account_field()
 
@@ -270,6 +272,7 @@ def _hit_item(hit: SearchHit | DocumentHit) -> dict[str, object]:
             "current": hit.current,
             "snippet": _bounded(hit.snippet, SNIPPET_MAX),
             "tags": list(hit.tags),
+            "folder_tags": list(hit.folder_tags),
         }
     return {
         "kind": "document",
@@ -277,6 +280,7 @@ def _hit_item(hit: SearchHit | DocumentHit) -> dict[str, object]:
         "name": display_name(hit.doc_name),
         "path": _bounded(hit.doc_path, PATH_MAX),
         "tags": list(hit.tags),
+        "folder_tags": list(hit.folder_tags),
     }
 
 
@@ -284,11 +288,12 @@ async def search(ctx: ToolContext, args: SearchArgs) -> CallToolResult:
     """Search your reMarkable library: the transcripts of transcribed pages, document names,
     folder paths and tag names, every word of query must match. Page results come first,
     best match first, each with its document, 1-based page number (null if the page is no
-    longer in the document), a snippet, its tags, and current (false when the snippet is
-    from an older version of the page); read_page fetches the full text. Documents with no
-    transcribed page are found by name or tag and follow as document results. folder limits
-    the search to everything below a folder; tags keeps results tagged with any of the
-    given names. Use next_cursor to continue."""
+    longer in the document), a snippet, its tags, folder_tags (the tags of every folder above
+    the document), and current (false when the snippet is from an older version of the
+    page); read_page fetches the full text. Documents with no transcribed page are found by
+    name or tag and follow as document results. folder limits the search to everything below
+    a folder; tags keeps results tagged with any of the given names, on the page, its
+    document or a folder above it. Use next_cursor to continue."""
     account = await use_account(ctx, args.account)
     folder: str | None = None
     if args.folder is not None:

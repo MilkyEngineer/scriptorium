@@ -54,7 +54,12 @@ from scriptorium.db.migrations import migrate as run_migrations
 from scriptorium.db.schema_account import ACCOUNT_STEPS
 from scriptorium.errors import InvalidArgumentError, NotFoundError
 from scriptorium.library.layout import is_uuid
-from scriptorium.library.tags import MAX_TAGS_PER_DOCUMENT, TagSet, normalise_tag
+from scriptorium.library.tags import (
+    MAX_ANCESTOR_DEPTH,
+    MAX_TAGS_PER_DOCUMENT,
+    TagSet,
+    normalise_tag,
+)
 
 DOCUMENT_TYPES: Final = frozenset({"DocumentType", "CollectionType"})
 DELETION_CAUSES: Final = frozenset({"user", "aged", "unknown"})
@@ -96,6 +101,9 @@ class DocumentRow:
     """Set while the document is outside the account's sync scope (M2, §11.1): only its
     ``.metadata`` and ``.content`` were fetched, and ``hash_root``/``generation`` still name
     the last version archived before it left the scope (None if it never was)."""
+    folder_tags: tuple[str, ...] = ()
+    """The own tags of every folder above it, sorted and deduplicated: what the ``tags``
+    filter inherits (§11.2). Filled by :meth:`Index.children` only; () elsewhere."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +173,7 @@ class SearchHit:
     doc_path: str
     snippet: str
     tags: tuple[str, ...] = ()  # the page's own tags and its document's, sorted
+    folder_tags: tuple[str, ...] = ()  # the tags of every folder above its document, sorted
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +188,7 @@ class DocumentHit:
     doc_name: str
     doc_path: str
     tags: tuple[str, ...] = ()  # the document's own tags, sorted
+    folder_tags: tuple[str, ...] = ()  # the tags of every folder above it, sorted
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +279,36 @@ def _has_tag(document: str, page: str | None, count: int) -> str:
     )
 
 
+def _inherit_cte(count: int) -> str:
+    """``inherit(uuid, depth)``: every row below a row whose own tags hold one of ``count``
+    bound names, down to :data:`MAX_ANCESTOR_DEPTH` levels (a folder's tags apply to
+    everything below it, as in the sync scope, §11.1).
+
+    The walk is the one :meth:`Index._folder_tags` makes upwards, from the other end, and
+    ignores tombstone and scope state. Parent links come from cloud metadata: a cycle repeats
+    rows at growing depths until the bound, so it ends. Page tags pass nothing down.
+    """
+    return (
+        "inherit(uuid, depth) AS (SELECT d.uuid, 1 FROM documents d WHERE d.parent IN "  # noqa: S608
+        "(SELECT g.document FROM tags g WHERE g.page = '' "
+        f"AND g.name IN ({_marks(count)})) "  # placeholders and a constant, never input
+        "UNION SELECT d.uuid, i.depth + 1 FROM documents d JOIN inherit i ON d.parent = i.uuid "
+        f"WHERE i.depth < {MAX_ANCESTOR_DEPTH})"
+    )
+
+
+def _tagged(document: str, page: str | None, count: int) -> str:
+    """The ``tags`` filter: :func:`_has_tag`, or a folder above ``document`` has one of the
+    names (the ``inherit`` table of :func:`_inherit_cte`, which must be in the query)."""
+    clause = _has_tag(document, page, count)
+    return f"({clause} OR {document} IN (SELECT uuid FROM inherit))"  # noqa: S608 - fixed
+
+
+def _with(ctes: Sequence[str]) -> str:
+    """``WITH RECURSIVE`` over the fixed table expressions ``ctes``; ``""`` for none."""
+    return f"WITH RECURSIVE {', '.join(ctes)} " if ctes else ""
+
+
 def _tags_text(names: Iterable[str]) -> str:
     """``transcripts.doc_tags``: the names, sorted, one per line (each is its own FTS text)."""
     return "\n".join(sorted(names))
@@ -295,7 +335,11 @@ def _opt_time(moment: datetime | None) -> str | None:
     return None if moment is None else to_db_time(moment)
 
 
-def _document(row: sqlite3.Row, tags: Mapping[str, tuple[str, ...]] | None = None) -> DocumentRow:
+def _document(
+    row: sqlite3.Row,
+    tags: Mapping[str, tuple[str, ...]] | None = None,
+    folder_tags: Mapping[str, tuple[str, ...]] | None = None,
+) -> DocumentRow:
     return DocumentRow(
         uuid=row["uuid"],
         type=row["type"],
@@ -311,6 +355,7 @@ def _document(row: sqlite3.Row, tags: Mapping[str, tuple[str, ...]] | None = Non
         generation=row["generation"],
         tags=() if tags is None else tags.get(row["uuid"], ()),
         excluded_at=opt_from_db_time(row["excluded_at"]),
+        folder_tags=() if folder_tags is None else folder_tags.get(row["uuid"], ()),
     )
 
 
@@ -521,24 +566,28 @@ class Index:
         appear only with ``include_deleted``.
 
         ``tags`` (§11.2) keeps the documents and folders carrying any of the names (exact,
-        normalised names), as their own tags or on any of their pages, and makes the listing
-        recursive: everything below ``parent`` at any depth, in one flat list under the same
-        sort key. At the root, the trash's subtree is included only with ``include_trash``;
-        what is below a tombstoned folder only with ``include_deleted`` (the one-level listing
-        never reaches it either).
+        normalised names), as their own tags, on any of their pages, or on any folder above
+        them (to :data:`MAX_ANCESTOR_DEPTH` levels, whatever that folder's state), and makes
+        the listing recursive: everything below ``parent`` at any depth, in one flat list
+        under the same sort key. At the root, the trash's subtree is included only with
+        ``include_trash``; what is below a tombstoned folder only with ``include_deleted``
+        (the one-level listing never reaches it either).
+
+        Every row carries ``folder_tags``, with or without a filter.
         """
         _check_limit(limit)
         parent = _norm_parent(parent)
         names = _tag_filter(tags)
         start: str
-        params: list[Any] = []
+        start_params: list[Any]
         if parent is None and include_trash:
             start = "(parent IS NULL OR parent = ?)"
-            params.append(TRASH)
+            start_params = [TRASH]
         else:
             start = "parent IS ?"
-            params.append(parent)
+            start_params = [parent]
         where: list[str] = []
+        params: list[Any] = list(start_params)
         prefix = ""
         if names is None:
             where.append(start)
@@ -548,12 +597,16 @@ class Index:
             # tombstoned folder, as the one-level listing never shows what is below one.
             first = "" if include_deleted else " AND deleted_at IS NULL"
             below = "" if include_deleted else " WHERE d.deleted_at IS NULL"
-            prefix = (
-                f"WITH RECURSIVE sub(uuid) AS (SELECT uuid FROM documents WHERE {start}{first} "  # noqa: S608
-                f"UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid{below}) "
+            prefix = _with(
+                [
+                    f"sub(uuid) AS (SELECT uuid FROM documents WHERE {start}{first} "  # noqa: S608
+                    f"UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid{below})",
+                    _inherit_cte(len(names)),
+                ]
             )
+            params.extend(names)  # inherit
             where.append("uuid IN (SELECT uuid FROM sub)")
-            where.append(_has_tag("documents.uuid", None, len(names)))
+            where.append(_tagged("documents.uuid", None, len(names)))
             params.extend(names)
         if not include_deleted:
             where.append("deleted_at IS NULL")
@@ -568,7 +621,8 @@ class Index:
         with self._lock:
             rows = self._conn.execute(sql, (*params, limit + 1)).fetchall()
             found = self._document_tags([r["uuid"] for r in rows[:limit]])
-        items = [_document(r, found) for r in rows[:limit]]
+            above = self._folder_tags(r["uuid"] for r in rows[:limit])
+        items = [_document(r, found, above) for r in rows[:limit]]
         next_cursor = None
         if len(rows) > limit:
             last = items[-1]
@@ -920,6 +974,60 @@ class Index:
                 out.setdefault(r["document"], []).append(r["name"])
         return {uuid: tuple(names) for uuid, names in out.items()}
 
+    def _folder_tags(self, uuids: Iterable[str]) -> dict[str, tuple[str, ...]]:
+        """For each of ``uuids``, the union of the own tags of every row above it, sorted;
+        rows with none are absent. What the ``tags`` filters inherit (§11.2).
+
+        The upward form of :func:`_inherit_cte`'s walk: it stops at the root, the trash, a
+        parent not in the index, a row already visited (the item itself included: the
+        parents are cloud metadata and may form a cycle) or after
+        :data:`MAX_ANCESTOR_DEPTH` rows; tombstone and scope state do not matter. One query
+        per level of the tree for all the items, then one for the tags.
+        """
+        starts = sorted(set(uuids))
+        parent_of: dict[str, str | None] = {}
+        frontier = starts
+        for _ in range(MAX_ANCESTOR_DEPTH):  # the parents of level k name level k + 1
+            wanted = sorted({u for u in frontier if u not in parent_of})
+            if not wanted:
+                break
+            found = self._parents(wanted)
+            parent_of.update((u, found.get(u)) for u in wanted)
+            frontier = [p for p in found.values() if p is not None and p != TRASH]
+        own = self._document_tags(
+            sorted({p for p in parent_of.values() if p is not None and p != TRASH})
+        )
+        out: dict[str, tuple[str, ...]] = {}
+        for start in starts:
+            names: set[str] = set()
+            seen = {start}
+            current = parent_of.get(start)
+            while (
+                current is not None
+                and current != TRASH
+                and current not in seen
+                and len(seen) <= MAX_ANCESTOR_DEPTH
+            ):
+                seen.add(current)
+                names.update(own.get(current, ()))
+                current = parent_of.get(current)
+            if names:
+                out[start] = tuple(sorted(names))
+        return out
+
+    def _parents(self, uuids: Sequence[str]) -> dict[str, str | None]:
+        """Each row's parent; rows not in the index are absent."""
+        out: dict[str, str | None] = {}
+        for start in range(0, len(uuids), 500):
+            chunk = list(uuids[start : start + 500])
+            for r in self._conn.execute(
+                "SELECT uuid, parent FROM documents "  # noqa: S608 - placeholders only
+                f"WHERE uuid IN ({_marks(len(chunk))})",
+                chunk,
+            ):
+                out[r["uuid"]] = r["parent"]
+        return out
+
     def _page_tags(self, documents: Iterable[str]) -> dict[str, dict[str, set[str]]]:
         """``document → page id ('' for the document) → names`` for ``documents``."""
         wanted = sorted(set(documents))
@@ -1091,9 +1199,12 @@ class Index:
         case-insensitively, sorted by name and UUID.
 
         ``folder`` (a folder UUID) keeps documents anywhere below it. ``tags`` is an any-of
-        filter on exact, normalised names: a transcript hit matches on its page's own tags or
-        its document's, a document hit on any tag of the document (its own or a page's). Hits
-        carry ``tags``: for a page, its own and its document's; for a document, its own.
+        filter on exact, normalised names: a transcript hit matches on its page's own tags,
+        its document's, or those of a folder above the document; a document hit on any tag of
+        the document (its own or a page's) or of a folder above it. Folder tags are inherited
+        in this filter only (the full-text index holds the document's and page's tags, not
+        its folders'). Hits carry ``tags``: for a page, its own and its document's; for a
+        document, its own; and ``folder_tags``, those of every folder above the document.
         """
         _check_limit(limit)
         terms = _search_terms(query)
@@ -1110,7 +1221,8 @@ class Index:
             if name_key is None:
                 rows = self._search_fts(terms, folder, names, fts_key, limit + 1)
                 found = self._page_tags(r["document"] for r in rows[:limit])
-                items.extend(_search_hit(r, found) for r in rows[:limit])
+                above = self._folder_tags(r["document"] for r in rows[:limit])
+                items.extend(_search_hit(r, found, above) for r in rows[:limit])
                 if len(rows) > limit:
                     last = rows[limit - 1]
                     key = (float(last["rank"]), int(last["id"]))
@@ -1119,10 +1231,17 @@ class Index:
             matched = self._search_names(terms, folder, names, name_key, room + 1)
             hits = matched[:room]
             own = self._document_tags([uuid for uuid, _ in hits])
+            above = self._folder_tags(uuid for uuid, _ in hits)
             for uuid, name in hits:
                 _, path = self._name_and_path(uuid)
                 items.append(
-                    DocumentHit(document=uuid, doc_name=name, doc_path=path, tags=own.get(uuid, ()))
+                    DocumentHit(
+                        document=uuid,
+                        doc_name=name,
+                        doc_path=path,
+                        tags=own.get(uuid, ()),
+                        folder_tags=above.get(uuid, ()),
+                    )
                 )
         next_cursor = None
         if len(matched) > room:
@@ -1132,16 +1251,24 @@ class Index:
         return Page(items, next_cursor)
 
     @staticmethod
-    def _subtree(folder: str | None) -> tuple[str, list[Any]]:
-        """A ``WITH`` prefix naming ``sub``, every row below ``folder``; ``""`` for none."""
-        if folder is None:
-            return "", []
-        # UNION drops repeats, so a parent cycle in cloud metadata ends the walk.
-        return (
-            "WITH RECURSIVE sub(uuid) AS (SELECT uuid FROM documents WHERE parent = ? "
-            "UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid) ",
-            [folder],
-        )
+    def _search_ctes(
+        folder: str | None, names: Sequence[str] | None
+    ) -> tuple[list[str], list[Any]]:
+        """The table expressions of a search and their bound values: ``sub``, every row below
+        ``folder`` (none without one), and ``inherit`` for a ``tags`` filter."""
+        ctes: list[str] = []
+        params: list[Any] = []
+        if folder is not None:
+            # UNION drops repeats, so a parent cycle in cloud metadata ends the walk.
+            ctes.append(
+                "sub(uuid) AS (SELECT uuid FROM documents WHERE parent = ? "
+                "UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid)"
+            )
+            params.append(folder)
+        if names is not None:
+            ctes.append(_inherit_cte(len(names)))
+            params.extend(names)
+        return ctes, params
 
     def _search_fts(
         self,
@@ -1151,13 +1278,14 @@ class Index:
         after: Sequence[Any] | None,
         limit: int,
     ) -> list[sqlite3.Row]:
-        prefix, params = self._subtree(folder)
+        ctes, params = self._search_ctes(folder, names)
+        prefix = _with(ctes)
         where = ["transcripts_fts MATCH ?"]
         params.append(_fts_query(terms))
         if folder is not None:
             where.append("t.document IN (SELECT uuid FROM sub)")
         if names is not None:
-            where.append(_has_tag("t.document", "g.page IN ('', t.page)", len(names)))
+            where.append(_tagged("t.document", "g.page IN ('', t.page)", len(names)))
             params.extend(names)
         if after is not None:
             rank, last_id = after
@@ -1186,7 +1314,8 @@ class Index:
     ) -> list[tuple[str, str]]:
         """``(uuid, name)`` of untranscribed live documents whose name or tags (their own or
         any page's: an untranscribed page has no other way to be found) hold every term."""
-        prefix, params = self._subtree(folder)
+        ctes, params = self._search_ctes(folder, names)
+        prefix = _with(ctes)
         where = [
             "d.type = 'DocumentType'",
             "d.deleted_at IS NULL",
@@ -1202,7 +1331,7 @@ class Index:
         if folder is not None:
             where.append("d.uuid IN (SELECT uuid FROM sub)")
         if names is not None:
-            where.append(_has_tag("d.uuid", None, len(names)))
+            where.append(_tagged("d.uuid", None, len(names)))
             params.extend(names)
         if after is not None:
             where.append("(d.name COLLATE NOCASE, d.uuid) > (?, ?)")
@@ -1301,7 +1430,11 @@ class Index:
             )
 
 
-def _search_hit(r: sqlite3.Row, tags: Mapping[str, Mapping[str, set[str]]]) -> SearchHit:
+def _search_hit(
+    r: sqlite3.Row,
+    tags: Mapping[str, Mapping[str, set[str]]],
+    folder_tags: Mapping[str, tuple[str, ...]],
+) -> SearchHit:
     on_document = tags.get(r["document"], {})
     names = on_document.get("", set()) | on_document.get(r["page"], set())
     return SearchHit(
@@ -1314,6 +1447,7 @@ def _search_hit(r: sqlite3.Row, tags: Mapping[str, Mapping[str, set[str]]]) -> S
         doc_path=r["doc_path"],
         snippet=r["snippet"],
         tags=tuple(sorted(names)),
+        folder_tags=folder_tags.get(r["document"], ()),
     )
 
 

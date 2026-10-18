@@ -237,11 +237,12 @@ def display_name(name: str) -> str:
     return name if len(name) <= _NAME_MAX else name[: _NAME_MAX - 1] + "…"
 
 
-def document_item(doc: DocumentRow) -> dict[str, object]:
+def document_item(doc: DocumentRow, *, folder_tags: bool = False) -> dict[str, object]:
     """One row of ``list``/``trash``: name, type, uuid, modified, page count, state, tags.
 
     Tags are the document's (or folder's) own, sorted; display data, bounded at parse time
-    (``library/tags.py``).
+    (``library/tags.py``). ``folder_tags`` (``list`` only) adds those of every folder above
+    the item, which the ``tags`` filter inherits.
     """
     item: dict[str, object] = {
         "uuid": doc.uuid,
@@ -251,6 +252,8 @@ def document_item(doc: DocumentRow) -> dict[str, object]:
         "state": state_of(doc),
         "tags": list(doc.tags),
     }
+    if folder_tags:
+        item["folder_tags"] = list(doc.folder_tags)
     if doc.type == DOCUMENT:
         item["pages"] = doc.page_count
         if doc.source_kind:

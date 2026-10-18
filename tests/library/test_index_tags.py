@@ -1,5 +1,6 @@
 """Tags in the index (account step V4): replace_tags, tags_of, documents_tagged,
-children(tags=), and search with folder and tag filters (Architecture §6.1, §11.2).
+children(tags=), and search with folder and tag filters, folder tags passing down to
+everything below (Architecture §6.1, §11.2).
 
 Every name here is synthetic.
 """
@@ -14,12 +15,13 @@ from typing import Any
 
 import pytest
 
+from scriptorium.cloud.scope import Known, ancestor_tags
 from scriptorium.db.connect import open_sqlite
 from scriptorium.db.migrations import migrate
 from scriptorium.db.schema_account import ACCOUNT_STEPS
 from scriptorium.errors import InvalidArgumentError
 from scriptorium.library.index import DocumentHit, DocumentRow, Index, PageRow, SearchHit
-from scriptorium.library.tags import TagSet
+from scriptorium.library.tags import MAX_ANCESTOR_DEPTH, TagSet
 from tests.db.sqlite_support import requires_fts5
 from tests.fakes.index import FakeIndex
 
@@ -179,17 +181,20 @@ def tree(index: Index) -> Index:
 
 
 def test_children_with_tags_is_recursive_any_of(tree: Index) -> None:
-    assert listed(tree, None, ["x"]) == ["F", "deep", "top"]
+    # G and mid carry no x of their own: they inherit it from F.
+    assert listed(tree, None, ["x"]) == ["F", "G", "deep", "mid", "top"]
     assert listed(tree, None, ["y"]) == ["mid", "top"]
-    assert listed(tree, None, ["x", "y"]) == ["F", "deep", "mid", "top"]
-    assert listed(tree, uid(1), ["x"]) == ["deep"]  # below F, not F itself
+    assert listed(tree, None, ["x", "y"]) == ["F", "G", "deep", "mid", "top"]
+    assert listed(tree, uid(1), ["x"]) == ["G", "deep", "mid"]  # below F, not F itself
     assert listed(tree, uid(2), ["y"]) == []
     assert listed(tree, None, ["nothing"]) == []
 
 
 def test_children_with_tags_respects_trash_and_tombstones(tree: Index) -> None:
-    assert listed(tree, None, ["x"], include_trash=True) == ["F", "deep", "top", "trashed"]
-    assert listed(tree, None, ["x"], include_deleted=True) == ["F", "deep", "gone", "top"]
+    with_trash = listed(tree, None, ["x"], include_trash=True)
+    assert with_trash == ["F", "G", "deep", "mid", "top", "trashed"]
+    with_deleted = listed(tree, None, ["x"], include_deleted=True)
+    assert with_deleted == ["F", "G", "deep", "gone", "mid", "top"]
     assert listed(tree, "trash", ["x"]) == ["trashed"]
 
 
@@ -207,9 +212,11 @@ def test_children_with_tags_does_not_walk_into_a_tombstoned_folder(index: Index)
     plain = index.children(None, include_trash=False, include_deleted=False, cursor=None, limit=50)
     assert [d.name for d in plain.items] == ["alive"]
     assert listed(index, None, ["x"]) == ["alive"]
-    assert listed(index, None, ["x"], include_deleted=True) == ["Dead", "alive", "orphan"]
-    # Listing the tombstoned folder itself shows what is in it, as the plain listing does.
-    assert listed(index, uid(10), ["x"]) == ["orphan"]
+    everything = listed(index, None, ["x"], include_deleted=True)
+    assert everything == ["Dead", "Inner", "alive", "orphan"]
+    # Listing the tombstoned folder itself shows what is in it, as the plain listing does;
+    # Inner inherits x from Dead, whose tombstone does not stop its tags passing down.
+    assert listed(index, uid(10), ["x"]) == ["Inner", "orphan"]
 
 
 def test_children_with_tags_paginates_without_repeats(tree: Index) -> None:
@@ -217,7 +224,7 @@ def test_children_with_tags_paginates_without_repeats(tree: Index) -> None:
         tree.upsert_document(doc(n, f"extra {n}", parent=uid(2)))
         tree.replace_tags(uid(n), tagset({"x"}))
     everything = listed(tree, None, ["x"], limit=100)
-    assert len(everything) == 28
+    assert len(everything) == 30
     for limit in (1, 3, 7):
         assert listed(tree, None, ["x"], limit=limit) == everything
 
@@ -254,6 +261,127 @@ def test_children_with_tags_survives_a_parent_cycle(index: Index) -> None:
     index.upsert_document(doc(3, "C", parent=uid(1)))
     index.replace_tags(uid(3), tagset({"x"}))
     assert listed(index, uid(1), ["x"]) == ["C"]
+
+
+# ---- folder tags pass down ------------------------------------------------------------------
+
+
+@pytest.fixture
+def nested(index: Index) -> Index:
+    """Root: T (folder, tagged t) > D (own tag "own"), U (untranscribed), F2 (folder) > D2
+    (transcribed); Out (transcribed, untagged) at the root."""
+    index.upsert_document(folder(1, "T"))
+    index.upsert_document(doc(2, "D", parent=uid(1)))
+    index.upsert_document(folder(3, "F2", parent=uid(1)))
+    index.upsert_document(doc(4, "D2", parent=uid(3)))
+    index.upsert_document(doc(5, "U", parent=uid(1)))
+    index.upsert_document(doc(6, "Out"))
+    for n in (2, 4, 5, 6):
+        pages_of(index, n, 1)
+    index.put_transcript(uid(4), uid(400), "h4-0", "budget review", "m", "lazy")
+    index.put_transcript(uid(6), uid(600), "h6-0", "budget elsewhere", "m", "lazy")
+    index.replace_tags(uid(1), tagset({"t"}))
+    index.replace_tags(uid(2), tagset({"own"}))
+    return index
+
+
+def rows(ix: Index, parent: str | None, tags: list[str] | None) -> dict[str, DocumentRow]:
+    page = ix.children(
+        parent, include_trash=False, include_deleted=False, tags=tags, cursor=None, limit=500
+    )
+    return {d.name: d for d in page.items}
+
+
+def test_children_inherit_folder_tags(nested: Index) -> None:
+    found = rows(nested, None, ["t"])
+    assert list(found) == ["F2", "T", "D", "D2", "U"]  # U: no transcript, still listed
+    assert found["T"].tags == ("t",) and found["T"].folder_tags == ()
+    for name in ("F2", "D", "D2", "U"):
+        assert found[name].folder_tags == ("t",), name
+    assert found["D"].tags == ("own",)  # its own tags, unchanged
+    assert found["D2"].tags == ()
+    assert list(rows(nested, uid(3), ["t"])) == ["D2"]
+    assert list(rows(nested, None, ["own"])) == ["D"]
+    # Without a filter the rows carry folder_tags too.
+    plain = rows(nested, uid(1), None)
+    assert {n: d.folder_tags for n, d in plain.items()} == {
+        "F2": ("t",),
+        "D": ("t",),
+        "U": ("t",),
+    }
+    assert rows(nested, None, None)["T"].folder_tags == ()
+
+
+def test_folder_tags_union_every_folder_above(nested: Index) -> None:
+    nested.replace_tags(uid(3), tagset({"t", "u"}))
+    found = rows(nested, None, ["u"])
+    assert list(found) == ["F2", "D2"]  # F2 by its own tag, D2 by F2's
+    assert found["F2"].folder_tags == ("t",)
+    assert found["D2"].folder_tags == ("t", "u")  # deduplicated, sorted
+
+
+def test_page_tags_pass_nothing_down(index: Index) -> None:
+    index.upsert_document(doc(1, "Odd"))  # a document named as a parent: untrusted metadata
+    pages_of(index, 1, 1)
+    index.upsert_document(doc(2, "Below", parent=uid(1)))
+    index.replace_tags(uid(1), tagset({"own"}, {uid(100): {"page-only"}}))
+    assert listed(index, None, ["page-only"]) == ["Odd"]
+    # A row's own tags pass down whatever its type, as in the sync scope.
+    assert rows(index, uid(1), ["own"])["Below"].folder_tags == ("own",)
+
+
+def test_a_folder_that_loses_its_tag_no_longer_passes_it_down(nested: Index) -> None:
+    nested.replace_tags(uid(1), TagSet())
+    assert rows(nested, None, ["t"]) == {}
+    assert nested.search("budget", tags=["t"], cursor=None, limit=10).items == []
+    assert all(d.folder_tags == () for d in rows(nested, uid(1), None).values())
+
+
+def test_inherited_tags_survive_a_parent_cycle(index: Index) -> None:
+    """A > B > A in cloud metadata, A tagged x, C in A, E in B: nothing hangs, and an item
+    never inherits from itself."""
+    index.upsert_document(folder(1, "A", parent=uid(2)))
+    index.upsert_document(folder(2, "B", parent=uid(1)))
+    index.upsert_document(doc(3, "C", parent=uid(1)))
+    index.upsert_document(doc(4, "E", parent=uid(2)))
+    pages_of(index, 4, 1)
+    index.put_transcript(uid(4), uid(400), "h4-0", "loop text", "m", "lazy")
+    index.replace_tags(uid(1), tagset({"x"}))
+    found = rows(index, uid(1), ["x"])
+    assert list(found) == ["A", "B", "C", "E"]
+    assert found["A"].folder_tags == ()
+    assert found["B"].folder_tags == ("x",)
+    assert found["C"].folder_tags == ("x",)
+    assert found["E"].folder_tags == ("x",)
+    (hit,) = index.search("loop", tags=["x"], cursor=None, limit=5).items
+    assert isinstance(hit, SearchHit) and hit.folder_tags == ("x",)
+
+
+def test_inheritance_stops_at_the_depth_limit(index: Index) -> None:
+    """A chain of MAX_ANCESTOR_DEPTH + 2 folders below a tagged one: the items more than
+    MAX_ANCESTOR_DEPTH folders below it do not inherit, and nothing fails."""
+    index.upsert_document(folder(1, "top"))
+    index.replace_tags(uid(1), tagset({"deep"}))
+    chain = MAX_ANCESTOR_DEPTH + 2
+    with index.transaction():
+        for n in range(2, chain + 2):
+            index.upsert_document(folder(n, f"f{n - 1:03d}", parent=uid(n - 1)))
+    index.upsert_document(doc(chain + 2, "bottom", parent=uid(chain + 1)))
+    # fNNN is NNN folders below top: f001 to f128 inherit; f129, f130 and bottom do not.
+    expected = ["top"] + [f"f{n:03d}" for n in range(1, MAX_ANCESTOR_DEPTH + 1)]
+    assert sorted(listed(index, None, ["deep"], limit=1000)) == sorted(expected)
+    last = rows(index, uid(MAX_ANCESTOR_DEPTH), None)
+    assert {n: d.folder_tags for n, d in last.items()} == {f"f{MAX_ANCESTOR_DEPTH:03d}": ("deep",)}
+    past = rows(index, uid(MAX_ANCESTOR_DEPTH + 1), None)
+    assert {n: d.folder_tags for n, d in past.items()} == {f"f{MAX_ANCESTOR_DEPTH + 1:03d}": ()}
+    assert rows(index, uid(chain + 1), None)["bottom"].folder_tags == ()
+    # The sync scope's walk stops at the same place.
+    known = {
+        uid(n): Known(frozenset({"deep"} if n == 1 else ()), uid(n - 1) if n > 1 else None)
+        for n in range(1, chain + 2)
+    }
+    assert ancestor_tags(uid(MAX_ANCESTOR_DEPTH), known.get)[0] == frozenset({"deep"})
+    assert ancestor_tags(uid(MAX_ANCESTOR_DEPTH + 1), known.get)[0] == frozenset()
 
 
 # ---- search ---------------------------------------------------------------------------------
@@ -384,6 +512,41 @@ def test_page_tag_matches_keep_the_cursors_stable(index: Index) -> None:
     assert len(everything) == 7
     for limit in (1, 2, 3):
         assert listed(index, None, ["harbour"], limit=limit) == everything
+
+
+def test_search_inherits_folder_tags(nested: Index) -> None:
+    hits = nested.search("budget", tags=["t"], cursor=None, limit=10).items
+    assert hits == [
+        SearchHit(
+            page_id=uid(400),
+            document=uid(4),
+            idx=0,
+            content_hash="h4-0",
+            current=True,
+            doc_name="D2",
+            doc_path="T/F2",
+            snippet="budget review",
+            tags=(),
+            folder_tags=("t",),
+        )
+    ]
+    # Unfiltered hits carry folder_tags too; the full-text index holds no folder tag.
+    everywhere = nested.search("budget", cursor=None, limit=10).items
+    assert {h.page_id: h.folder_tags for h in everywhere if isinstance(h, SearchHit)} == {
+        uid(400): ("t",),
+        uid(600): (),
+    }
+    row = nested._conn.execute("SELECT doc_tags FROM transcripts WHERE document = ?", (uid(4),))
+    assert row.fetchone()[0] == ""
+    # An untranscribed document below the folder is a document hit.
+    (u,) = nested.search("u", tags=["t"], cursor=None, limit=10).items
+    assert u == DocumentHit(document=uid(5), doc_name="U", doc_path="T", folder_tags=("t",))
+    (d,) = nested.search("d", tags=["t"], cursor=None, limit=10).items
+    assert isinstance(d, DocumentHit) and d.tags == ("own",) and d.folder_tags == ("t",)
+    # With folder= the two filters combine.
+    below = nested.search("budget", folder=uid(3), tags=["t"], cursor=None, limit=10).items
+    assert ids(below) == [uid(400)]
+    assert nested.search("budget", folder=uid(3), tags=["own"], cursor=None, limit=10).items == []
 
 
 def test_folder_filter_is_the_subtree(library: Index) -> None:
