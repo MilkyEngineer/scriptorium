@@ -193,6 +193,25 @@ def test_children_with_tags_respects_trash_and_tombstones(tree: Index) -> None:
     assert listed(tree, "trash", ["x"]) == ["trashed"]
 
 
+def test_children_with_tags_does_not_walk_into_a_tombstoned_folder(index: Index) -> None:
+    """A live document below a tombstoned folder: the plain root listing never reaches it,
+    and neither does the recursive tag listing, unless deleted rows are asked for."""
+    index.upsert_document(folder(10, "Dead"))
+    index.upsert_document(folder(11, "Inner", parent=uid(10)))
+    index.upsert_document(doc(12, "orphan", parent=uid(11)))
+    index.upsert_document(doc(13, "alive"))
+    for n in (10, 12, 13):
+        index.replace_tags(uid(n), tagset({"x"}))
+    index.mark_deleted(uid(10), "unknown", T0)
+
+    plain = index.children(None, include_trash=False, include_deleted=False, cursor=None, limit=50)
+    assert [d.name for d in plain.items] == ["alive"]
+    assert listed(index, None, ["x"]) == ["alive"]
+    assert listed(index, None, ["x"], include_deleted=True) == ["Dead", "alive", "orphan"]
+    # Listing the tombstoned folder itself shows what is in it, as the plain listing does.
+    assert listed(index, uid(10), ["x"]) == ["orphan"]
+
+
 def test_children_with_tags_paginates_without_repeats(tree: Index) -> None:
     for n in range(20, 45):
         tree.upsert_document(doc(n, f"extra {n}", parent=uid(2)))

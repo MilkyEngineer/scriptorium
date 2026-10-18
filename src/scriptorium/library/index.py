@@ -523,7 +523,9 @@ class Index:
         ``tags`` (§11.2) keeps the documents and folders carrying any of the names (exact,
         normalised names), as their own tags or on any of their pages, and makes the listing
         recursive: everything below ``parent`` at any depth, in one flat list under the same
-        sort key. At the root, the trash's subtree is included only with ``include_trash``.
+        sort key. At the root, the trash's subtree is included only with ``include_trash``;
+        what is below a tombstoned folder only with ``include_deleted`` (the one-level listing
+        never reaches it either).
         """
         _check_limit(limit)
         parent = _norm_parent(parent)
@@ -542,10 +544,13 @@ class Index:
             where.append(start)
         else:
             # Every row reachable from parent; UNION drops repeats, so a parent cycle in cloud
-            # metadata ends the walk.
+            # metadata ends the walk. Without include_deleted the walk does not enter a
+            # tombstoned folder, as the one-level listing never shows what is below one.
+            first = "" if include_deleted else " AND deleted_at IS NULL"
+            below = "" if include_deleted else " WHERE d.deleted_at IS NULL"
             prefix = (
-                f"WITH RECURSIVE sub(uuid) AS (SELECT uuid FROM documents WHERE {start} "  # noqa: S608
-                "UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid) "
+                f"WITH RECURSIVE sub(uuid) AS (SELECT uuid FROM documents WHERE {start}{first} "  # noqa: S608
+                f"UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid{below}) "
             )
             where.append("uuid IN (SELECT uuid FROM sub)")
             where.append(_has_tag("documents.uuid", None, len(names)))
