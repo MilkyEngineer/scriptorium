@@ -18,8 +18,10 @@
    again. A document already archived that leaves the scope keeps its files and
    ``hash_root``; only ``excluded_at`` is set. One that enters the scope is committed like a
    new document (or just unmarked if its archived version is current). Folders are always
-   mirrored, but only folder-shaped ones: an item typed ``CollectionType`` whose index lists
-   more than its ``.metadata`` and ``.content`` is decided like a document. Every listed
+   mirrored, but only folder-shaped ones: an item typed ``CollectionType`` whose index (or,
+   when it was not fetched, whose archived version) holds more than its ``.metadata`` and
+   ``.content`` is decided like a document, and an excluded row keeps the cloud's type.
+   Every listed
    document is decided again when the scope changed since the last fully processed poll
    (``sync_state.scope_applied``, set to a pending marker as soon as a change is seen so an
    interrupted transition is redone whole), when a folder changed, or when a document was
@@ -27,7 +29,8 @@
    tombstones or removes anything. An unreadable stored scope ends the poll with
    ``backoff`` and reason ``scope_malformed`` before any cloud request: guessing ``all``
    would download what the user excluded. The decision fails closed: a document whose own
-   ``.content`` could not be read whole (``scope_tags_unknown``), or below a folder whose
+   ``.content`` is absent or could not be read whole (``scope_tags_unknown``), or below a
+   folder whose
    current version this poll does not know (``scope_ancestor_unknown``), and that no known
    tag settles, fails for this poll: nothing of it is downloaded and its row is left as it
    was.
@@ -743,7 +746,7 @@ class SyncOnce:
                 folder = fact.folder
             else:
                 folder = row is not None and row.type == "CollectionType"
-            folder = folder and _scope_exempt_folder(uuid, row, indexes.get(uuid))
+            folder = folder and self._scope_exempt_folder(uuid, row, indexes.get(uuid))
             me: Known | None = None
             inside: bool | None = True
             if scope.mode != "all" and not folder:
@@ -909,6 +912,26 @@ class SyncOnce:
             return None
         return scope_tags(_read_json_file(path))
 
+    def _scope_exempt_folder(
+        self, uuid: str, row: DocumentRow | None, index: DocumentIndex | None
+    ) -> bool:
+        """Whether an item whose ``.metadata`` (or row) says folder is mirrored whatever the
+        scope. The type is the cloud's word, so only a folder-shaped one is: a fetched index
+        that lists nothing but ``<uuid>.metadata`` and ``<uuid>.content``, or, unfetched, a
+        row that was never excluded whose archived version holds nothing else. The archive is
+        what counts, not the stored type: an item archived under ``all`` with pages is decided
+        like a document once a scope is set. Anything else, or an archive that cannot be
+        read, is decided like a document, so a "folder" cannot carry pages past the scope."""
+        if index is not None:
+            return set(index.files) <= _folder_files(uuid)
+        if row is None or row.excluded_at is not None:
+            return False
+        try:
+            files = self._archive.current_files(uuid)
+        except (ScriptoriumError, OSError):
+            return False
+        return set(files) <= _folder_files(uuid)
+
     def _excluded_row(
         self,
         entry: RootEntry,
@@ -926,9 +949,15 @@ class SyncOnce:
             if row is not None:
                 return dataclasses.replace(row, excluded_at=excluded_at)
         metadata = fact.metadata
+        # The cloud's type, as a commit stores it: an item that says folder but carries files
+        # keeps CollectionType (and is still decided like a document, see
+        # _scope_exempt_folder), so the type does not flip when it enters the scope.
+        doc_type = metadata.get("type")
+        if not isinstance(doc_type, str) or doc_type not in _DOCUMENT_TYPES:
+            doc_type = "DocumentType"
         return DocumentRow(
             uuid=entry.uuid,
-            type="DocumentType",
+            type=doc_type,
             parent=fact.parent,
             name=_display_name(metadata.get("visibleName"), fallback=entry.uuid),
             last_modified=_epoch_ms(metadata.get("lastModified")) or now,
@@ -1485,15 +1514,9 @@ def _display_name(value: object, *, fallback: str) -> str:
     return clean if clean.strip() else fallback
 
 
-def _scope_exempt_folder(uuid: str, row: DocumentRow | None, index: DocumentIndex | None) -> bool:
-    """Whether an item whose ``.metadata`` (or archived row) says folder is mirrored whatever
-    the scope. The type is the cloud's word, so only a folder-shaped one is: a fetched index
-    that lists nothing but ``<uuid>.metadata`` and ``<uuid>.content``, or, unfetched, a row
-    that was never excluded. Anything else is decided like a document, so a "folder" cannot
-    carry pages past the scope."""
-    if index is not None:
-        return set(index.files) <= {f"{uuid}.metadata", f"{uuid}.content"}
-    return row is None or row.excluded_at is None
+def _folder_files(uuid: str) -> frozenset[str]:
+    """The only files a folder-shaped item has."""
+    return frozenset({f"{uuid}.metadata", f"{uuid}.content"})
 
 
 def _parent(value: object) -> str | None:

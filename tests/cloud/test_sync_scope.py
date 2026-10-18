@@ -150,6 +150,53 @@ def test_a_folder_that_lists_pages_is_decided_like_a_document(tmp_path: Path) ->
     assert sha256(UNUSED_PAGE) in h.blob_names()
 
 
+def test_an_excluded_folder_with_pages_keeps_the_clouds_type(tmp_path: Path) -> None:
+    odd = folder(F)
+    odd[f"{F}/{F}.rm"] = UNUSED_PAGE
+    cloud, h = setup(tmp_path, {F: odd, B: doc(B, "work")})
+    set_scope(h, "allow", "work")
+
+    h.poll()
+
+    row = h.index.document(F)
+    assert row is not None and row.excluded_at is not None
+    assert row.type == "CollectionType"  # not rewritten to DocumentType
+
+    tagged = folder(F, "work")
+    tagged[f"{F}/{F}.rm"] = UNUSED_PAGE
+    cloud.put_documents({F: tagged})
+    assert F in h.poll().committed
+    back = h.index.document(F)
+    assert back is not None and back.type == "CollectionType" and back.excluded_at is None
+
+
+def test_a_folder_with_pages_archived_before_a_scope_is_decided_like_a_document(
+    tmp_path: Path,
+) -> None:
+    """Archived under ``all``, unchanged since: the archive's file list, not the stored type,
+    decides whether it is a folder the scope lets through."""
+    odd = folder(F)
+    odd[f"{F}/{F}.rm"] = UNUSED_PAGE
+    _cloud, h = setup(tmp_path, {F: odd, G: folder(G), B: doc(B, "work")})
+    first = h.poll()
+    assert sorted(first.committed) == sorted([F, G, B])
+    files_before, history_before = h.library_files(F), h.history_of(F)
+    set_scope(h, "deny", "private")
+    assert h.poll().outcome == "ok"
+    assert excluded_at(h, F) is None  # untagged: inside a deny scope
+    set_scope(h, "allow", "work")
+
+    report = h.poll()
+
+    assert report.outcome == "ok" and report.committed == ()
+    row = h.index.document(F)
+    assert row is not None and row.excluded_at is not None and row.type == "CollectionType"
+    assert excluded_at(h, G) is None  # a folder-shaped folder is still exempt
+    assert h.library_files(F) == files_before  # narrowing keeps what is archived
+    assert h.history_of(F) == history_before
+    assert report.tombstoned == ()
+
+
 def test_an_unchanged_excluded_document_is_not_fetched_again(tmp_path: Path) -> None:
     cloud, h = setup(tmp_path, {A: doc(A, "private"), B: doc(B)})
     set_scope(h, "deny", "private")
