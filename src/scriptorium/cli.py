@@ -80,22 +80,36 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _run_worker(settings: Settings) -> int:
-    from scriptorium.worker import Worker
+WORKER_ALREADY_RUNNING: Final = 3
+"""``scriptorium worker``'s exit code when another worker holds ``<data>/worker.lock``."""
 
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        with contextlib.suppress(NotImplementedError):  # no signal handlers on Windows
-            loop.add_signal_handler(sig, stop.set)
-    worker = await Worker.open(settings, stop)
-    if worker is None:  # stopped while waiting for the server's migrations
-        return 0
+
+async def _run_worker(settings: Settings) -> int:
+    import logging
+
+    from scriptorium.logging import log_event
+    from scriptorium.worker import Worker, acquire_worker_lock
+
+    lock = acquire_worker_lock(settings.data_dir)
+    if lock is None:  # a second worker on this /data would duplicate every poll and render
+        log_event(logging.getLogger("scriptorium.worker"), "worker_already_running")
+        return WORKER_ALREADY_RUNNING
     try:
-        await worker.run(stop)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError):  # no signal handlers on Windows
+                loop.add_signal_handler(sig, stop.set)
+        worker = await Worker.open(settings, stop)
+        if worker is None:  # stopped while waiting for the server's migrations
+            return 0
+        try:
+            await worker.run(stop)
+        finally:
+            worker.close()
+        return 0
     finally:
-        worker.close()
-    return 0
+        os.close(lock)  # releases the flock
 
 
 def cmd_worker(args: argparse.Namespace) -> int:

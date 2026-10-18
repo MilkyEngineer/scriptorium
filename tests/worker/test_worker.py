@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -27,11 +28,12 @@ from scriptorium.cloud.sync import STATE_ANOMALY, SyncReport
 from scriptorium.jobs.kinds import RenderSpec
 from scriptorium.library import pages as pg
 from scriptorium.library.render import render_pdf_page, render_rm_page
-from scriptorium.users.store import global_db_path, worker_heartbeat_path
+from scriptorium.users.store import global_db_path, worker_heartbeat_path, worker_lock_path
 from scriptorium.worker import (
     AccountContext,
     AccountLoop,
     Worker,
+    acquire_worker_lock,
     backoff_delay,
     heartbeat_age,
     jittered,
@@ -536,6 +538,25 @@ async def test_the_worker_waits_for_the_server_to_migrate(tmp_path: Path) -> Non
     opened = await Worker.open(linked.settings, asyncio.Event(), timing=FAST)
     assert opened is not None
     opened.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX")
+def test_only_one_worker_lock_per_data_dir(tmp_path: Path) -> None:
+    first = acquire_worker_lock(tmp_path)
+    assert first is not None
+    assert worker_lock_path(tmp_path).is_file()
+    try:
+        assert acquire_worker_lock(tmp_path) is None  # a second descriptor, same process
+        other = tmp_path / "other"
+        other.mkdir()
+        elsewhere = acquire_worker_lock(other)  # another /data is another lock
+        assert elsewhere is not None
+        os.close(elsewhere)
+    finally:
+        os.close(first)
+    again = acquire_worker_lock(tmp_path)  # released with its descriptor
+    assert again is not None
+    os.close(again)
 
 
 def test_heartbeat_age(tmp_path: Path) -> None:

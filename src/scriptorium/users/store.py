@@ -49,6 +49,7 @@ __all__ = [
     "uid_for",
     "user_dir",
     "worker_heartbeat_path",
+    "worker_lock_path",
 ]
 
 #: A user's directory name: ``uid_hash[:16]``.
@@ -110,6 +111,11 @@ def global_db_path(data_dir: Path) -> Path:
 def worker_heartbeat_path(data_dir: Path) -> Path:
     """``<data>/worker.heartbeat``: the worker's liveness file (its healthcheck reads it)."""
     return Path(os.path.abspath(data_dir)) / "worker.heartbeat"
+
+
+def worker_lock_path(data_dir: Path) -> Path:
+    """``<data>/worker.lock``: held (``flock``) by the one worker process running on ``/data``."""
+    return Path(os.path.abspath(data_dir)) / "worker.lock"
 
 
 def user_dir(data_dir: Path, uid: str) -> Path:

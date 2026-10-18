@@ -34,6 +34,10 @@ One process, one asyncio loop, four kinds of task:
 The worker never migrates: it opens ``scriptorium.sqlite`` and each ``index.sqlite`` with
 ``migrate=False`` and waits while the server has not migrated them yet.
 
+One worker per ``/data``: at start it takes an exclusive, non-blocking ``flock`` on
+``<data>/worker.lock`` (:func:`acquire_worker_lock`) and holds it until it exits; a second
+worker finds it held, logs ``worker_already_running`` and exits with code 3.
+
 The worker is the only cloud writer (CLAUDE.md), and in M1 it writes nothing: ``SyncOnce``
 only reads. Nothing here deletes under ``blobs/``, ``library/`` or ``tombstones/``; the PNG
 cache under ``pages/`` is only ever added to.
@@ -51,6 +55,7 @@ import logging
 import os
 import random
 import secrets
+import sys
 import tempfile
 import threading
 import time
@@ -91,13 +96,18 @@ from scriptorium.users.store import (
     account_paths,
     global_db_path,
     worker_heartbeat_path,
+    worker_lock_path,
 )
+
+if sys.platform != "win32":
+    import fcntl
 
 __all__ = [
     "BUDGET_REASONS",
     "AccountLoop",
     "Timing",
     "Worker",
+    "acquire_worker_lock",
     "backoff_delay",
     "heartbeat_age",
     "jittered",
@@ -163,6 +173,29 @@ def heartbeat_age(path: Path, now: float | None = None) -> float | None:
     except OSError:
         return None
     return max(0.0, (time.time() if now is None else now) - written)
+
+
+def acquire_worker_lock(data_dir: Path) -> int | None:
+    """Take the exclusive ``flock`` on ``<data>/worker.lock``; its descriptor, or None if held.
+
+    The lock lives as long as the returned descriptor is open (closing it, or the process
+    exiting, releases it). Two descriptors in one process conflict as two processes do,
+    because ``flock`` locks belong to the open file description. On Windows, where there is
+    no ``flock``, the file is opened but not locked.
+    """
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(worker_lock_path(data_dir), flags, 0o600)
+    if sys.platform == "win32":
+        return fd
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def read_heartbeat(path: Path) -> dict[str, Any]:

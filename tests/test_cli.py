@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -108,3 +109,21 @@ async def test_the_worker_runs_until_sigterm(tmp_path: Path) -> None:
     assert beat.exists(), "the worker never wrote its heartbeat"
     os.kill(os.getpid(), signal.SIGTERM)  # handled by the worker's loop, not the default
     assert await asyncio.wait_for(task, timeout=30) == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX")
+async def test_a_second_worker_on_the_same_data_exits_with_code_3(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from scriptorium.worker import acquire_worker_lock
+
+    caplog.set_level(logging.INFO, logger="scriptorium")
+    settings = make_settings(data_dir=_data(tmp_path))
+    held = acquire_worker_lock(settings.data_dir)
+    assert held is not None
+    try:
+        assert await cli._run_worker(settings) == cli.WORKER_ALREADY_RUNNING == 3
+        assert any(r.getMessage() == "worker_already_running" for r in caplog.records)
+        assert not global_db_path(settings.data_dir).exists()  # it did nothing else
+    finally:
+        os.close(held)
