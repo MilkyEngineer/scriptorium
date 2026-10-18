@@ -305,16 +305,66 @@ def test_tag_filter_page_hits_use_page_and_document_tags(library: Index) -> None
     assert sorted(ids(either)) == [uid(201), uid(300)]
 
 
-def test_tag_filter_document_hits_use_document_tags(library: Index) -> None:
+def test_tag_filter_document_hits_use_every_tag_of_the_document(library: Index) -> None:
     library.replace_tags(uid(4), tagset({"draft"}, {uid(400): {"page-tag"}}))
     library.replace_tags(uid(5), tagset(set(), {uid(500): {"draft"}}))
     (hit,) = library.search("sketches", tags=["draft"], cursor=None, limit=10).items
     assert isinstance(hit, DocumentHit) and hit.document == uid(4)
-    assert hit.tags == ("draft",)
-    assert library.search("loose", tags=["draft"], cursor=None, limit=10).items == []
-    # Untranscribed documents are found by their own tag names, case-insensitively.
-    (by_tag,) = library.search("DRAFT", cursor=None, limit=10).items
-    assert isinstance(by_tag, DocumentHit) and by_tag.document == uid(4)
+    assert hit.tags == ("draft",)  # a document hit carries the document's own tags
+    # An untranscribed page has no other way to be found: its page tags count too.
+    (loose,) = library.search("loose", tags=["draft"], cursor=None, limit=10).items
+    assert isinstance(loose, DocumentHit) and loose.document == uid(5)
+    found = library.search("sketches", tags=["page-tag"], cursor=None, limit=10).items
+    assert ids(found) == [uid(4)]
+    # Untranscribed documents are found by their tag names, case-insensitively.
+    by_tag = library.search("DRAFT", cursor=None, limit=10).items
+    assert ids(by_tag) == [uid(5), uid(4)]  # Loose, Sketches: by name
+    assert all(isinstance(h, DocumentHit) for h in by_tag)
+    assert ids(library.search("page-tag", cursor=None, limit=10).items) == [uid(4)]
+
+
+def test_a_page_tag_on_an_untranscribed_notebook_is_findable(index: Index) -> None:
+    """The notebook's only "harbour" tag is on a page with no transcript yet."""
+    index.upsert_document(doc(1, "Sketchbook"))
+    index.upsert_document(doc(2, "Other"))
+    pages_of(index, 1, 2)
+    pages_of(index, 2, 1)
+    index.replace_tags(uid(1), tagset(set(), {uid(100): {"harbour"}}))
+
+    assert ids(index.search("harbour", cursor=None, limit=5).items) == [uid(1)]
+    found = index.search("sketchbook", tags=["harbour"], cursor=None, limit=5).items
+    assert ids(found) == [uid(1)]
+    assert ids(index.search("other", tags=["harbour"], cursor=None, limit=5).items) == []
+    assert listed(index, None, ["harbour"]) == ["Sketchbook"]
+    (row,) = index.children(
+        None, include_trash=False, include_deleted=False, tags=["harbour"], cursor=None, limit=5
+    ).items
+    assert row.tags == ()  # list shows the document's own tags
+
+
+def test_page_tag_matches_keep_the_cursors_stable(index: Index) -> None:
+    """Several page tags of one document match once: the predicate is per document."""
+    for n in range(1, 8):
+        index.upsert_document(doc(n, f"Book {n % 3}"))
+        pages_of(index, n, 3)
+        own = {"harbour"} if n % 2 else set()
+        index.replace_tags(uid(n), tagset(own, {uid(n * 100 + i): {"harbour"} for i in range(3)}))
+    full = ids(index.search("harbour", cursor=None, limit=100).items)
+    assert sorted(full) == [uid(n) for n in range(1, 8)]
+    for limit in (1, 2, 3):
+        walked: list[str] = []
+        cursor = None
+        while True:
+            page = index.search("harbour", tags=["harbour"], cursor=cursor, limit=limit)
+            walked.extend(ids(page.items))
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+        assert walked == full
+    everything = listed(index, None, ["harbour"], limit=100)
+    assert len(everything) == 7
+    for limit in (1, 2, 3):
+        assert listed(index, None, ["harbour"], limit=limit) == everything
 
 
 def test_folder_filter_is_the_subtree(library: Index) -> None:

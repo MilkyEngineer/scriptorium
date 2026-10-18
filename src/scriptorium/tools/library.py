@@ -133,8 +133,9 @@ class ListArgs(PageArgs):
         default=False, description="Also list items deleted from the cloud but kept here."
     )
     tags: list[TagName] | None = _tags_field(
-        "Only items carrying any of these tags (names as list shows them); the listing then "
-        "covers everything below the folder, not just its direct children."
+        "Only items carrying any of these tags (names as list shows them), on the item itself "
+        "or on one of its pages; the listing then covers everything below the folder, not "
+        "just its direct children."
     )
     account: str | None = _account_field()
 
@@ -144,8 +145,9 @@ async def list_documents(ctx: ToolContext, args: ListArgs) -> CallToolResult:
     default), folders first, then by name. Each item has its name, type, UUID, last-modified
     time, page count, state (live, trashed, or deleted from the cloud but kept here) and
     tags. folder is a UUID or a path of names such as "Notes/Projects". tags keeps only the
-    items tagged with any of the given names, searching everything below the folder rather
-    than one level. Use next_cursor to continue a long listing."""
+    items tagged with any of the given names (on the item or one of its pages), searching
+    everything below the folder rather than one level. Use next_cursor to continue a long
+    listing."""
     account = await use_account(ctx, args.account)
     parent: str | None = None
     if args.folder is not None:
@@ -252,7 +254,7 @@ class SearchArgs(PageArgs):
     )
     tags: list[TagName] | None = _tags_field(
         "Only results tagged with any of these names: a page matches on its own tags or its "
-        "document's, a document on its own."
+        "document's, a document on its own or any of its pages'."
     )
     account: str | None = _account_field()
 

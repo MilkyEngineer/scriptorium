@@ -255,13 +255,15 @@ def _marks(count: int) -> str:
     return ", ".join("?" * count)
 
 
-def _has_tag(document: str, page: str, count: int) -> str:
-    """``EXISTS`` clause: the row ``document`` names has one of ``count`` bound tag names.
+def _has_tag(document: str, page: str | None, count: int) -> str:
+    """``EXISTS`` clause: the row ``document`` names has one of ``count`` bound tag names,
+    on the pages ``page`` selects (``None``: any tag of the document, its own or a page's).
 
     ``document`` and ``page`` are fixed SQL fragments from this module, never input.
     """
+    on_page = "" if page is None else f"AND {page} "
     return (
-        f"EXISTS (SELECT 1 FROM tags g WHERE g.document = {document} AND {page} "  # noqa: S608
+        f"EXISTS (SELECT 1 FROM tags g WHERE g.document = {document} {on_page}"  # noqa: S608
         f"AND g.name IN ({_marks(count)}))"
     )
 
@@ -517,8 +519,8 @@ class Index:
         lists the top of the trash; pass ``parent="trash"`` to list only that. Tombstoned rows
         appear only with ``include_deleted``.
 
-        ``tags`` (§11.2) keeps the documents and folders carrying any of the names as their
-        own tags (exact, normalised names; page tags do not count) and makes the listing
+        ``tags`` (§11.2) keeps the documents and folders carrying any of the names (exact,
+        normalised names), as their own tags or on any of their pages, and makes the listing
         recursive: everything below ``parent`` at any depth, in one flat list under the same
         sort key. At the root, the trash's subtree is included only with ``include_trash``.
         """
@@ -545,7 +547,7 @@ class Index:
                 "UNION SELECT d.uuid FROM documents d JOIN sub ON d.parent = sub.uuid) "
             )
             where.append("uuid IN (SELECT uuid FROM sub)")
-            where.append(_has_tag("documents.uuid", "g.page = ''", len(names)))
+            where.append(_has_tag("documents.uuid", None, len(names)))
             params.extend(names)
         if not include_deleted:
             where.append("deleted_at IS NULL")
@@ -1076,13 +1078,14 @@ class Index:
         included, are never interpreted). The transcript hits come first, sorted by bm25 rank,
         then transcript id; the cursor carries the last ``(rank, id)``, so a page boundary is
         exact for an unchanged index (ranks shift when transcripts are added). After them come
-        :class:`DocumentHit` rows: live documents with no transcript at all whose name or own
-        tags contain every term, compared case-insensitively, sorted by name and UUID.
+        :class:`DocumentHit` rows: live documents with no transcript at all whose name or tags
+        (the document's own or any of its pages') contain every term, compared
+        case-insensitively, sorted by name and UUID.
 
         ``folder`` (a folder UUID) keeps documents anywhere below it. ``tags`` is an any-of
         filter on exact, normalised names: a transcript hit matches on its page's own tags or
-        its document's, a document hit on its document's own tags. Hits carry ``tags``: for a
-        page, its own and its document's; for a document, its own.
+        its document's, a document hit on any tag of the document (its own or a page's). Hits
+        carry ``tags``: for a page, its own and its document's; for a document, its own.
         """
         _check_limit(limit)
         terms = _search_terms(query)
@@ -1173,8 +1176,8 @@ class Index:
         after: Sequence[Any] | None,
         limit: int,
     ) -> list[tuple[str, str]]:
-        """``(uuid, name)`` of untranscribed live documents whose name or own tags hold every
-        term."""
+        """``(uuid, name)`` of untranscribed live documents whose name or tags (their own or
+        any page's: an untranscribed page has no other way to be found) hold every term."""
         prefix, params = self._subtree(folder)
         where = [
             "d.type = 'DocumentType'",
@@ -1184,15 +1187,14 @@ class Index:
         for term in terms:
             where.append(
                 "(instr(scriptorium_fold(d.name), ?) > 0 OR EXISTS (SELECT 1 FROM tags g "
-                "WHERE g.document = d.uuid AND g.page = '' "
-                "AND instr(scriptorium_fold(g.name), ?) > 0))"
+                "WHERE g.document = d.uuid AND instr(scriptorium_fold(g.name), ?) > 0))"
             )
             folded = _fold(term)
             params.extend((folded, folded))
         if folder is not None:
             where.append("d.uuid IN (SELECT uuid FROM sub)")
         if names is not None:
-            where.append(_has_tag("d.uuid", "g.page = ''", len(names)))
+            where.append(_has_tag("d.uuid", None, len(names)))
             params.extend(names)
         if after is not None:
             where.append("(d.name COLLATE NOCASE, d.uuid) > (?, ?)")

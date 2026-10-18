@@ -214,8 +214,9 @@ async def test_list_shows_tags_and_filters_recursively(library: Served, linked: 
     assert {item["uuid"] for item in either["items"]} == {FOLDER, NOTEBOOK, INSIDE}
     inside = await library.ok("list", {"folder": "Archive", "tags": ["review"]})
     assert [item["uuid"] for item in inside["items"]] == [INSIDE]
-    # A page tag does not tag the document.
-    assert (await library.ok("list", {"tags": ["retro"]}))["items"] == []
+    # A page tag finds its document (the item shows the document's own tags).
+    retro = (await library.ok("list", {"tags": ["retro"]}))["items"]
+    assert [(item["uuid"], item["tags"]) for item in retro] == [(NOTEBOOK, ["review"])]
     assert (await library.error("list", {"tags": ["\x00"]}))["code"] == "invalid_argument"
 
 
