@@ -40,7 +40,7 @@ class AccountPaths:
     root: Path          # /data/users/<uid>/accounts/<acct>
     blobs: Path; library: Path; tombstones: Path; pages: Path; staging: Path
     index: Path         # root / "index.sqlite"
-    def inside(self, p: Path) -> Path: ...   # resolves and asserts containment; raises PathEscape
+    def inside(self, p: Path) -> Path: ...   # resolves and asserts containment; raises PathEscapeError
 
 def account_paths(data_dir: Path, uid: str, acct: str) -> AccountPaths   # uid, acct validated by regex
 def user_dir(data_dir: Path, uid: str) -> Path
