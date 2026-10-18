@@ -277,6 +277,23 @@ def test_page_image_bytes_refuses_a_corrupt_png() -> None:
         page_image_bytes(bad)
 
 
+def test_downscale_png_is_page_image_bytes_from_a_png() -> None:
+    result = _rendered(1)
+    small = render.downscale_png(result.png, max_side_px=300)
+    assert small == page_image_bytes(result, max_side_px=300)
+    assert render.downscale_png(result.png, max_side_px=5000) == result.png
+    with pytest.raises(InvalidArgumentError):
+        render.downscale_png(b"not a png at all, not a png at all", max_side_px=300)
+    # A header claiming more pixels than any render is refused before decoding.
+    huge = bytearray(result.png)
+    huge[16:24] = (40_000).to_bytes(4, "big") * 2
+    with pytest.raises(InvalidArgumentError, match="too large"):
+        render.downscale_png(bytes(huge), max_side_px=300)
+    with render_pool(1) as pool:
+        pooled = render_in_pool(pool, render.downscale_png, result.png, max_side_px=300)
+        assert pooled.result(timeout=60) == small
+
+
 # ----------------------------------------------------------------------------- hostile input
 
 

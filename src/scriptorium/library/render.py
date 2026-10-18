@@ -65,6 +65,7 @@ __all__ = [
     "PX_PER_UNIT",
     "UNITS_PER_PT",
     "RenderResult",
+    "downscale_png",
     "extract_pdf_page",
     "extract_pdf_page_from_blob",
     "page_image_bytes",
@@ -230,6 +231,22 @@ def page_image_bytes(result: RenderResult, *, max_side_px: int = 1024) -> bytes:
     return _encode(image.resize(size, Image.Resampling.LANCZOS))
 
 
+def downscale_png(png: bytes, *, max_side_px: int) -> bytes:
+    """Return the PNG ``png`` with its longest side at most ``max_side_px`` (PNG to PNG).
+
+    The OCR image of §8.3 (longest side 2576 px) made from an archive PNG; the same rules as
+    :func:`page_image_bytes`: Lanczos, deterministic, never upscales, a PNG that already fits
+    comes back unchanged. The header is checked before anything is decoded, and an image
+    over :data:`MAX_CANVAS_PIXELS` (which the renderer never writes) is refused undecoded.
+    """
+    width, height = _png_size(png)
+    if width < 1 or height < 1 or width * height > MAX_CANVAS_PIXELS:
+        raise InvalidArgumentError("page image is too large to scale")
+    return page_image_bytes(
+        RenderResult(png, width, height, (0.0, 0.0, 0.0, 0.0)), max_side_px=max_side_px
+    )
+
+
 # --------------------------------------------------------------------------- process pool
 
 
@@ -288,6 +305,7 @@ _POOL_FUNCTIONS: Final[frozenset[Callable[..., object]]] = frozenset(
         extract_pdf_page,
         extract_pdf_page_from_blob,
         page_image_bytes,
+        downscale_png,
     }
 )
 
