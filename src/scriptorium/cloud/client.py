@@ -98,9 +98,21 @@ def _retry_after(response: httpx.Response) -> float | None:
 
 
 def _require_https(request: httpx.Request) -> None:
-    """Request hook: every request, redirect hops included, goes over HTTPS."""
+    """Request hook: every request goes over HTTPS."""
     if request.url.scheme != "https":
         raise CloudRequestError("refused a request that is not HTTPS")
+
+
+def _require_identity(response: httpx.Response, what: str) -> None:
+    """Refuse a compressed body before reading it.
+
+    httpx decodes any ``Content-Encoding`` (stacked ones too) a whole network chunk at a
+    time, before a size cap can see the result, so a few kilobytes of gzip could expand
+    to gigabytes. Every request asks for ``identity``; anything else is refused unread.
+    """
+    encoding = response.headers.get("content-encoding")
+    if encoding is not None and encoding.strip().lower() not in ("", "identity"):
+        raise CloudProtocolError(f"{what}: compressed response refused")
 
 
 class _VerifiedStream(io.RawIOBase):
@@ -186,9 +198,9 @@ class CloudClient:
         self._http = httpx.Client(
             transport=transport,
             timeout=httpx.Timeout(self._timeout_s),
-            # httpx drops Authorization on a cross-origin hop; every hop must be HTTPS.
-            follow_redirects=True,
-            max_redirects=3,
+            # Never follow a redirect: httpx would read and decode each hop's body itself,
+            # unbounded, and a hop could aim a request at a host inside the network.
+            follow_redirects=False,
             event_hooks={"request": [_require_https]},
             trust_env=False,  # no proxy or .netrc from the environment
             headers={"accept-encoding": "identity", "user-agent": "scriptorium"},
@@ -353,6 +365,12 @@ class CloudClient:
                         status=status,
                         retry_after_s=_retry_after(response),
                     )
+                try:
+                    _require_identity(response, "user token")
+                except CloudProtocolError:  # not a rejection: back off
+                    raise TransientCloudError(
+                        "user token: compressed response refused", status=status
+                    ) from None
                 body = self._read(response, MAX_POINTER_BYTES, "user token")
         except httpx.HTTPError as exc:  # network, timeout, redirects: not a rejection
             raise TransientCloudError(f"token request failed ({type(exc).__name__})") from None
@@ -375,11 +393,12 @@ class CloudClient:
                         self._forget(token)
                         continue
                     self._check_status(response, "sync")
+                    _require_identity(response, "sync")
                     yield response
                     return
             except httpx.TransportError as exc:
                 raise TransientCloudError(f"request failed ({type(exc).__name__})") from None
-            except httpx.HTTPError as exc:  # too many redirects, undecodable body
+            except httpx.HTTPError as exc:  # a malformed response
                 raise CloudProtocolError(f"request failed ({type(exc).__name__})") from None
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -399,6 +418,8 @@ class CloudClient:
             )
         if status in (404, 410):
             raise CloudNotFoundError(f"{what}: HTTP {status}", status=status)
+        if 300 <= status < 400:
+            raise CloudRequestError(f"{what}: redirect refused", status=status)
         raise CloudRequestError(f"{what}: HTTP {status}", status=status)
 
     @staticmethod

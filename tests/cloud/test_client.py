@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import pytest
 from remarkable_mcp import sync as fork
 
 from scriptorium.cloud import client as client_module
-from scriptorium.cloud.client import FILES_URL, CloudClient
+from scriptorium.cloud.client import FILES_URL, ROOT_URL, USER_TOKEN_URL, CloudClient
 from scriptorium.cloud.errors import (
     BlobVerificationError,
     CloudNotFoundError,
@@ -389,17 +390,69 @@ def test_a_redirect_to_plain_http_is_refused(tmp_path: Path, cloud: FakeCloud) -
         client.root()
 
 
-def test_endless_redirects_are_a_protocol_error(tmp_path: Path, cloud: FakeCloud) -> None:
+@pytest.mark.parametrize("location", ["https://10.0.0.5/internal", "/sync/v3/files/elsewhere"])
+def test_redirects_are_never_followed(tmp_path: Path, cloud: FakeCloud, location: str) -> None:
     target = f"{FILES_URL}/{cloud.root_hash}"
+    seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url).startswith(target):
-            return httpx.Response(302, headers={"location": target + "?again"})
+        seen.append(str(request.url))
+        if str(request.url) == target:
+            # A huge body on the hop: refused unread, as httpx would have read it whole.
+            return httpx.Response(302, headers={"location": location}, content=b"x" * 10**6)
         return cloud.handler(request)
 
     client = CloudClient(DEVICE_TOKEN, cache_dir=tmp_path, transport=httpx.MockTransport(handler))
-    with pytest.raises(CloudProtocolError):
+    assert client._http.follow_redirects is False
+    with pytest.raises(CloudRequestError, match="redirect refused"):
         client.root()
+    assert seen[-1] == target  # the hop was not requested
+
+
+class _Unreadable(httpx.SyncByteStream):
+    """A body that fails the test if anything reads it."""
+
+    def __iter__(self) -> Iterator[bytes]:
+        raise AssertionError("the compressed body was read")
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "gzip, gzip", "br", "deflate", "x-unknown"])
+@pytest.mark.parametrize("where", ["token", "pointer", "root", "index", "blob"])
+def test_a_compressed_response_is_refused_unread(
+    tmp_path: Path, cloud: FakeCloud, encoding: str, where: str
+) -> None:
+    """httpx decodes before any cap sees the bytes: a small gzip body could be gigabytes."""
+    urls = {
+        "token": USER_TOKEN_URL,
+        "pointer": ROOT_URL,
+        "root": f"{FILES_URL}/{cloud.root_hash}",
+        "index": f"{FILES_URL}/{cloud.doc_hash(NOTEBOOK)}",
+        "blob": f"{FILES_URL}/{sha256(fixture_documents()[NOTEBOOK][PAGE_101])}",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = cloud.handler(request)
+        if str(request.url) != urls[where]:
+            return response
+        headers = {"content-type": "application/octet-stream", "content-encoding": encoding}
+        return httpx.Response(200, headers=headers, stream=_Unreadable())
+
+    client = CloudClient(DEVICE_TOKEN, cache_dir=tmp_path, transport=httpx.MockTransport(handler))
+    expected = TransientCloudError if where == "token" else CloudProtocolError
+    with pytest.raises(expected, match="compressed response refused"):
+        if where == "index":
+            client.document_index(NOTEBOOK, cloud.doc_hash(NOTEBOOK))
+        elif where == "blob":
+            ref = client.document_index(NOTEBOOK, cloud.doc_hash(NOTEBOOK)).files[PAGE_101]
+            with client.open_blob(ref.sha256, max_bytes=ref.size) as stream:
+                stream.read()
+        else:
+            client.root()
+
+
+def test_an_identity_encoding_is_accepted(tmp_path: Path, cloud: FakeCloud) -> None:
+    cloud.headers[ROOT_KEY] = {"content-encoding": "identity"}
+    assert make(cloud, tmp_path).root().entries
 
 
 def test_errors_carry_no_token_or_body(tmp_path: Path, cloud: FakeCloud) -> None:
