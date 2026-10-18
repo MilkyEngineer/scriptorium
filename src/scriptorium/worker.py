@@ -151,6 +151,11 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+
+class _AccountGoneError(Exception):
+    """A render's account was removed while it rendered: nothing may be written for it."""
+
+
 JITTER: Final = 0.10
 """The poll interval's jitter (±10 %, §7)."""
 BACKOFF_CAP_SECONDS: Final = 3600
@@ -749,7 +754,10 @@ class Worker:
         rel = pg.png_relpath(source.page_id, source.content_hash, max_side=spec.max_side)
         path = pg.resolve_png(ctx.paths, rel)
         if not await asyncio.to_thread(path.is_file):
-            data = await self._render(ctx, source, spec.max_side, job)
+            try:
+                data = await self._render(ctx, source, spec.max_side, job)
+            except _AccountGoneError:
+                return dict(GONE_RESULT)
             # Looked at again after the render (which can take a while): a PNG written into
             # an account that was removed meanwhile would recreate its directory.
             if await asyncio.to_thread(self._account_gone, job):
@@ -779,6 +787,8 @@ class Worker:
             base_path = pg.resolve_png(ctx.paths, base_rel)
             if not await asyncio.to_thread(base_path.is_file):
                 base = await self._render(ctx, source, None, job)
+                if await asyncio.to_thread(self._account_gone, job):  # as in _render_job
+                    raise _AccountGoneError
                 await asyncio.to_thread(pg.write_png, ctx.paths, base_rel, base)
             head = await asyncio.to_thread(_read_head, base_path)
             longest = max(pg.png_size(head))

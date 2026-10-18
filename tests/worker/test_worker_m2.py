@@ -18,6 +18,7 @@ from scriptorium.cloud.client import CloudClient
 from scriptorium.cloud.sync import SyncReport
 from scriptorium.jobs.kinds import GONE_RESULT, RenderSpec
 from scriptorium.jobs.queue import PRIORITY_LOW, PRIORITY_NORMAL, JobQueue
+from scriptorium.library import pages as pg
 from scriptorium.library.index import DocumentRow
 from scriptorium.worker import AccountContext, AccountLoop, render_priority
 from tests.cloud.fake_cloud import (
@@ -139,6 +140,44 @@ async def test_render_jobs_of_a_removed_account_are_gone(linked: Linked) -> None
     assert done is not None and (done.state, done.result) == ("done", dict(GONE_RESULT))
     assert linked.queue.rerun(done) is None
     assert not linked.paths.pages.exists()
+
+
+async def test_a_page_image_whose_account_goes_while_rendering_writes_nothing(
+    linked: Linked, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The base PNG a page_image render needs is not written once the account has gone: a
+    write would recreate the moved account's directory."""
+    await linked.loop().poll_once(linked.context())  # no renders run yet
+    page = linked.index().page(NOTEBOOK, 0)
+    version = pg.current_version(linked.paths, linked.index(), NOTEBOOK)
+    assert page is not None and version is not None
+    spec = RenderSpec(NOTEBOOK, page.page_id, page.content_hash, version.generation, 2048)
+    job = linked.queue.enqueue(
+        uid=linked.uid,
+        acct=linked.acct,
+        kind=spec.kind,
+        dedupe_key=spec.key(linked.acct),
+        payload=spec.payload(),
+    )
+    asked: list[int] = []
+
+    def gone(row: Any) -> bool:
+        # The archive renders the poll queued see a removed account; the page_image job
+        # sees it live when it starts and removed once its base render is done.
+        if row.id != job.id:
+            return True
+        asked.append(row.id)
+        return len(asked) > 1
+
+    monkeypatch.setattr(linked.worker, "_account_gone", gone)
+
+    await linked.worker.drain_jobs()
+
+    done = linked.queue.get(job.id, linked.uid)
+    assert done is not None and (done.state, done.result) == ("done", dict(GONE_RESULT))
+    assert len(asked) == 2
+    pages = linked.paths.pages
+    assert not pages.exists() or not any(pages.rglob("*.png"))
 
 
 async def test_a_poll_does_nothing_once_the_directory_has_moved(
