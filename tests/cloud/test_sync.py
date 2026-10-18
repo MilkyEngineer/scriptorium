@@ -8,11 +8,13 @@ import logging
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
 from scriptorium.cloud import sync as sync_module
+from scriptorium.cloud.client import ROOT_URL
 from scriptorium.cloud.sync import SyncReport, SyncSettings
 from tests.cloud.cassettes import Player
 from tests.cloud.fake_cloud import (
@@ -238,6 +240,170 @@ def test_empty_root_after_a_full_one_is_an_anomaly(tmp_path: Path) -> None:
     assert_safe(h)
 
 
+def clear_anomaly(h: Harness, *, allow_mass_delete: bool = False) -> None:
+    """What ``admin_clear_anomaly`` leaves in ``sync_state`` (Architecture §7 step 4)."""
+    with h.index.transaction():
+        h.index.set_state("anomaly", None)
+        h.index.set_state("anomaly_reason", None)
+        if allow_mass_delete:
+            h.index.set_state("allow_mass_delete", "true")
+
+
+def test_a_cleared_generation_regression_resumes_and_still_needs_two_listings(
+    tmp_path: Path,
+) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.poll()
+    cloud.publish(generation=2**63 - 1)  # one bogus pointer is believed...
+    assert h.poll().outcome == "ok"
+    cloud.publish(generation=5)  # ...so the genuine root now looks regressed
+
+    regressed = h.poll()
+
+    assert regressed.anomaly == "generation_regressed"
+    assert regressed.anomaly_reason == f"root generation 5 is lower than {2**63 - 1}"
+    assert h.index.state["last_generation"] == "5"
+    assert json.loads(h.index.state["previous_listing"])["complete"] is False
+
+    clear_anomaly(h)  # an administrator looked: without this the account stays read-only
+    cloud.remove_document(PDF)
+    resumed = h.poll()
+    assert resumed.outcome == "ok" and resumed.tombstoned == ()  # the previous was unlisted
+    assert h.poll().tombstoned == (PDF,)
+    assert_safe(h)
+
+
+def test_a_cleared_empty_root_is_believed_only_after_two_complete_listings(
+    tmp_path: Path,
+) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.poll()
+    cloud.remove_document(NOTEBOOK, PDF)
+    assert h.poll().anomaly == "empty_root"
+    assert "tombstone" not in h.archive.op_names()
+
+    clear_anomaly(h)
+    first = h.poll()
+    assert first.outcome == "ok" and first.tombstoned == ()
+    second = h.poll()
+
+    # Two documents are under the breaker's floor: they are moved, never deleted.
+    assert second.tombstoned == (NOTEBOOK, PDF)
+    assert h.archive.tombstones[PDF] == expected_files(PDF)
+    assert h.archive.library == {}
+    assert_safe(h)
+
+
+def test_an_approved_mass_delete_is_applied_once(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    nine(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.poll()
+    cloud.remove_document(*PAGES[:6])
+    h.poll()
+    assert h.poll().anomaly == "mass_delete"
+
+    clear_anomaly(h)  # cleared without approval: the same candidates trip it again
+    again = h.poll()
+    assert again.anomaly == "mass_delete" and not again.mass_delete_approved
+    assert "tombstone" not in h.archive.op_names()
+
+    clear_anomaly(h, allow_mass_delete=True)
+    approved = h.poll()
+
+    assert approved.outcome == "ok" and approved.mass_delete_approved
+    assert approved.tombstoned == tuple(sorted(PAGES[:6]))
+    assert "allow_mass_delete" not in h.index.state  # consumed
+    assert len(h.archive.library) == 3 and len(h.archive.tombstones) == 6
+    assert_safe(h)
+
+
+def test_an_approval_is_consumed_by_the_next_listing_even_unused(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.index.state["allow_mass_delete"] = "true"
+
+    report = h.poll()
+
+    assert report.mass_delete_approved and report.tombstoned == ()
+    assert "allow_mass_delete" not in h.index.state
+
+
+def test_an_approval_survives_a_poll_that_never_reached_the_root(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    cloud.status[ROOT_KEY] = 503
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.index.state["allow_mass_delete"] = "true"
+
+    assert h.poll().outcome == "backoff"
+    assert h.index.state["allow_mass_delete"] == "true"
+
+
+def test_the_index_blob_is_kept_with_each_version(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.poll()
+
+    for uuid in (NOTEBOOK, PDF):
+        doc_index = h.client.document_index(uuid, cloud.doc_hash(uuid))
+        stored = h.archive.blob_path(hashlib.sha256(doc_index.body).hexdigest())
+        assert stored.read_bytes() == doc_index.body
+        # The fake cloud addresses document indexes by HashEntries, as S1 saw, so the
+        # stored body's name is not the history row's hash_root (see the hand-back).
+        assert stored.name != h.index.history_of(uuid)[0][1]
+
+
+def test_the_library_is_enumerated_page_by_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync_module, "_LIST_PAGE", 2)
+    cloud = FakeCloud()
+    nine(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    h.poll()
+    calls = h.index.recent_calls
+    cloud.remove_document(PAGES[0])
+    h.poll()
+    report = h.poll()
+
+    assert report.tombstoned == (PAGES[0],)
+    assert h.index.recent_calls - calls == 2 * 5  # nine rows, two per page, per poll
+
+
+def test_uppercase_hashes_from_the_cloud_are_stored_lowercase(tmp_path: Path) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+
+    def shout(request: httpx.Request) -> httpx.Response:
+        response = cloud.handler(request)
+        name = request.headers.get("rm-filename", "")
+        if str(request.url) == ROOT_URL:
+            pointer = json.loads(response.content)
+            pointer["hash"] = pointer["hash"].upper()
+            return httpx.Response(200, json=pointer)
+        if name.endswith(".docSchema") and name != "root.docSchema":
+            lines = response.content.decode().split("\n")
+            loud = [ln[:64].upper() + ln[64:] if ln[64:65] == ":" else ln for ln in lines]
+            return httpx.Response(200, content="\n".join(loud).encode())
+        return response
+
+    h = harness(httpx.MockTransport(shout), tmp_path)
+
+    report = h.poll()
+
+    assert report.outcome == "ok" and report.root_hash == cloud.root_hash
+    for uuid in (NOTEBOOK, PDF):
+        assert h.archive.library[uuid] == expected_files(uuid)
+        assert h.index.history_of(uuid) == [(cloud.generation, cloud.doc_hash(uuid))]
+
+
 def test_unparseable_root_is_a_protocol_anomaly(tmp_path: Path) -> None:
     cloud = FakeCloud()
     both(cloud)
@@ -451,10 +617,59 @@ def test_hostile_metadata_becomes_inert_display_data(tmp_path: Path) -> None:
     row.name.encode("utf-8")  # no lone surrogate left
     assert row.parent is None
     assert row.type == "DocumentType"
-    assert row.last_modified is None and row.last_opened is None
+    # No usable lastModified: the row records when sync saw this version instead.
+    assert row.last_modified == h.index.history[0][3] and row.last_opened is None
     assert row.page_count == 0 and row.source_kind == "notebook"
     assert report.metadata_errors == 1  # the .content was not an object
     assert report.outcome == "partial"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"fileType": ["pdf"]},
+        {"fileType": {"a": 1}},
+        {"fileType": None, "pageCount": True},
+        {"cPages": {"pages": {"x": 1}}},
+        {"cPages": [1, 2], "pages": "abc"},
+    ],
+)
+def test_odd_content_types_never_crash_the_poll(tmp_path: Path, content: object) -> None:
+    cloud = FakeCloud()
+    docs = fixture_documents()
+    docs[NOTEBOOK][f"{NOTEBOOK}.content"] = json.dumps(content).encode()
+    cloud.put_documents(docs)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+
+    report = h.poll()
+
+    assert set(report.committed) == {NOTEBOOK, PDF}
+    row = h.index.document(NOTEBOOK)
+    assert row is not None and row.source_kind == "notebook" and row.page_count >= 0
+
+
+def test_an_unexpected_error_fails_one_document_not_the_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud = FakeCloud()
+    both(cloud)
+    h = harness(httpx.MockTransport(cloud.handler), tmp_path)
+    real = sync_module._content_facts
+
+    def boom(uuid: str, *args: Any) -> Any:
+        if uuid == NOTEBOOK:
+            raise TypeError("a case nobody anticipated")
+        return real(uuid, *args)
+
+    monkeypatch.setattr(sync_module, "_content_facts", boom)
+
+    report = h.poll()
+
+    assert report.outcome == "partial"
+    assert report.failed == {NOTEBOOK: "internal_error"}
+    assert report.committed == (PDF,)
+    assert h.index.document(NOTEBOOK) is None and NOTEBOOK not in h.archive.library
+    assert h.index.get_state("previous_listing") is not None  # the poll finished
 
 
 def test_file_names_outside_the_allowlist_never_reach_the_archive(tmp_path: Path) -> None:

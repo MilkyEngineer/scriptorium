@@ -1,7 +1,11 @@
-"""Fake of ``library/tombstones.py:plan`` (plan §3.3): the rules, written from the plan.
+"""Fake of ``library/tombstones.py:plan`` (plan §3.3), following A's rules as merged.
 
 Pure, like the real planner. Sync tests inject it (``SyncOnce(..., planner=plan)``) while
-A's module is unmerged; after the merge they can run against both.
+A's module is not on this branch; after the merge they can run against both. The rules, in
+A's order: generation regressed; empty root (``had_entries`` from the previous listing,
+or from the library when there is none); un-tombstone what is present; candidates only
+between two complete listings, excluding what is already tombstoned; the breaker at
+``max(5, 10 %)`` or ``max_per_poll``, skipped once by ``allow_mass_delete``.
 """
 
 from __future__ import annotations
@@ -17,16 +21,19 @@ def plan(
     library: frozenset[str],
     tombstoned: frozenset[str],
     max_per_poll: int,
+    *,
+    allow_mass_delete: bool = False,
 ) -> TombstonePlan:
     if previous is not None and current.generation < previous.generation:
         return TombstonePlan(_NONE, _NONE, "generation_regressed")
-    if not current.uuids and ((previous is not None and previous.uuids) or library):
+    had_entries = bool(previous.uuids) if previous is not None else bool(library)
+    if not current.uuids and had_entries:
         return TombstonePlan(_NONE, _NONE, "empty_root")
-    to_untombstone = tombstoned & current.uuids
+    to_untombstone = frozenset(tombstoned & current.uuids)
     if previous is None or not (previous.complete and current.complete):
         return TombstonePlan(_NONE, to_untombstone, None)
-    candidates = library - current.uuids - previous.uuids
-    limit = max(5, len(library) / 10)
-    if len(candidates) > limit or len(candidates) > max_per_poll:
+    candidates = frozenset(library - tombstoned - previous.uuids - current.uuids)
+    over_share = len(candidates) > 5 and len(candidates) * 10 > len(library)
+    if not allow_mass_delete and (over_share or len(candidates) > max_per_poll):
         return TombstonePlan(_NONE, to_untombstone, "mass_delete")
-    return TombstonePlan(frozenset(candidates), to_untombstone, None)
+    return TombstonePlan(candidates, to_untombstone, None)

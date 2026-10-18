@@ -45,7 +45,7 @@ def test_schema_3_and_4_parse() -> None:
         body("4", "0:.:2:10", f"{H1}:0:{DOC}:3:10"),  # header count is wrong
         body("3", f"{H1}:0:{DOC}:3"),  # a field missing
         body("3", f"{H1[:-1]}:0:{DOC}:0:1"),  # short hash
-        body("3", f"{H1.upper()}:0:{DOC}:0:1"),
+        body("3", f"{H1[:-1]}g:0:{DOC}:0:1"),  # not hex
         body("3", f"{H1}:0:{DOC}:0:-1"),
         body("3", f"{H1}:0:{DOC}:0:" + chr(0x661)),  # a non-ASCII digit int() accepts
         body("3", f"{H1}:0:{DOC}:0:1", f"{H2}:0:{DOC}:0:1"),  # one id twice
@@ -78,7 +78,7 @@ def test_index_bounds() -> None:
         json.dumps({"hash": H1, "generation": 2**63}).encode(),
         json.dumps({"hash": H1, "generation": 1.5}).encode(),
         json.dumps({"hash": "../" + H1[3:], "generation": 1}).encode(),
-        json.dumps({"hash": H1.upper(), "generation": 1}).encode(),
+        json.dumps({"hash": H1[:-1] + "G", "generation": 1}).encode(),
     ],
 )
 def test_bad_root_pointers_are_refused(pointer: bytes) -> None:
@@ -89,6 +89,28 @@ def test_bad_root_pointers_are_refused(pointer: bytes) -> None:
 def test_root_pointer() -> None:
     raw = json.dumps({"hash": H1, "generation": 7, "schemaVersion": 4}).encode()
     assert parse_root_pointer(raw) == (H1, 7)
+
+
+def test_hashes_are_normalised_to_lowercase() -> None:
+    upper = "AbCdEf" + "0" * 58
+    pointer = json.dumps({"hash": upper, "generation": 1}).encode()
+    assert parse_root_pointer(pointer) == (upper.lower(), 1)
+
+    [entry] = parse_index(body("3", f"{upper}:0:{DOC}.pdf:0:1"), max_entries=1, what="x")
+    assert entry.hash == upper.lower()
+
+    raw = body("3", f"{upper}:0:{DOC}.pdf:0:1")
+    by_entries = hash_entries(parse_index(raw, max_entries=1, what="x"))
+    index = parse_document_index(raw, uuid=DOC, hash=by_entries.upper(), max_files=1)
+    assert index.hash == by_entries
+    assert index.files[f"{DOC}.pdf"].sha256 == upper.lower()
+    assert index.body == raw
+
+    root_raw = body("4", "0:.:1:1", f"{upper}:0:{DOC}:1:1")
+    by_body = hashlib.sha256(root_raw).hexdigest()
+    root = parse_root(root_raw, root_hash=by_body.upper(), generation=1, max_entries=1)
+    assert root.hash == by_body
+    assert root.entries[0].hash == upper.lower()
 
 
 def test_root_must_match_its_hash_by_either_address() -> None:
@@ -111,8 +133,8 @@ def test_document_index_keeps_only_allowlisted_names_of_its_document() -> None:
         f"{DOC}.metadata",
         f"{DOC}.content",
         f"{DOC}/{PAGE}.rm",
-        f"{DOC}/{PAGE}-metadata.json",
         f"{OTHER}.metadata",
+        f"{DOC}/{PAGE}-metadata.json",  # not on A's allowlist
         f"{DOC}/../{OTHER}.metadata",
         f"{DOC}.metadata/../../x",
         f"/{DOC}.pdf",
@@ -125,8 +147,8 @@ def test_document_index_keeps_only_allowlisted_names_of_its_document() -> None:
 
     index = parse_document_index(raw, uuid=DOC, hash=address, max_files=20)
 
-    assert sorted(index.files) == sorted(names[:4])
-    assert index.skipped == 6
+    assert sorted(index.files) == sorted(names[:3])
+    assert index.skipped == 7
     with pytest.raises(TypeError):
         index.files["x"] = index.files[names[0]]  # type: ignore[index]
 

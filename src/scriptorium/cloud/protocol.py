@@ -13,6 +13,8 @@ not fully understand instead of guessing:
 * Root entry ids must be UUIDs and document file names must pass the §11.0 allowlist
   and belong to their document; anything else is counted and left out, so no
   cloud-supplied string ever reaches a path join unchecked.
+* Hashes are accepted in either case and returned as lowercase hex, the only spelling
+  the archive and the index store (Architecture §6).
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Final, NamedTuple
 
@@ -40,9 +42,10 @@ MAX_GENERATION: Final = 2**63 - 1
 
 _UUID_RE: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
+_HEX64_RE: Final = re.compile(r"[0-9A-Fa-f]{64}")
 # [0-9] rather than \d: Python's \d also matches non-ASCII digits, which int() accepts.
 _ENTRY_RE: Final = re.compile(
-    r"(?P<hash>[0-9a-f]{64}):(?P<type>[0-9A-Fa-f]{1,8}):(?P<id>[^:\s]{1,256})"
+    r"(?P<hash>[0-9A-Fa-f]{64}):(?P<type>[0-9A-Fa-f]{1,8}):(?P<id>[^:\s]{1,256})"
     r":(?P<subfiles>[0-9]{1,9}):(?P<size>[0-9]{1,15})"
 )
 _SCHEMA4_HEADER_RE: Final = re.compile(r"0:\.:(?P<count>[0-9]{1,9}):(?P<size>[0-9]{1,15})")
@@ -53,7 +56,15 @@ def is_uuid(value: str) -> bool:
 
 
 def is_sha256(value: str) -> bool:
+    """A lowercase hex SHA-256, the normalised spelling."""
     return _SHA256_RE.fullmatch(value) is not None
+
+
+def normalise_sha256(value: object) -> str | None:
+    """``value`` as lowercase hex if it is a SHA-256 in hex of either case, else None."""
+    if isinstance(value, str) and _HEX64_RE.fullmatch(value) is not None:
+        return value.lower()
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,12 +109,14 @@ class DocumentIndex:
     """A document's files: xochitl-relative name -> (sha256, declared size).
 
     Every name passed ``is_safe_name`` and belongs to ``uuid``; ``skipped`` counts the
-    names that did not and were left out.
+    names that did not and were left out. ``body`` is the index as fetched (it matched
+    ``hash``), kept so sync can store it in ``blobs/`` beside the files it lists.
     """
 
     uuid: str
     hash: str
     files: Mapping[str, BlobRef]
+    body: bytes = field(default=b"", repr=False)
     skipped: int = 0
 
 
@@ -142,7 +155,7 @@ def parse_index(body: bytes, *, max_entries: int, what: str) -> list[IndexEntry]
         seen.add(entry_id)
         entries.append(
             IndexEntry(
-                hash=match["hash"],
+                hash=match["hash"].lower(),
                 type=match["type"],
                 id=entry_id,
                 subfiles=int(match["subfiles"]),
@@ -164,6 +177,7 @@ def hash_entries(entries: Iterable[IndexEntry]) -> str:
 
 def matches_address(body: bytes, entries: list[IndexEntry], expected: str) -> bool:
     """True if the index is stored under either content address the service uses."""
+    expected = expected.lower()
     return hash_entries(entries) == expected or hashlib.sha256(body).hexdigest() == expected
 
 
@@ -175,9 +189,9 @@ def parse_root_pointer(body: bytes) -> tuple[str, int]:
         raise CloudProtocolError("root pointer is not JSON") from None
     if not isinstance(data, dict):
         raise CloudProtocolError("root pointer is not an object")
-    root_hash = data.get("hash")
+    root_hash = normalise_sha256(data.get("hash"))
     generation = data.get("generation")
-    if not isinstance(root_hash, str) or not is_sha256(root_hash):
+    if root_hash is None:
         raise CloudProtocolError("root pointer has no valid hash")
     # bool is an int subclass; a JSON true is not a generation.
     if type(generation) is not int or not 0 <= generation <= MAX_GENERATION:
@@ -186,6 +200,7 @@ def parse_root_pointer(body: bytes) -> tuple[str, int]:
 
 
 def parse_root(body: bytes, *, root_hash: str, generation: int, max_entries: int) -> RootInfo:
+    root_hash = root_hash.lower()
     entries = parse_index(body, max_entries=max_entries, what="root index")
     if not matches_address(body, entries, root_hash):
         raise CloudProtocolError("root index does not match its hash")
@@ -205,6 +220,7 @@ def is_document_file(uuid: str, name: str) -> bool:
 
 
 def parse_document_index(body: bytes, *, uuid: str, hash: str, max_files: int) -> DocumentIndex:
+    hash = hash.lower()
     entries = parse_index(body, max_entries=max_files, what="document index")
     if not matches_address(body, entries, hash):
         raise CloudProtocolError("document index does not match its hash")
@@ -213,5 +229,6 @@ def parse_document_index(body: bytes, *, uuid: str, hash: str, max_files: int) -
         uuid=uuid,
         hash=hash,
         files=MappingProxyType(files),
+        body=body,
         skipped=len(entries) - len(files),
     )

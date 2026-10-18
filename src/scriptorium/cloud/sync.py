@@ -1,15 +1,17 @@
 """One poll of one account: Architecture §7 steps 1 to 4 and 7.
 
 1. **Root.** Fetch the root pointer and index. A generation lower than the last one
-   seen, or a root with no documents after a non-empty one, sets ``anomaly`` and stops:
-   nothing is downloaded or moved. While ``anomaly`` is set every poll returns at once
-   without a single cloud request (read-only safe mode) until an operator clears it.
+   seen, or a root with no documents after a non-empty one (the planner's rules 1 and
+   2, asked before anything is listed), sets ``anomaly`` and stops: nothing is
+   downloaded or moved. While ``anomaly`` is set every poll returns at once without a
+   single cloud request (read-only safe mode) until an operator clears it.
 2. **Listing.** Every root entry whose document index hash differs from the committed
    ``hash_root`` has its index fetched; an unchanged hash is an unchanged document
    (indexes are content-addressed), so it needs no fetch. A document whose index fails
    is left alone, the others proceed, and the listing is marked incomplete.
 3. **Commit.** Per changed document: stage, download the blobs not yet in ``blobs/``
-   (each streamed through SHA-256 verification and its declared size cap), then, in one
+   (each streamed through SHA-256 verification and its declared size cap) and store the
+   document index itself as a blob, then, in one
    ``Index.transaction()``, append ``history``, upsert the ``documents`` row and
    ``Archive.commit`` the files. File system work goes last inside the transaction, so a
    failure there rolls the rows back and the next poll retries.
@@ -17,7 +19,10 @@
    (``sync_state.previous_listing``), what to tombstone (absent from two consecutive
    complete listings, behind the circuit breaker) and what to un-tombstone (present
    again). Un-tombstoning runs before step 3's commits so a returning document's old
-   files are back in place before a newer version replaces them.
+   files are back in place before a newer version replaces them. No plan is applied
+   once an anomaly is set. An administrator's one-shot approval
+   (``sync_state.allow_mass_delete``, written by ``admin_clear_anomaly``) is passed to
+   the planner as ``allow_mass_delete=True`` and consumed by the next poll that lists.
 7. **Failure classes.** 401/403 from the token endpoint is ``token_rejected``; 429, a
    network failure or three transient failures in a row end the poll with ``backoff``;
    an unparseable root is ``anomaly="protocol"``. ``needs_relink`` (three rejections in
@@ -32,9 +37,10 @@ Rendering (step 5) and OCR (step 6) belong to the worker.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import logging
-import re
 import secrets
 import time
 import unicodedata
@@ -80,6 +86,8 @@ STATE_LAST_FULL_LISTING_OK: Final = "last_full_listing_ok"
 STATE_PREVIOUS_LISTING: Final = "previous_listing"
 STATE_ANOMALY: Final = "anomaly"
 STATE_ANOMALY_REASON: Final = "anomaly_reason"
+STATE_ALLOW_MASS_DELETE: Final = "allow_mass_delete"
+"""One-shot administrator approval: ``"true"`` lets the next listing skip the breaker."""
 
 ANOMALY_GENERATION_REGRESSED: Final = "generation_regressed"
 ANOMALY_EMPTY_ROOT: Final = "empty_root"
@@ -91,7 +99,9 @@ MAX_JSON_BYTES: Final = 8 * 1024 * 1024
 """Largest ``.metadata``/``.content`` parsed for the documents row; larger is left unparsed."""
 MAX_NAME_CHARS: Final = 1024
 MAX_PAGES: Final = 100_000
-_DOC_TYPE_RE: Final = re.compile(r"[A-Za-z]{1,32}Type")
+_DOCUMENT_TYPES: Final = frozenset({"DocumentType", "CollectionType"})
+_BEGINNING: Final = datetime(1, 1, 1, tzinfo=UTC)
+_LIST_PAGE: Final = 1000
 _FILE_TYPES: Final = frozenset({"notebook", "pdf", "epub"})
 _BIDI_CONTROLS: Final = frozenset(
     "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
@@ -148,6 +158,8 @@ class SyncReport:
     bytes_downloaded: int = 0
     anomaly: str | None = None
     anomaly_reason: str | None = None
+    mass_delete_approved: bool = False
+    """This poll consumed an administrator's ``allow_mass_delete`` approval."""
 
 
 @dataclass(frozen=True)
@@ -187,6 +199,7 @@ class _Run:
     bytes_downloaded: int = 0
     anomaly: str | None = None
     anomaly_reason: str | None = None
+    mass_delete_approved: bool = False
 
 
 class _Streak:
@@ -247,22 +260,31 @@ class SyncOnce:
 
         previous = _load_listing(self._index.get_state(STATE_PREVIOUS_LISTING))
         last_generation = _parse_int(self._index.get_state(STATE_LAST_GENERATION))
-        library = self._index.document_uuids(deleted=False)
-        tombstoned = self._index.document_uuids(deleted=True)
-        if last_generation is not None and root.generation < last_generation:
-            return self._raise_anomaly(
-                run,
-                ANOMALY_GENERATION_REGRESSED,
-                f"root generation {root.generation} is lower than {last_generation}",
-            )
-        if not root.entries and (library or (previous is not None and previous.uuids)):
-            return self._raise_anomaly(
-                run,
-                ANOMALY_EMPTY_ROOT,
-                f"root lists no documents; the archive holds {len(library)}",
-            )
+        approved = self._index.get_state(STATE_ALLOW_MASS_DELETE) == "true"
+        library, tombstoned = self._library_sets()
         uuids = frozenset(entry.uuid for entry in root.entries)
         run.documents_listed = len(uuids)
+
+        # The planner's rules 1 and 2 need no listing, so a regressed or emptied root is
+        # refused before a single index is fetched. That root is saved as an incomplete
+        # listing: after an administrator clears the anomaly the next poll compares against
+        # it, and it can never count as one of the two complete listings a deletion needs.
+        unlisted = Listing(uuids=uuids, complete=False, generation=root.generation)
+        early: str | None = None
+        if last_generation is not None and root.generation < last_generation:
+            early = ANOMALY_GENERATION_REGRESSED
+        else:
+            early = self._planner(
+                previous, unlisted, library, tombstoned, self._settings.tombstone_max_per_poll
+            ).anomaly
+        if early is not None:
+            if early == ANOMALY_GENERATION_REGRESSED:
+                seen = last_generation if last_generation is not None else _generation(previous)
+                why = f"root generation {root.generation} is lower than {seen}"
+            else:
+                why = f"root lists {len(uuids)} documents; the archive holds {len(library)}"
+            self._save_listing(unlisted, root_hash=None)
+            return self._raise_anomaly(run, early, why)
 
         # Step 2: the listing.
         stop: _Stop | None = None
@@ -279,8 +301,22 @@ class SyncOnce:
 
         if stop is None:
             plan = self._planner(
-                previous, current, library, tombstoned, self._settings.tombstone_max_per_poll
+                previous,
+                current,
+                library,
+                tombstoned,
+                self._settings.tombstone_max_per_poll,
+                allow_mass_delete=approved,
             )
+            if approved:
+                run.mass_delete_approved = True
+                log_event(
+                    logger,
+                    "sync.mass_delete_approved",
+                    level=logging.WARNING,
+                    acct=self._settings.acct,
+                    count=len(plan.to_tombstone),
+                )
             if plan.anomaly is not None:
                 # The breaker (or a check the planner shares with step 1) tripped: nothing
                 # is moved, downloaded or committed until an operator has looked.
@@ -299,11 +335,7 @@ class SyncOnce:
                     self._tombstone(plan.to_tombstone, run)
 
         fully_done = complete and stop is None and not run.failed and run.anomaly is None
-        with self._index.transaction():
-            self._index.set_state(STATE_LAST_GENERATION, str(root.generation))
-            self._index.set_state(STATE_PREVIOUS_LISTING, _dump_listing(current))
-            self._index.set_state(STATE_LAST_FULL_LISTING_OK, "true" if complete else "false")
-            self._index.set_state(STATE_LAST_ROOT_HASH, root.hash if fully_done else None)
+        self._save_listing(current, root_hash=root.hash if fully_done else None)
 
         if run.anomaly is not None:
             return self._finish(run, "anomaly", reason=run.anomaly)
@@ -312,6 +344,33 @@ class SyncOnce:
         if run.failed or run.skipped_files or run.rejected_entries or run.metadata_errors:
             return self._finish(run, "partial", reason=_first_reason(run))
         return self._finish(run, "ok")
+
+    def _library_sets(self) -> tuple[frozenset[str], frozenset[str]]:
+        """``(library, tombstoned)``: every document row, split on ``deleted_at``.
+
+        Pages through ``Index.recent`` from the beginning of time, which lists tombstoned
+        rows too; §3.4 has no other way to enumerate the documents.
+        """
+        live: set[str] = set()
+        dead: set[str] = set()
+        cursor: str | None = None
+        while True:
+            page = self._index.recent(_BEGINNING, cursor, _LIST_PAGE)
+            for row in page.items:
+                (live if row.deleted_at is None else dead).add(row.uuid)
+            cursor = page.next_cursor
+            if cursor is None:
+                return frozenset(live), frozenset(dead)
+
+    def _save_listing(self, listing: Listing, *, root_hash: str | None) -> None:
+        """Record this poll's listing for the next one and consume any one-shot approval."""
+        with self._index.transaction():
+            self._index.set_state(STATE_LAST_GENERATION, str(listing.generation))
+            self._index.set_state(STATE_PREVIOUS_LISTING, _dump_listing(listing))
+            ok = "true" if listing.complete else "false"
+            self._index.set_state(STATE_LAST_FULL_LISTING_OK, ok)
+            self._index.set_state(STATE_LAST_ROOT_HASH, root_hash)
+            self._index.set_state(STATE_ALLOW_MASS_DELETE, None)
 
     # ---- step 2 --------------------------------------------------------------------------
 
@@ -371,6 +430,18 @@ class SyncOnce:
                 self._fail(run, uuid, "local_io")
                 if local.hit():
                     return _Stop("backoff", "local_io")
+            except Exception as exc:
+                # A bug, or cloud data no check anticipated: fail this document, not the
+                # account. Without this one bad document would end every poll at the same
+                # place and keep every document after it from ever committing.
+                self._fail(run, uuid, "internal_error", refused=True)
+                log_event(
+                    logger,
+                    "sync.document_error",
+                    level=logging.ERROR,
+                    acct=self._settings.acct,
+                    reason=type(exc).__name__,
+                )
             else:
                 transient.reset()
                 local.reset()
@@ -383,8 +454,13 @@ class SyncOnce:
         files = doc_index.files
         with self._archive.stage(entry.uuid, f"sync-{secrets.token_hex(6)}") as staged:
             self._fetch_blobs(files, run)
-            row = self._document_row(entry, doc_index, root.generation, run)
+            if doc_index.body:
+                # This version's file list, kept like any blob (§6). Its content address is
+                # SHA-256 of the body: hash_root itself only for a body-addressed index.
+                body_sha = hashlib.sha256(doc_index.body).hexdigest()
+                self._archive.put_blob(body_sha, io.BytesIO(doc_index.body))
             seen_at = self._clock()
+            row = self._document_row(entry, doc_index, root.generation, seen_at, run)
             with self._index.transaction():
                 self._index.append_history(entry.uuid, root.generation, entry.hash, seen_at)
                 self._index.upsert_document(row)
@@ -424,9 +500,10 @@ class SyncOnce:
                 raise
 
     def _fetch_one(self, sha256: str, name: str, size: int) -> int:
+        """Download one blob into ``blobs/``; returns its actual size (``size`` is a cap)."""
         with self._client.open_blob(sha256, max_bytes=size, filename=name) as stream:
-            self._archive.put_blob(sha256, stream)
-        return size
+            path = self._archive.put_blob(sha256, stream)
+        return path.stat().st_size
 
     @staticmethod
     def _count(run: _Run, size: int) -> None:
@@ -436,14 +513,19 @@ class SyncOnce:
     # ---- the documents row -----------------------------------------------------------------
 
     def _document_row(
-        self, entry: RootEntry, doc_index: DocumentIndex, generation: int, run: _Run
+        self,
+        entry: RootEntry,
+        doc_index: DocumentIndex,
+        generation: int,
+        seen_at: datetime,
+        run: _Run,
     ) -> DocumentRow:
         uuid = entry.uuid
         files = doc_index.files
         metadata = self._read_json(files.get(f"{uuid}.metadata"), run, required=True)
         content = self._read_json(files.get(f"{uuid}.content"), run, required=False)
         doc_type = metadata.get("type")
-        if not isinstance(doc_type, str) or not _DOC_TYPE_RE.fullmatch(doc_type):
+        if not isinstance(doc_type, str) or doc_type not in _DOCUMENT_TYPES:
             doc_type = "DocumentType"
         source_kind, page_count = _content_facts(uuid, doc_type, content, files)
         return DocumentRow(
@@ -451,7 +533,7 @@ class SyncOnce:
             type=doc_type,
             parent=_parent(metadata.get("parent")),
             name=_display_name(metadata.get("visibleName"), fallback=uuid),
-            last_modified=_epoch_ms(metadata.get("lastModified")),
+            last_modified=_epoch_ms(metadata.get("lastModified")) or seen_at,
             last_opened=_epoch_ms(metadata.get("lastOpened")),
             deleted_at=None,
             deletion_cause=None,
@@ -578,6 +660,7 @@ class SyncOnce:
             bytes_downloaded=run.bytes_downloaded,
             anomaly=run.anomaly,
             anomaly_reason=run.anomaly_reason,
+            mass_delete_approved=run.mass_delete_approved,
         )
         log_event(
             logger,
@@ -603,6 +686,10 @@ def _first_reason(run: _Run) -> str:
     if run.skipped_files:
         return "skipped_files"
     return "metadata_errors"
+
+
+def _generation(listing: Listing | None) -> int | None:
+    return None if listing is None else listing.generation
 
 
 def _parse_int(raw: str | None) -> int | None:
@@ -679,12 +766,12 @@ def _epoch_ms(value: object) -> datetime | None:
 
 def _content_facts(
     uuid: str, doc_type: str, content: Mapping[str, Any], files: Mapping[str, BlobRef]
-) -> tuple[str | None, int | None]:
+) -> tuple[str | None, int]:
     """``(source_kind, page_count)`` from ``.content``, falling back on the file list."""
     if doc_type == "CollectionType":
-        return None, None
+        return None, 0
     kind = content.get("fileType")
-    if kind not in _FILE_TYPES:
+    if not isinstance(kind, str) or kind not in _FILE_TYPES:
         if f"{uuid}.pdf" in files:
             kind = "pdf"
         elif f"{uuid}.epub" in files:

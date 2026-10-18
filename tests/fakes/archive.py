@@ -1,11 +1,14 @@
 """In-memory fake of ``library/archive.py:Archive`` (plan §3.2) that records every operation.
 
-Blobs are real files under ``<root>/blobs`` (callers read them through ``blob_path``); the
-library, tombstones and the per-generation holding area are dictionaries of
-``name -> sha256``, so a test can assert exactly what moved where. Like the real archive
-it has no method that deletes: superseded files go to ``holding``, removed documents to
-``tombstones``. ``inject`` raises an exception (usually :class:`SimulatedCrash`, standing in
-for SIGKILL) at a named point.
+Blobs are real files at ``<root>/blobs/<sha256>``, the merged archive's flat layout
+(callers read them through ``blob_path``); the library, tombstones and the per-generation
+holding area are dictionaries of ``name -> sha256``, so a test can assert exactly what moved
+where. Like the real archive it has no method that deletes: superseded files go to
+``holding``, removed documents to ``tombstones``. Where sync depends on the real archive's
+rules the fake applies them too: ``commit`` refuses an empty file set, the bare ``<uuid>``,
+a name of another document and a missing blob; ``tombstone`` and ``untombstone`` are no-ops
+when there is nothing to move. ``inject`` raises an exception (usually
+:class:`SimulatedCrash`, standing in for SIGKILL) at a named point.
 """
 
 from __future__ import annotations
@@ -33,7 +36,9 @@ class SimulatedCrash(BaseException):
 class Staging:
     uuid: str
     job: str
+    path: Path
     open: bool = True
+    committed: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,8 @@ class Committed:
     uuid: str
     generation: int
     hash_root: str
+    files: Mapping[str, Path]
+    held: Path | None
 
 
 @dataclass
@@ -66,7 +73,7 @@ class FakeArchive:
     def stage(self, uuid: str, job: str) -> Iterator[Staging]:
         _check_uuid(uuid)
         key = f"{uuid}.{job}"
-        staged = Staging(uuid, job)
+        staged = Staging(uuid, job, self.root / "staging" / key)
         self.staging[key] = staged
         self.ops.append(("stage", uuid))
         try:
@@ -108,33 +115,53 @@ class FakeArchive:
         if not staged.open or self.staging.get(f"{staged.uuid}.{staged.job}") is not staged:
             raise RefusedError("commit of a staging area that is not open")
         uuid = staged.uuid
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise RefusedError("generation must be a non-negative integer")
+        _check_sha(hash_root)
+        if not files:
+            raise RefusedError("a commit needs at least one file")
         for name, sha in files.items():
-            if not is_safe_name(name) or not (
-                name.startswith(f"{uuid}.") or name.startswith(f"{uuid}/")
+            if (
+                name == uuid
+                or not is_safe_name(name)
+                or not (name.startswith(f"{uuid}.") or name.startswith(f"{uuid}/"))
             ):
                 raise RefusedError("commit of a file name outside the allowlist")
             if not self.blob_path(sha).is_file():
                 raise RefusedError("commit of a file whose blob is missing")
         previous = self.library.get(uuid)
+        held = None
         if previous is not None:
             self.holding.append((uuid, generation, previous))
+            held = self.root / "library" / ".holding" / uuid / str(generation)
         self.library[uuid] = dict(files)
         self.generations[uuid] = generation
+        staged.committed = True
         self.ops.append(("commit", uuid, str(generation), hash_root))
-        return Committed(uuid, generation, hash_root)
+        lib = self.root / "library"
+        return Committed(uuid, generation, hash_root, {n: lib / n for n in sorted(files)}, held)
 
     def tombstone(self, uuid: str) -> None:
         self._maybe_crash("tombstone")
         _check_uuid(uuid)
-        files = self.library.pop(uuid, {})
+        files = self.library.pop(uuid, None)
+        if files is None:
+            return  # nothing in the library: a no-op, as in the real archive
+        if uuid in self.tombstones:
+            self.holding.append((uuid, -1, self.tombstones[uuid]))
         self.tombstones[uuid] = files
         self.ops.append(("tombstone", uuid))
 
     def untombstone(self, uuid: str) -> None:
         self._maybe_crash("untombstone")
         _check_uuid(uuid)
-        files = self.tombstones.pop(uuid, {})
-        self.library[uuid] = files
+        files = self.tombstones.pop(uuid, None)
+        if files is None:
+            return  # no tombstone: a no-op, as in the real archive
+        if uuid in self.library:
+            self.holding.append((uuid, -1, files))  # a newer version is already in place
+        else:
+            self.library[uuid] = files
         self.ops.append(("untombstone", uuid))
 
     def sweep_staging(self) -> int:
@@ -147,9 +174,8 @@ class FakeArchive:
         return {name: self.blob_path(sha) for name, sha in self.library.get(uuid, {}).items()}
 
     def blob_path(self, sha256: str) -> Path:
-        if len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
-            raise RefusedError("not a SHA-256")
-        return self.root / "blobs" / sha256[:2] / sha256
+        _check_sha(sha256)
+        return self.root / "blobs" / sha256
 
     # ---- test helpers -----------------------------------------------------------------
 
@@ -184,6 +210,11 @@ class FakeArchive:
             return
         del self.faults[point]
         raise exc
+
+
+def _check_sha(sha256: str) -> None:
+    if len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
+        raise RefusedError("not a lowercase SHA-256")
 
 
 def _check_uuid(uuid: str) -> None:

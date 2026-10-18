@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import importlib
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,11 +28,29 @@ class DocumentView(Protocol):
     """The fields of ``Index.document()``'s row that sync reads."""
 
     @property
-    def hash_root(self) -> str: ...
+    def hash_root(self) -> str | None: ...
     @property
     def last_opened(self) -> datetime | None: ...
     @property
     def deleted_at(self) -> datetime | None: ...
+
+
+class ChangeView(Protocol):
+    """The fields of an ``Index.recent()`` row that sync reads."""
+
+    @property
+    def uuid(self) -> str: ...
+    @property
+    def deleted_at(self) -> datetime | None: ...
+
+
+class ChangePage(Protocol):
+    """One page of ``Index.recent()``."""
+
+    @property
+    def items(self) -> Sequence[ChangeView]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
 
 
 class ArchivePort(Protocol):
@@ -51,9 +69,9 @@ class ArchivePort(Protocol):
 class IndexPort(Protocol):
     """The subset of ``library/index.py:Index`` (plan §3.4) that sync calls.
 
-    ``document_uuids`` is **not** in plan §3.4: the tombstone planner needs the sets of
-    live and tombstoned documents, and §3.4 offers no way to enumerate them (``children``
-    walks one folder). Proposed to B in the hand-back.
+    The planner needs the sets of live and tombstoned documents and §3.4 has no method that
+    lists them, so sync pages through ``recent`` from the beginning of time, which includes
+    tombstoned rows (see ``SyncOnce._library_sets``).
     """
 
     def transaction(self) -> AbstractContextManager[None]: ...
@@ -61,7 +79,7 @@ class IndexPort(Protocol):
     def mark_deleted(self, uuid: str, cause: str, at: datetime) -> None: ...
     def unmark_deleted(self, uuid: str) -> None: ...
     def document(self, uuid: str) -> DocumentView | None: ...
-    def document_uuids(self, *, deleted: bool) -> frozenset[str]: ...
+    def recent(self, since: datetime, cursor: str | None, limit: int) -> ChangePage: ...
     def append_history(
         self, uuid: str, generation: int, hash_root: str, seen_at: datetime
     ) -> None: ...
@@ -80,6 +98,8 @@ class Planner(Protocol):
         tombstoned: frozenset[str],
         max_per_poll: int,
         /,
+        *,
+        allow_mass_delete: bool = False,
     ) -> TombstonePlan: ...
 
 
@@ -99,22 +119,22 @@ def default_planner() -> Planner:
 # ---- mirrors until library/ is merged (replace with imports) -------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DocumentRow:
     """Mirror of ``library/index.py:DocumentRow``: the ``documents`` columns of §6.1."""
 
     uuid: str
-    type: str
+    type: str  # "DocumentType" | "CollectionType"
     parent: str | None
     name: str
-    last_modified: datetime | None
-    last_opened: datetime | None
-    deleted_at: datetime | None
-    deletion_cause: str | None
-    source_kind: str | None
-    page_count: int | None
-    hash_root: str
-    generation: int
+    last_modified: datetime
+    last_opened: datetime | None = None
+    deleted_at: datetime | None = None
+    deletion_cause: str | None = None  # "user" | "aged" | "unknown" when deleted
+    source_kind: str | None = None  # e.g. "notebook", "pdf", "epub"
+    page_count: int = 0
+    hash_root: str | None = None
+    generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -135,13 +155,13 @@ class TombstonePlan:
     anomaly: str | None
 
 
-_UUID: Final = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_UUID_PATTERN: Final = "[0-9a-f-]{36}"
 _SAFE_NAME: Final = re.compile(
-    rf"{_UUID}(?:\.(?:metadata|content|pagedata|pdf|epub))?"  # the §11.0 allowlist
-    rf"|{_UUID}/{_UUID}(?:\.rm|-metadata\.json)"  # a page inside a document directory
+    rf"(?P<doc>{_UUID_PATTERN})"
+    rf"(?:\.(?:metadata|content|pagedata|pdf|epub)|/(?P<page>{_UUID_PATTERN})\.rm)?"
 )
 
 
-def is_safe_name(name: str) -> bool:
-    """Mirror of ``library/layout.py:is_safe_name``: the §11.0 allowlist plus page files."""
-    return _SAFE_NAME.fullmatch(name) is not None
+def is_safe_name(name: object) -> bool:
+    """Mirror of ``library/layout.py:is_safe_name``: the xochitl names the archive stores."""
+    return isinstance(name, str) and _SAFE_NAME.fullmatch(name) is not None
