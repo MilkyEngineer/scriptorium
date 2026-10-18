@@ -753,6 +753,26 @@ async def test_more_than_the_minimum_goes_as_one_batch(batching: Harness) -> Non
     assert h.client.pages_sent() == 7
 
 
+async def test_a_batch_fits_the_cap_even_if_every_item_costs_the_most_it_can(
+    batching: Harness,
+) -> None:
+    """A batch is paid for item by item after it is sent, with no further cap check, so the
+    scan admits only as many items as the room covers at OCR_MAX_TOKENS of output each."""
+    h = batching
+    settings = h.linked.settings
+    worst = cost_usd(settings, runner_mod.EST_INPUT_TOKENS, settings.ocr_max_tokens, batch=True)
+    typical = cost_usd(
+        settings, runner_mod.EST_INPUT_TOKENS, runner_mod.EST_OUTPUT_TOKENS, batch=True
+    )
+    room = 5.5 * worst
+    assert room / typical >= len(PAGES)  # the typical estimate would have sent every page
+    h.ledger.user_cap = room
+    await h.poll(2)
+    (batch_id,) = h.client.batches
+    sent = len(h.client.batches[batch_id].custom_ids)
+    assert sent == 5 and sent * worst <= room
+
+
 async def test_batch_results_are_checked_against_the_jobs_items(batching: Harness) -> None:
     h = batching
     await h.poll(2)

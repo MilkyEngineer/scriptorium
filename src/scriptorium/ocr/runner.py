@@ -110,7 +110,10 @@ SCAN_LIMIT: Final = 500
 """Pages without a transcript one scan looks at (stable or not)."""
 EST_INPUT_TOKENS: Final = 5_000
 EST_OUTPUT_TOKENS: Final = 1_500
-"""A generous estimate of one page's tokens, to bound a scan's submissions by the cap."""
+"""A generous estimate of one page's tokens, to bound how many single jobs a scan queues by
+the cap's room; each single job checks the cap again before its call. A batch is paid for
+item by item with no later check, so its items are estimated at ``OCR_MAX_TOKENS`` of output,
+the most one can cost."""
 MAX_PNG_BYTES: Final = 64 * 1024 * 1024
 KEY_REFUSED: Final = "key_refused"
 """Deferral reason while the account's refused-key note applies to the mode."""
@@ -647,7 +650,7 @@ class OcrRunner:
         if len(candidates) > settings.ocr_batch_min:
             if batch_running:
                 return 0  # one batch per account at a time; the rest goes in the next one
-            per_item = cost_usd(settings, EST_INPUT_TOKENS, EST_OUTPUT_TOKENS, batch=True)
+            per_item = cost_usd(settings, EST_INPUT_TOKENS, settings.ocr_max_tokens, batch=True)
             afford = affordable_pages(remaining, per_item, len(candidates))
             submitted = await self._submit_batch(ctx, candidates[:afford], mode, now)
             if submitted is not None:
