@@ -27,7 +27,6 @@ from scriptorium.auth.oidc import User
 from scriptorium.cloud.sync import STATE_ANOMALY, STATE_ANOMALY_REASON, STATE_LAST_FULL_LISTING_OK
 from scriptorium.db.connect import from_db_time
 from scriptorium.errors import RefusedError
-from scriptorium.jobs.kinds import RENDER_KINDS
 from scriptorium.tools import ToolContext, ToolRegistry, ToolSpec
 from scriptorium.tools._conventions import (
     READ_ONLY,
@@ -51,7 +50,7 @@ from scriptorium.tools._library import (
 from scriptorium.tools._services import Services
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import worker_heartbeat_path
-from scriptorium.worker import HEARTBEAT_STALE_SECONDS, heartbeat_age
+from scriptorium.worker import HEARTBEAT_STALE_SECONDS, heartbeat_age, read_heartbeat
 
 DEVICES_URL: Final = "https://my.remarkable.com/"
 OCR_LAZY_NOTE: Final = (
@@ -257,17 +256,30 @@ def _status(svc: Services, account: Account) -> dict[str, object]:
                 "hint": "An administrator must look at it and clear it.",
             }
         )
-    dead = sum(jobs.get(kind, {}).get("dead", 0) for kind in RENDER_KINDS)
+    verdicts, rerunnable = svc.queue.dead_renders(account.uid, acct=account.acct)
+    dead = verdicts + rerunnable
     if dead:
+        message = f"{dead} page images could not be rendered."
+        if rerunnable:
+            message += (
+                f" {rerunnable} of them failed for a reason other than the page itself and "
+                "are rendered again when the page is next asked for or the worker restarts."
+            )
         warnings.append(
             {
                 "code": "render_failures",
                 "count": dead,
-                "message": f"{dead} page images could not be rendered.",
+                "rerunnable": rerunnable,
+                "message": message,
             }
         )
-    age = heartbeat_age(worker_heartbeat_path(svc.settings.data_dir))
-    worker = {"heartbeat_age_s": None if age is None else round(age, 1)}
+    beat_path = worker_heartbeat_path(svc.settings.data_dir)
+    age = heartbeat_age(beat_path)
+    rebuilds = read_heartbeat(beat_path).get("render_pool_rebuilds")
+    worker = {
+        "heartbeat_age_s": None if age is None else round(age, 1),
+        "render_pool_rebuilds": rebuilds if type(rebuilds) is int and rebuilds >= 0 else None,
+    }
     if account.row.active and (age is None or age > HEARTBEAT_STALE_SECONDS):
         warnings.append(
             {

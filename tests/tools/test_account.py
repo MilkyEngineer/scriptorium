@@ -237,6 +237,15 @@ async def test_status_of_a_synced_account(linked: Linked, library: Served) -> No
     assert status["jobs"]["dead"] == 0
     assert all(n == 0 for n in status["jobs"]["pending"].values())
     assert 0 <= status["worker"]["heartbeat_age_s"] < 60
+    assert status["worker"]["render_pool_rebuilds"] == 0
+    linked.worker.render_pool_rebuilds = 3
+    _fresh_heartbeat(linked)
+    status = await library.ok("account_status")
+    assert status["worker"]["render_pool_rebuilds"] == 3
+    worker_heartbeat_path(linked.settings.data_dir).write_text("2026-10-01T12:00:00Z\n")
+    status = await library.ok("account_status")  # an old-style heartbeat body
+    assert status["worker"]["render_pool_rebuilds"] is None
+    assert status["warnings"] == []
 
 
 async def test_status_warns_of_a_stale_worker_and_failed_renders(
@@ -248,20 +257,25 @@ async def test_status_warns_of_a_stale_worker_and_failed_renders(
     os.utime(path, (old, old))
     version = pg.current_version(linked.paths, linked.index(), NOTEBOOK)
     assert version is not None
-    source = pg.page_sources(linked.paths, version)[1]
+    sources = pg.page_sources(linked.paths, version)
     conn = sqlite3.connect(global_db_path(linked.settings.data_dir))
     try:
         with conn:
-            conn.execute(
-                "UPDATE jobs SET state = 'dead' WHERE dedupe_key = ?",
-                (render_key(linked.acct, PAGES[1], source.content_hash),),
-            )
+            # One verdict on the page, one run that failed (a broken render pool).
+            for idx, error in ((1, "invalid_argument"), (2, "internal")):
+                conn.execute(
+                    "UPDATE jobs SET state = 'dead', error = ? WHERE dedupe_key = ?",
+                    (error, render_key(linked.acct, PAGES[idx], sources[idx].content_hash)),
+                )
     finally:
         conn.close()
     status = await library.ok("account_status")
     assert set(_codes(status)) == {"worker_stale", "render_failures"}
     assert status["worker"]["heartbeat_age_s"] >= 600
-    assert status["jobs"]["dead"] == 1
+    assert status["worker"]["render_pool_rebuilds"] == 0
+    assert status["jobs"]["dead"] == 2
+    (failures,) = [w for w in status["warnings"] if w["code"] == "render_failures"]
+    assert (failures["count"], failures["rerunnable"]) == (2, 1)
     assert status["status"] == "ok"  # warnings, but the archive is served and syncing
 
 
