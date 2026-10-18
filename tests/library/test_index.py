@@ -652,6 +652,19 @@ def test_v2_rekeys_a_version_1_index_by_document(tmp_path: Path) -> None:
 # ---- sync state and transactions ------------------------------------------------------------
 
 
+def test_setting_set_get_delete(index: Index) -> None:
+    assert index.get_setting("auto_ocr") is None
+    index.set_setting("auto_ocr", '{"enabled": true, "folders": []}')
+    assert index.get_setting("auto_ocr") == '{"enabled": true, "folders": []}'
+    index.set_setting("auto_ocr", '{"enabled": false, "folders": []}')
+    assert index.get_setting("auto_ocr") == '{"enabled": false, "folders": []}'
+    index.set_setting("auto_ocr", None)
+    assert index.get_setting("auto_ocr") is None
+    # Settings and sync state are separate namespaces.
+    index.set_state("auto_ocr", "x")
+    assert index.get_setting("auto_ocr") is None
+
+
 def test_state_set_get_delete(index: Index) -> None:
     assert index.get_state("last_generation") is None
     index.set_state("last_generation", "12")

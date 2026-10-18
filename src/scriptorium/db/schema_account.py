@@ -196,5 +196,21 @@ END;
 """,
 )
 
-ACCOUNT_STEPS: Final[tuple[Step, ...]] = (V1, V2)
+V3: Final = Step(
+    name="account index v3: per-account settings, sync scope exclusion",
+    sql="""
+-- Per-account user settings (§6.1): JSON values under a short key, e.g. "auto_ocr",
+-- "sync_scope". They live here rather than in a per-user file because folder UUIDs and tags
+-- belong to one account and the index is already transactional and snapshotted.
+CREATE TABLE settings(
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+) WITHOUT ROWID;
+-- Set while a document is outside the sync scope (§7, §11.1): its metadata is mirrored, its
+-- blobs are not downloaded. Never implies deletion.
+ALTER TABLE documents ADD COLUMN excluded_at TEXT;
+""",
+)
+
+ACCOUNT_STEPS: Final[tuple[Step, ...]] = (V1, V2, V3)
 """Append-only. ``len(ACCOUNT_STEPS)`` is the per-account schema version."""

@@ -914,6 +914,26 @@ class Index:
                     (key, value),
                 )
 
+    # ---- per-account settings (§6.1) ------------------------------------------------------
+
+    def get_setting(self, key: str) -> str | None:
+        """The JSON text stored under ``key`` (``auto_ocr``, ``sync_scope``), or ``None``."""
+        with self._lock:
+            row = self._conn.execute("SELECT v FROM settings WHERE k = ?", (key,)).fetchone()
+        return None if row is None else str(row["v"])
+
+    def set_setting(self, key: str, value: str | None) -> None:
+        """Set ``key`` to the JSON text ``value``; ``None`` removes it."""
+        with self.transaction():
+            if value is None:
+                self._conn.execute("DELETE FROM settings WHERE k = ?", (key,))
+            else:
+                self._conn.execute(
+                    "INSERT INTO settings(k, v) VALUES (?, ?) "
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    (key, value),
+                )
+
     # ---- internals ------------------------------------------------------------------------
 
     def _name_and_path(self, uuid: str) -> tuple[str, str]:

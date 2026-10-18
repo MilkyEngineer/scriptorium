@@ -19,7 +19,7 @@ What M2 adds beyond the milestone table in `02-milestones.md`, all decided with 
 | Id | Name | Modules | Effort | Depends on | Security-critical |
 | --- | --- | --- | --- | --- | --- |
 | **F** | OCR keys, modes, caps, cost | `ocr/__init__.py`, `ocr/modes.py`, `ocr/ledger.py`, `ocr/client.py`, `ocr/prompt.py` + `ocr/prompt.md`, `config.py` (§12 OCR variables), `users/store.py` additions, `tools/account.py` (`set_claude_api_key`, `clear_claude_api_key`), `tools/admin.py` (`admin_allow_server_key`) | xhigh | — | yes: API keys at rest and in memory, spend caps, nothing content-bearing in logs |
-| **G** | Transcription pipeline | `jobs/kinds.py` (`OcrSpec`), `ocr/debounce.py`, `ocr/batches.py`, worker OCR job runner and auto-OCR scan, `tools/ocr.py` (`transcribe`, `ocr_status`, `read_page` mode switch), `tools/account.py` (`set_auto_ocr`), account `settings` table | high | F's interfaces (fakes), I's `priority` | partly: transcripts are note content; batch results are untrusted input |
+| **G** | Transcription pipeline | `jobs/kinds.py` (`OcrSpec`), `ocr/debounce.py`, `ocr/batches.py`, worker OCR job runner and auto-OCR scan, `tools/ocr.py` (`transcribe`, `ocr_status`, `read_page` mode switch), `tools/account.py` (`set_auto_ocr`), account step V5 | high | F's interfaces (fakes), I's `priority` | partly: transcripts are note content; batch results are untrusted input |
 | **H** | Search and tags | `library/tags.py`, `library/pages.py` (`content_tags`), `library/index.py` (`tags` table, `replace_tags`, `tags_of`, `children(tags=, recursive=)`, `search(folder=, tags=)`), `tools/library.py` (`search`, `list(tags=)`), worker commit hook | high | — | partly: tags are cloud-supplied strings |
 | **I** | Sync scope, wake-up, priority, admin and destructive tools | `cloud/scope.py`, `cloud/sync.py` (scope filter, `excluded`, `anomaly_candidates`), `cloud/notifications.py` (if S7 passes), `jobs/queue.py` (`priority`, `deprioritise`), `tools/_conventions.py` (confirmation tokens), `tools/account.py` (`set_sync_scope`, `disconnect_remarkable(keep_archive=false)`), `tools/admin.py` (`admin_clear_anomaly`), review leftovers | xhigh | S7 result for the wake-up only | yes: the only cloud reader, destructive path, anomaly clearing |
 
@@ -29,7 +29,7 @@ Cloud writes: **none** in M2. `set_sync_scope` changes what the worker downloads
 
 ## 3. Interface contracts
 
-Seams between workstreams. Names and signatures are binding; bodies are the implementing workstream's business. All synchronous and blocking unless marked; errors are `scriptorium.errors.ScriptoriumError` subclasses with §11.0 codes. Row and settings additions go through `db/` migrations owned by the workstream named, as ordered SQL steps (account steps continue from V2; global steps from the current `SCRIPTORIUM_STEPS`).
+Seams between workstreams. Names and signatures are binding; bodies are the implementing workstream's business. All synchronous and blocking unless marked; errors are `scriptorium.errors.ScriptoriumError` subclasses with §11.0 codes. Row and settings additions go through `db/` migrations owned by the workstream named, as ordered SQL steps. Account step V3 (`settings` table with `Index.get_setting`/`set_setting`, `documents.excluded_at`) is already on `main`; H owns V4 (`tags`), G owns V5 (`transcripts.prompt_version`); global steps continue from the current `SCRIPTORIUM_STEPS` (F: `ocr_spend`, `users.ocr_cap_usd`; I: `jobs.priority`, `confirmations`), and F's step merges first, so I rebases onto it.
 
 ### 3.1 OCR keys, modes, caps, cost (F)
 
@@ -102,12 +102,9 @@ OCR_KINDS = ("ocr", "ocr_batch")   # "ocr_batch": one job per submitted Batches 
 def is_stable(page: PageRow, *, now: datetime, previous_poll_at: datetime | None) -> bool
     # True when stable_since ≤ previous_poll_at (unchanged across two complete polls) or now − stable_since ≥ 30 min
 
-# library/index.py — account migration V3 (G owns the step; H's `tags` table is V4 so the two never collide)
-#   settings(k TEXT PRIMARY KEY, v TEXT)      — per-account user settings; JSON values
-#   transcripts.prompt_version TEXT NULL
+# library/index.py — account migration V5 (G owns the step): transcripts.prompt_version TEXT NULL
+# `settings` (V3) is on main: Index.get_setting(key) -> str | None, Index.set_setting(key, json_text | None)
 class Index:
-    def get_setting(self, key: str) -> str | None
-    def set_setting(self, key: str, value: str | None) -> None
     def put_transcript(self, document, page_id, content_hash, text, model, mode, *, prompt_version: str | None = None,
                        input_tokens: int | None = None, output_tokens: int | None = None, cost_usd: float | None = None) -> None
     def pages_without_transcript(self, *, folders: Sequence[str], recursive: bool = True, limit: int) -> list[PageRow]   # live documents only
@@ -158,7 +155,7 @@ def in_scope(scope: SyncScope, doc_tags: frozenset[str], ancestor_tags: frozense
 # its row upserted with excluded_at set and state "excluded", and nothing else downloaded; a document that enters the scope later
 # is committed like a new one; narrowing never tombstones or removes anything already archived (§11.1). Folder tags apply to
 # descendants: the planner resolves ancestors from the metadata it already has in the listing.
-# documents.excluded_at TEXT NULL (account migration V5, I owns it)
+# documents.excluded_at TEXT NULL is on main (V3); I adds `excluded_at` to DocumentRow, the commit path and `state` in tool results
 
 # cloud/notifications.py — only if S7 passes; otherwise the file is not created and NOTIFICATIONS is rejected at start
 class NotificationListener:
@@ -193,7 +190,7 @@ Everything in `04-m1-work-breakdown.md` §4 applies. In addition:
 - **Transcripts are note content.** They never appear in logs, job payloads, error strings, audit identifiers or test fixture names; tests use the S3 fixture pages and synthetic text.
 - **Keys** exist as `SecretStr` and are passed to `OcrClient` only; no `repr`, no exception message, no settings dump includes them (`config.py` already redacts; keep it so). A tool response never echoes a key or its prefix.
 - **Cloud strings** (tag names, batch custom ids built from UUIDs) pass the same discipline as file names: UUID allowlist for identifiers, bounded and normalised for display strings, never joined into paths.
-- **Migrations** are append-only steps; F/G/H/I own the step numbers named in §3 and nobody renumbers.
+- **Migrations** are append-only steps; F/G/H/I own the step numbers named in §3 and nobody renumbers. When a step lands on `main` before yours, rebase and renumber yours above it.
 - **New dependency:** `anthropic` (MIT) only, pinned with an upper bound, added by F with `scriptorium licence-check` output in the hand-back; the coordinator records it in Architecture §4.4. No other new runtime dependency without the same.
 - Security-critical workstreams (F, I) run the `security-guidance` plugin's review before hand-back and report what it found.
 
