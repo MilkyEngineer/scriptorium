@@ -4,6 +4,8 @@ The device token lives in the user's ``secrets.enc`` under :func:`device_token_n
 worker records its view of the account in the account index's ``sync_state`` under the
 ``STATE_*`` keys below (beside the sync's own keys in :mod:`scriptorium.cloud.sync`);
 ``account_status`` reads them and ``connect_remarkable`` clears the relink state.
+:func:`is_anomaly_reason` is the shape the sync's ``anomaly_reason`` must have, checked by the
+worker before it stores one and by the tools before they return one.
 
 :func:`poll_lock` is the one lock the worker and the server share about an account: the
 worker holds it for a whole poll (and for its start-up sweep), and
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import stat
 import sys
 from collections.abc import Iterator
@@ -40,6 +43,7 @@ if sys.platform != "win32":
     import fcntl
 
 __all__ = [
+    "ANOMALY_REASON_RE",
     "DEVICE_DESCRIPTION",
     "RELINK_AFTER",
     "STATE_LAST_POLL_AT",
@@ -49,6 +53,7 @@ __all__ = [
     "STATE_TOKEN_REJECTIONS",
     "PollLock",
     "device_token_name",
+    "is_anomaly_reason",
     "move_aside",
     "poll_lock",
     "removal_destination",
@@ -73,6 +78,18 @@ STATE_LAST_SYNC_AT: Final = "last_sync_at"
 STATE_LAST_POLL_AT: Final = "last_poll_at"
 STATE_LAST_POLL_OUTCOME: Final = "last_poll_outcome"
 """The last poll's ``SyncReport.outcome``, or ``watchdog``/``error`` when it did not end."""
+
+ANOMALY_REASON_RE: Final = re.compile(r"[a-z0-9_:;. =-]{1,120}")
+"""What ``sync_state.anomaly_reason`` may hold, matched whole: the reason codes and counts the
+worker writes (``root: protocol``, ``6 of 9 documents missing from the root``, ``root lists 0
+documents; the archive holds 9``), never text the cloud supplied such as a document name.
+A backstop, not a classifier: an all-lowercase name would fit, so writers still pass only
+codes and counts; it keeps case, markup, control and non-ASCII characters out."""
+
+
+def is_anomaly_reason(value: object) -> bool:
+    """Whether ``value`` has the shape of an anomaly reason (:data:`ANOMALY_REASON_RE`)."""
+    return isinstance(value, str) and ANOMALY_REASON_RE.fullmatch(value) is not None
 
 
 def device_token_name(acct: str) -> str:

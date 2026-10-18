@@ -1167,7 +1167,13 @@ class SyncOnce:
     ) -> None:
         """Enter safe mode. ``candidates`` (a tripped breaker's) replace any stored ones;
         any other anomaly clears them, so an approval is only ever built from the latest
-        trip."""
+        trip. ``reason`` is returned to users and administrators, so it must be a code or a
+        count (``accounts.is_anomaly_reason``), never cloud-supplied text: anything else is
+        a programming error (:class:`ValueError`, raised before anything is stored)."""
+        from scriptorium.accounts import is_anomaly_reason
+
+        if not is_anomaly_reason(reason):
+            raise ValueError("an anomaly reason must be a code or a count")
         stored = json.dumps(sorted(candidates), separators=(",", ":")) if candidates else None
         with self._index.transaction():
             self._index.set_state(STATE_ANOMALY, kind)

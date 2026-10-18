@@ -11,7 +11,10 @@ next poll whose planner runs spends it, used or not, and what it lets through is
 
 Like the other admin tools it is ``admin_only``, names the user by uid, and audits only
 identifiers: the uid, the account, a count and the length of the administrator's reason.
-The candidates and the reason text are never returned, stored or logged.
+The candidates and the reason text are never returned, stored or logged. The cleared
+anomaly's own reason (the worker's code or count) is returned only if it still has that
+shape (``accounts.is_anomaly_reason``), so a stored value that is anything else never reaches
+an administrator.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from typing import Final
 from mcp_types import CallToolResult
 from pydantic import Field, field_validator
 
+from scriptorium.accounts import is_anomaly_reason
 from scriptorium.cloud.protocol import is_uuid
 from scriptorium.cloud.sync import (
     ANOMALY_MASS_DELETE,
@@ -204,7 +208,7 @@ def _clear_anomaly(svc: Services, uid: str, allow_mass_delete: bool) -> dict[str
     return {
         "user": uid,
         "account": row.acct,
-        "cleared": {"anomaly": anomaly, "reason": reason},
+        "cleared": {"anomaly": anomaly, "reason": reason if is_anomaly_reason(reason) else None},
         "allow_mass_delete": allow_mass_delete,
         "approved_documents": approved,
         "approval_expires_at": to_db_time(expires_at) if allow_mass_delete else None,

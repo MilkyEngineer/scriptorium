@@ -1,4 +1,5 @@
-"""``accounts.poll_lock``: the lock a poll and ``disconnect_remarkable`` share."""
+"""``accounts``: the poll lock a poll and ``disconnect_remarkable`` share, moving an account
+aside, and the shape of an anomaly reason."""
 
 from __future__ import annotations
 
@@ -14,6 +15,8 @@ import pytest
 
 from scriptorium import accounts
 from scriptorium.accounts import move_aside, poll_lock, removal_destination
+from scriptorium.cloud.errors import CloudError
+from scriptorium.cloud.protocol import MAX_GENERATION
 from scriptorium.errors import PathEscapeError, RefusedError
 from scriptorium.users.store import AccountPaths, account_paths, removed_account_path
 
@@ -200,3 +203,49 @@ def test_move_aside_refuses_a_removed_directory_swapped_for_a_symlink(
     with pytest.raises(NotADirectoryError):
         move_aside(paths, destination)
     assert paths.root.is_dir() and not any(real.iterdir())
+
+
+# ---- the shape of an anomaly reason -------------------------------------------------------------
+
+
+def _cloud_error_classes() -> list[type[CloudError]]:
+    found: list[type[CloudError]] = []
+    pending: list[type[CloudError]] = [CloudError]
+    while pending:
+        cls = pending.pop()
+        found.append(cls)
+        pending.extend(cls.__subclasses__())
+    return found
+
+
+def test_every_reason_the_worker_writes_has_the_anomaly_reason_shape() -> None:
+    # The strings cloud/sync.py builds today, at their longest.
+    written = [f"root: {cls.reason}" for cls in _cloud_error_classes()]
+    written += [
+        f"root generation 0 is lower than {MAX_GENERATION}",
+        f"root generation {MAX_GENERATION - 1} is lower than {MAX_GENERATION}",
+        "root lists 0 documents; the archive holds 50000",
+        "50000 of 50000 documents missing from the root",
+    ]
+    for reason in written:
+        assert accounts.is_anomaly_reason(reason), reason
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "",
+        "x" * 121,
+        "Synthetic Notebook",
+        "root: protocol\n",
+        "root: protocol\x00",
+        "root:\tprotocol",
+        "root: <b>",
+        "synthétique",
+        "root: ‮protocol",
+        None,
+        6,
+    ],
+)
+def test_anything_else_is_not_an_anomaly_reason(reason: object) -> None:
+    assert not accounts.is_anomaly_reason(reason)

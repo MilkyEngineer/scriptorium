@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from scriptorium.auth.oidc import OIDCValidator
+from scriptorium.cloud.sync import SyncOnce, SyncSettings, _Run
 from scriptorium.users.store import global_db_path
 from scriptorium.worker import AccountLoop
 from tests.cloud.fake_cloud import PAGES, FakeCloud
@@ -268,3 +269,48 @@ async def test_clearing_without_approval_withdraws_an_unspent_one(
     await _poll(linked, loop)
     assert _state(linked, "anomaly") == "mass_delete"  # the six are not let through
     assert _tombstoned(linked) == frozenset()
+
+
+async def test_a_stored_reason_that_is_not_a_code_is_not_returned(
+    app: Served, linked: Linked, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Every writer stores codes or counts; a value of any other shape (an older row, or a
+    # future writer that slipped cloud text in) never reaches the administrator.
+    caplog.set_level(logging.DEBUG)
+    cloud_text = "Synthetic Notebook <b>"
+    index = linked.index()
+    with index.transaction():
+        index.set_state("anomaly", "protocol")
+        index.set_state("anomaly_reason", cloud_text)
+
+    cleared = await _admin(app, linked)
+
+    assert cleared["cleared"] == {"anomaly": "protocol", "reason": None}
+    assert _state(linked, "anomaly") is None and _state(linked, "anomaly_reason") is None
+    for text in (json.dumps(cleared), _server_logs(caplog), json.dumps(app.audit_rows())):
+        assert "Synthetic Notebook" not in text
+    # One of the worker's own reasons is returned as it is.
+    with index.transaction():
+        index.set_state("anomaly", "protocol")
+        index.set_state("anomaly_reason", "root: hash_mismatch")
+    cleared = await _admin(app, linked)
+    assert cleared["cleared"] == {"anomaly": "protocol", "reason": "root: hash_mismatch"}
+
+
+async def test_the_worker_refuses_to_store_a_reason_that_is_not_a_code(linked: Linked) -> None:
+    index = linked.index()
+    settings = SyncSettings(sync_workers=1)
+    # Only the index is used on this path; the client and archive are never touched.
+    sync = SyncOnce(None, None, index, settings, linked.clock)  # type: ignore[arg-type]
+    run = _Run(started_at=linked.clock(), started_mono=0.0)
+    for bad in ("Synthetic Notebook", "root: protocol\nforged", "x" * 121, ""):
+        with pytest.raises(ValueError) as refused:
+            sync._set_anomaly(run, "protocol", bad)
+        assert not bad or bad not in str(refused.value)
+    assert _state(linked, "anomaly") is None and _state(linked, "anomaly_reason") is None
+    assert run.anomaly is None
+
+    sync._set_anomaly(run, "protocol", "root: hash_mismatch")
+
+    assert _state(linked, "anomaly") == "protocol"
+    assert _state(linked, "anomaly_reason") == "root: hash_mismatch"
