@@ -487,8 +487,14 @@ def test_malformed_api_key_refused_without_echo(env: pytest.MonkeyPatch, bad: st
 
 
 def test_server_key_users_csv(env: pytest.MonkeyPatch) -> None:
-    env.setenv("SCRIPTORIUM_SERVER_KEY_USERS", " sub-1, friend@example.org,0123456789abcdef ,")
-    assert load_settings().server_key_users == ("sub-1", "friend@example.org", "0123456789abcdef")
+    env.setenv(
+        "SCRIPTORIUM_SERVER_KEY_USERS", " fedcba9876543210, friend@example.org,0123456789abcdef ,"
+    )
+    assert load_settings().server_key_users == (
+        "fedcba9876543210",
+        "friend@example.org",
+        "0123456789abcdef",
+    )
     env.setenv("SCRIPTORIUM_SERVER_KEY_USERS", "*")
     assert load_settings().server_key_users == ("*",)
 

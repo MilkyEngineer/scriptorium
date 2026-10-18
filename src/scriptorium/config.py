@@ -280,8 +280,9 @@ class Settings(BaseSettings):
         default=(),
         repr=False,
         description=(
-            "Users allowed the server key: 16-character uids, `sub` values or verified emails; "
-            "`*` admits everyone and is logged as a warning at start."
+            "Users allowed the server key: 16-character uids (as account_status shows them) or "
+            "verified emails; `*` admits everyone and is logged as a warning at start. An OIDC "
+            "`sub` is not an entry: it never matches."
         ),
     )
     ocr_model: str = Field(default=DEFAULT_OCR_MODEL, description="Model that transcribes.")
@@ -401,8 +402,8 @@ class Settings(BaseSettings):
                 or any(c.isspace() or c in "\"'\\" for c in entry)
             ):
                 raise ValueError(
-                    "each entry must be `*`, a uid, a `sub` or an email: printable, without "
-                    f"spaces or quotes, at most {_SERVER_KEY_USER_MAX} characters"
+                    "each entry must be `*`, a 16-character uid or a verified email: printable, "
+                    f"without spaces or quotes, at most {_SERVER_KEY_USER_MAX} characters"
                 )
         return value
 
