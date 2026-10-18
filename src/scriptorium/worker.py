@@ -20,9 +20,14 @@ One process, one asyncio loop, four kinds of task:
   ``render`` jobs are queued for pages without a PNG.
 - **Job runner.** Leases ``render`` and ``page_image`` jobs, at most ``RENDER_WORKERS`` at a
   time, renders in the process pool (heartbeating the lease while it waits), writes the PNG
-  and completes or fails the job. A job whose lease was lost is abandoned, not reported.
+  and completes or fails the job. A job whose lease was lost is abandoned, not reported. A
+  ``ProcessPoolExecutor`` is broken for good once a child exits abruptly, so a job that
+  finds the pool broken (at submit or while waiting) shuts it down, drops it so the next
+  job gets a fresh one (``render_pool_rebuilt``), and fails normally to be retried.
 - **Housekeeping.** ``requeue_expired`` at start and every minute; the liveness file
-  ``<data>/worker.heartbeat`` (read by ``scriptorium healthcheck --worker``).
+  ``<data>/worker.heartbeat`` (read by ``scriptorium healthcheck --worker``, which looks
+  only at its mtime; its body is a small JSON object with the time and the number of render
+  pool rebuilds since start, which ``account_status`` reports).
 
 The worker never migrates: it opens ``scriptorium.sqlite`` and each ``index.sqlite`` with
 ``migrate=False`` and waits while the server has not migrated them yet.
@@ -39,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import random
@@ -47,7 +53,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from concurrent.futures import BrokenExecutor, Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +99,7 @@ __all__ = [
     "backoff_delay",
     "heartbeat_age",
     "jittered",
+    "read_heartbeat",
     "refresh_document",
 ]
 
@@ -104,6 +111,7 @@ BACKOFF_CAP_SECONDS: Final = 3600
 BUDGET_REASONS: Final = frozenset({"byte_budget", "time_budget"})
 """A ``partial`` poll with one of these reasons stopped early with more to do."""
 HEARTBEAT_STALE_SECONDS: Final = 180
+HEARTBEAT_MAX_BYTES: Final = 4096
 DOCUMENT_TYPE: Final = "DocumentType"
 
 
@@ -153,6 +161,26 @@ def heartbeat_age(path: Path, now: float | None = None) -> float | None:
     except OSError:
         return None
     return max(0.0, (time.time() if now is None else now) - written)
+
+
+def read_heartbeat(path: Path) -> dict[str, Any]:
+    """The heartbeat file's body (``{"at": ..., "render_pool_rebuilds": n}``), or ``{}``.
+
+    Anything unreadable, oversized or not a JSON object reads as ``{}``: the body is
+    informational, the file's mtime is the liveness signal.
+    """
+    try:
+        with path.open("rb") as fh:
+            raw = fh.read(HEARTBEAT_MAX_BYTES + 1)
+    except OSError:
+        return {}
+    if len(raw) > HEARTBEAT_MAX_BYTES:
+        return {}
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 # ---- pages ---------------------------------------------------------------------------------
@@ -261,6 +289,9 @@ class Worker:
         if self.client_factory is None:
             self.client_factory = _default_client_factory(self.settings)
         self._owns_executor = self.render_executor is None
+        self._executor_lock = threading.Lock()
+        self.render_pool_rebuilds = 0
+        """Render pools replaced since start because the last one broke (heartbeat body)."""
         self._contexts: dict[tuple[str, str], AccountContext] = {}
         self._contexts_lock = threading.Lock()
         self._loops: dict[str, tuple[AccountLoop, asyncio.Task[None], asyncio.Event]] = {}
@@ -312,11 +343,30 @@ class Worker:
         return self._slots
 
     def executor(self) -> Executor:
-        if self.render_executor is None:
-            self.render_executor = render.render_pool(
-                self.settings.render_workers, log_level=self.settings.log_level
-            )
-        return self.render_executor
+        """The render pool, built on first use and again after :meth:`drop_executor`."""
+        with self._executor_lock:
+            if self.render_executor is None:
+                self.render_executor = render.render_pool(
+                    self.settings.render_workers, log_level=self.settings.log_level
+                )
+                self._owns_executor = True
+            return self.render_executor
+
+    def drop_executor(self, broken: Executor) -> bool:
+        """Shut down ``broken`` and forget it, so :meth:`executor` builds a fresh pool.
+
+        Several jobs can find the same pool broken; only the first replaces it (returns
+        True), the others see that ``broken`` is no longer the current pool.
+        """
+        with self._executor_lock:
+            if self.render_executor is not broken:
+                return False
+            self.render_executor = None
+            self.render_pool_rebuilds += 1
+            count = self.render_pool_rebuilds
+        broken.shutdown(wait=False, cancel_futures=True)
+        log_event(logger, "render_pool_rebuilt", level=logging.WARNING, count=count)
+        return True
 
     async def run(self, stop: asyncio.Event) -> None:
         """Run every task until ``stop`` is set, then wind down."""
@@ -352,7 +402,8 @@ class Worker:
         """Atomically replace ``<data>/worker.heartbeat`` (its mtime is the signal)."""
         path = worker_heartbeat_path(self.settings.data_dir)
         tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
-        tmp.write_text(f"{to_db_time(self.clock())}\n", encoding="ascii")
+        body = {"at": to_db_time(self.clock()), "render_pool_rebuilds": self.render_pool_rebuilds}
+        tmp.write_text(json.dumps(body, separators=(",", ":")) + "\n", encoding="ascii")
         os.replace(tmp, path)
 
     async def _housekeeping(self, stop: asyncio.Event) -> None:
@@ -570,22 +621,39 @@ class Worker:
             longest = max(pg.png_size(head))
             scale = min(render.MAX_SCALE, max(render.MIN_SCALE, max_side / longest))
         rm, single_pdf = await asyncio.to_thread(self._inputs, ctx.paths, source)
-        pool = self.executor()
         if rm is not None:
-            fut = render.render_in_pool(
-                pool, render.render_rm_page, rm, scale=scale, pdf_page=single_pdf
+            result = await self._in_pool(
+                job, render.render_rm_page, rm, scale=scale, pdf_page=single_pdf
             )
         elif single_pdf is not None:
-            fut = render.render_in_pool(pool, render.render_pdf_page, single_pdf, 0, scale=scale)
+            result = await self._in_pool(job, render.render_pdf_page, single_pdf, 0, scale=scale)
         else:
             png = await asyncio.to_thread(pg.blank_page_png, scale)
             width, height = pg.png_size(png)
-            fut = _done(render.RenderResult(png, width, height, (0.0, 0.0, 0.0, 0.0)))
-        result = await self._await_with_heartbeat(fut, job)
+            result = render.RenderResult(png, width, height, (0.0, 0.0, 0.0, 0.0))
         if max_side is None:
             return result.png
-        sized = render.render_in_pool(pool, render.page_image_bytes, result, max_side_px=max_side)
-        return await self._await_with_heartbeat(sized, job)
+        return await self._in_pool(job, render.page_image_bytes, result, max_side_px=max_side)
+
+    async def _in_pool[**P, R](
+        self, job: JobRow, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs
+    ) -> R:
+        """Run ``fn`` in the render pool, heartbeating the job; heal a broken pool.
+
+        A pool that is broken (a child exited abruptly) or refuses work is dropped so the
+        next job gets a fresh one; the error propagates and this job fails and is retried.
+        """
+        pool = self.executor()
+        try:
+            fut = render.render_in_pool(pool, fn, *args, **kwargs)
+        except RuntimeError:  # BrokenProcessPool, or a pool that was shut down
+            self.drop_executor(pool)
+            raise
+        try:
+            return await self._await_with_heartbeat(fut, job)
+        except BrokenExecutor:  # BrokenProcessPool: a child died while this job waited
+            self.drop_executor(pool)
+            raise
 
     @staticmethod
     def _inputs(paths: AccountPaths, source: pg.PageSource) -> tuple[bytes | None, bytes | None]:
@@ -613,12 +681,6 @@ class Worker:
             await asyncio.to_thread(
                 self.queue.heartbeat, job.id, self.owner, self.timing.lease_ttl_s
             )
-
-
-def _done[T](value: T) -> Future[T]:
-    fut: Future[T] = Future()
-    fut.set_result(value)
-    return fut
 
 
 def _read_head(path: Path) -> bytes:

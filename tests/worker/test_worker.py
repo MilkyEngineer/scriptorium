@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import os
 import threading
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +34,7 @@ from scriptorium.worker import (
     backoff_delay,
     heartbeat_age,
     jittered,
+    read_heartbeat,
 )
 from tests.cloud.fake_cloud import NOTEBOOK, PAGES, PDF, TOKEN_KEY, fixture_documents, renamed
 from tests.cloud.scenarios import PAGE_101
@@ -319,6 +324,48 @@ async def test_a_page_that_will_not_render_fails_its_job(tmp_path: Path) -> None
         linked.close()
 
 
+async def test_a_broken_render_pool_is_rebuilt_and_the_next_job_renders(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A child that exits abruptly breaks a ProcessPoolExecutor for good; the worker heals."""
+    caplog.set_level(logging.INFO, logger="scriptorium")
+    linked = link(tmp_path, settings={"render_workers": 1})
+    try:
+        injected = linked.worker.render_executor
+        assert injected is not None
+        injected.shutdown()
+        linked.worker.render_executor = None  # the worker builds its own spawn pool
+        pool = linked.worker.executor()
+        assert isinstance(pool, ProcessPoolExecutor)
+        killed = pool.submit(os._exit, 1)  # not via render_in_pool: a test hook only
+        with pytest.raises(BrokenProcessPool):
+            killed.result(timeout=60)
+        await linked.loop().poll_once(linked.context())
+
+        job = await asyncio.to_thread(linked.queue.lease, linked.worker.owner, kinds=["render"])
+        assert job is not None
+        await linked.worker.run_job(job)
+        failed = linked.queue.get(job.id, linked.uid)
+        assert failed is not None and (failed.state, failed.error) == ("failed", "internal")
+        assert linked.worker.render_pool_rebuilds == 1
+        assert linked.worker.render_executor is None  # dropped; the next job builds a new one
+        assert any(r.getMessage() == "render_pool_rebuilt" for r in caplog.records)
+
+        nxt = await asyncio.to_thread(linked.queue.lease, linked.worker.owner, kinds=["render"])
+        assert nxt is not None
+        await linked.worker.run_job(nxt)
+        done = linked.queue.get(nxt.id, linked.uid)
+        assert done is not None and done.state == "done", done
+        assert linked.worker.executor() is not pool
+        assert linked.worker.render_pool_rebuilds == 1
+
+        linked.worker.write_heartbeat()
+        beat = read_heartbeat(worker_heartbeat_path(linked.settings.data_dir))
+        assert beat["render_pool_rebuilds"] == 1
+    finally:
+        linked.close()
+
+
 async def test_page_image_jobs_render_larger_than_the_archive(linked: Linked) -> None:
     await linked.sync()
     page = linked.index().page(NOTEBOOK, 0)
@@ -425,3 +472,13 @@ def test_heartbeat_age(tmp_path: Path) -> None:
     age = heartbeat_age(path)
     assert age is not None and age < 5
     assert heartbeat_age(path, now=path.stat().st_mtime + 100) == pytest.approx(100)
+
+
+def test_read_heartbeat_tolerates_any_body(tmp_path: Path) -> None:
+    path = tmp_path / "worker.heartbeat"
+    assert read_heartbeat(path) == {}
+    for body in ("2026-10-01T12:00:00.000000Z\n", "[1]", "x" * 5000):
+        path.write_text(body)
+        assert read_heartbeat(path) == {}
+    path.write_text('{"at":"t","render_pool_rebuilds":2}\n')
+    assert read_heartbeat(path) == {"at": "t", "render_pool_rebuilds": 2}
