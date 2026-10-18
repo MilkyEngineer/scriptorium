@@ -36,6 +36,7 @@ M2_TOOLS = {
     "transcribe",
     "ocr_status",
     "set_auto_ocr",
+    "set_sync_scope",
 }
 ADMIN_TOOLS = {"admin_allow_server_key"}
 NOTEBOOK_NAME = "Scriptorium Test Notebook"

@@ -1,5 +1,5 @@
-"""Account tools (§11.1): connect_remarkable, disconnect_remarkable, account_status, and the
-user's own Claude API key (set_claude_api_key, clear_claude_api_key).
+"""Account tools (§11.1): connect_remarkable, disconnect_remarkable, account_status,
+set_sync_scope, and the user's own Claude API key (set_claude_api_key, clear_claude_api_key).
 
 ``connect_remarkable`` is the one cloud write in M1: it exchanges a one-time code for a device
 token (a new device at reMarkable on every call). The token is sealed with the master keys and
@@ -9,12 +9,16 @@ next supervision pass.
 A Claude API key is checked with the cheapest API call before it is sealed (SecretBox name
 ``claude_api_key``) and is never returned, logged or audited afterwards, not even a prefix:
 results say only whether a key is stored (§8.1).
+
+``set_sync_scope`` stores the account's scope (``cloud/scope.py``) in its index; the worker
+applies it on its next poll. Tag names are the user's display strings: they are returned to
+the user and never logged or audited (the audit records how many there are).
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated, Final
+from typing import Annotated, Final, Literal
 
 from mcp_types import CallToolResult
 from pydantic import ConfigDict, Field, SecretStr, field_validator
@@ -29,6 +33,16 @@ from scriptorium.accounts import (
     device_token_name,
 )
 from scriptorium.auth.oidc import User
+from scriptorium.cloud.scope import (
+    MAX_SCOPE_TAGS,
+    MAX_TAG_LEN,
+    SETTING_SYNC_SCOPE,
+    ScopeError,
+    SyncScope,
+    dump_scope,
+    load_scope,
+    make_scope,
+)
 from scriptorium.cloud.sync import (
     STATE_ANOMALY,
     STATE_ANOMALY_REASON,
@@ -216,6 +230,89 @@ async def disconnect_remarkable(ctx: ToolContext, args: DisconnectArgs) -> CallT
     accounts = payload["disconnected"]
     if isinstance(accounts, list) and len(accounts) == 1:
         ctx.audit["acct"] = accounts[0]
+    return json_result(payload, cap=RESULT_CAP_BYTES)
+
+
+# ---- set_sync_scope ----------------------------------------------------------------------------
+
+
+class ScopeArgs(ToolArgs):
+    mode: Literal["all", "allow", "deny"] = Field(
+        description="all: mirror every document (the default). allow: only documents that "
+        "carry one of tags, or sit in a folder that does. deny: every document except those.",
+    )
+    tags: list[Annotated[str, Field(min_length=1, max_length=4 * MAX_TAG_LEN)]] = Field(
+        default_factory=list,
+        max_length=MAX_SCOPE_TAGS,
+        description="reMarkable tag names, matched exactly after trimming; empty for mode all, "
+        f"1 to {MAX_SCOPE_TAGS} for allow and deny.",
+    )
+
+
+def _scope_view(scope: SyncScope) -> dict[str, object]:
+    return {"mode": scope.mode, "tags": sorted(scope.tags)}
+
+
+def _set_scope(svc: Services, user: User, scope: SyncScope) -> dict[str, object]:
+    uid = svc.uid(user)
+    row = next((r for r in svc.store.accounts(uid) if r.active), None)
+    if row is None:
+        raise not_linked()
+    index = svc.index(uid, row.acct)
+    try:
+        before: SyncScope | None = load_scope(index)
+    except ScopeError:
+        before = None  # a damaged setting: replaced below, which is how it gets repaired
+    # "all" is the default: no row, as on an account that never had a scope.
+    index.set_setting(SETTING_SYNC_SCOPE, None if scope.mode == "all" else dump_scope(scope))
+    unmatched = sorted(tag for tag in scope.tags if not index.documents_tagged([tag]))
+    if scope.mode == "all":
+        message = (
+            "Every document is mirrored again from the next sync on; documents excluded until "
+            "now are downloaded then."
+        )
+    else:
+        message = (
+            "From the next sync on, documents outside this scope are listed as excluded and "
+            "are not downloaded; documents that come into it are downloaded. Nothing archived "
+            "here is deleted: what was mirrored before stays readable. Tags on single pages "
+            "do not count, and a document whose tags cannot be read is left as it is until "
+            "they can."
+        )
+    if unmatched:
+        message += (
+            " Some of these tags are on no document or folder archived here (check the "
+            "spelling); they still apply to documents that carry them later."
+        )
+    return {
+        "account": row.acct,
+        "scope": _scope_view(scope),
+        "previous": None if before is None else _scope_view(before),
+        "changed": before != scope,
+        "unmatched_tags": unmatched,
+        "message": message,
+    }
+
+
+async def set_sync_scope(ctx: ToolContext, args: ScopeArgs) -> CallToolResult:
+    """Choose which documents of your linked reMarkable account this server mirrors: all of
+    them (mode "all", the default), only documents carrying one of the given reMarkable tags
+    or sitting in a folder that carries one (mode "allow"), or every document except those
+    (mode "deny"). Tags are matched exactly after trimming, and tags on single pages do not
+    count. The worker applies the scope on its next sync: documents outside it are listed as
+    excluded and never downloaded. Narrowing the scope never deletes anything already
+    archived; those versions stay readable."""
+    try:
+        scope = make_scope(args.mode, args.tags)
+    except ScopeError as exc:
+        raise invalid_argument(
+            f"That scope cannot be used: {exc}.",
+            f'Mode "all" takes no tags; "allow" and "deny" take 1 to {MAX_SCOPE_TAGS} tag '
+            "names without control characters.",
+        ) from None
+    payload = await asyncio.to_thread(_set_scope, services(ctx), ctx.user, scope)
+    ctx.audit["acct"] = payload["account"]
+    ctx.audit["count"] = len(scope.tags)
     return json_result(payload, cap=RESULT_CAP_BYTES)
 
 
@@ -620,6 +717,13 @@ def register(registry: ToolRegistry) -> None:
     registry.add(ToolSpec.from_handler(account_status, args=StatusArgs, annotations=READ_ONLY))
     registry.add(
         ToolSpec.from_handler(
+            set_sync_scope,
+            args=ScopeArgs,
+            annotations=tool_annotations(read_only=False, idempotent=True),
+        )
+    )
+    registry.add(
+        ToolSpec.from_handler(
             set_claude_api_key,
             args=SetKeyArgs,
             annotations=tool_annotations(read_only=False, idempotent=True, open_world=True),
@@ -649,4 +753,5 @@ __all__ = [
     "register",
     "set_auto_ocr",
     "set_claude_api_key",
+    "set_sync_scope",
 ]
