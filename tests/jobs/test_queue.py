@@ -636,3 +636,34 @@ def test_active_and_recent_errors(queue: JobQueue, clock: Clock) -> None:
     assert done is not None
     queue.complete(done.id, "w", {})
     assert [j.dedupe_key for j in queue.active(UID, acct=None, kind="ocr_batch")] == ["ocr_batch:2"]
+
+
+# ---- record_dead ------------------------------------------------------------------------------
+
+
+def test_record_dead_names_finished_work(queue: JobQueue) -> None:
+    acct = "01J0000000000000000000000A"
+    dead = queue.record_dead(
+        uid=UID, acct=acct, kind="ocr", dedupe_key="ocr:x", payload={"page": "p"}, error="refused"
+    )
+    assert (dead.state, dead.error, dead.attempts, dead.max_attempts) == ("dead", "refused", 0, 1)
+    assert queue.lease("w") is None
+    # An existing key is returned unchanged, and enqueue finds the dead job.
+    again = queue.record_dead(
+        uid=UID, acct=acct, kind="ocr", dedupe_key="ocr:x", payload={}, error="too_large"
+    )
+    assert (again.id, again.error) == (dead.id, "refused")
+    assert queue.enqueue(uid=UID, acct=acct, kind="ocr", dedupe_key="ocr:x", payload={}).id == (
+        dead.id
+    )
+    with pytest.raises(RefusedError):
+        queue.record_dead(
+            uid="fedcba9876543210",
+            acct=acct,
+            kind="ocr",
+            dedupe_key="ocr:x",
+            payload={},
+            error="refused",
+        )
+    with pytest.raises(InvalidArgumentError):
+        queue.record_dead(uid=UID, acct=acct, kind="ocr", dedupe_key="ocr:y", payload={}, error="")

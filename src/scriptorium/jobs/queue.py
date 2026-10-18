@@ -19,6 +19,8 @@ The server enqueues, the worker leases and runs. Life of a job::
   suffix). A key held by another user is refused rather than returned.
 - ``cancel`` succeeds only for the owning ``uid`` and only while the job is not running
   (``queued``, or ``failed`` waiting for its retry).
+- ``record_dead`` writes a job straight into ``dead``, for a verdict reached without one
+  (an OCR batch item the API refused), so its key names finished work like any other.
 
 Times come from an injected clock (``Callable[[], datetime]``, timezone-aware) so tests are
 deterministic. Nothing here logs payloads, results or errors: they may carry identifiers the
@@ -227,6 +229,43 @@ class JobQueue:
                 "VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?) "
                 "ON CONFLICT(dedupe_key) DO NOTHING RETURNING *",
                 (uid, acct, kind, dedupe_key, body, max_attempts, next_run, now, now),
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE dedupe_key = ?", (dedupe_key,)
+                ).fetchone()
+        if row["uid"] != uid:
+            raise RefusedError("That job key is in use.")
+        return _row(row)
+
+    def record_dead(
+        self,
+        *,
+        uid: str,
+        acct: str | None,
+        kind: str,
+        dedupe_key: str,
+        payload: Mapping[str, Any],
+        error: str,
+    ) -> JobRow:
+        """Record work that already failed for good elsewhere as a ``dead`` job.
+
+        For a verdict that arrived without a job of its own (a page the OCR API refused
+        inside a batch): the key then names finished work, as for any dead job, and a
+        deliberate re-run goes through :meth:`rerun`. Like :meth:`enqueue`, an existing key
+        is returned unchanged, and a key held by another user is refused.
+        """
+        if not uid or not kind or not dedupe_key or not error:
+            raise InvalidArgumentError("uid, kind, dedupe_key and error are required.")
+        body = _json(payload, MAX_PAYLOAD_BYTES, "payload")
+        now = to_db_time(self._now())
+        with self._write() as conn:
+            row = conn.execute(
+                "INSERT INTO jobs(uid, acct, kind, dedupe_key, payload, state, attempts, "
+                "max_attempts, error, next_run_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'dead', 0, 1, ?, ?, ?, ?) "
+                "ON CONFLICT(dedupe_key) DO NOTHING RETURNING *",
+                (uid, acct, kind, dedupe_key, body, error[:MAX_ERROR_CHARS], now, now, now),
             ).fetchone()
             if row is None:
                 row = conn.execute(
