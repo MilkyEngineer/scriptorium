@@ -1,4 +1,6 @@
-"""The M1 job kinds, ``render`` and ``page_image``: keys and payloads (§6.2, §8.3).
+"""Job kinds: keys and payloads (§6.2, §7 step 6, §8.3).
+
+M1: ``render`` and ``page_image``. M2: ``ocr`` and ``ocr_batch`` (see "OCR jobs" below).
 
 The server enqueues and the worker runs, so both build keys and read payloads here. A key
 names the version of the work (§6.2): ``render:<acct>:<page>:<hash>`` renders the archive PNG
@@ -20,26 +22,48 @@ key and every ``:after:`` key built from it, and ``JobQueue.rerun`` creates at m
 :data:`RERUN_CAP` ``:after:`` jobs per family, so a page version whose content keeps killing
 render children costs a bounded number of crashes across tool calls and worker restarts.
 A family at its cap is treated like a verdict.
+
+**OCR jobs.** ``ocr:<acct>:<document>:<page>:<hash>`` transcribes one version of one
+document's page (transcripts are per document, §6.1, so the document is in the key);
+``transcribe(force=true)`` re-runs it under ``:after:<id>`` within the same
+:data:`RERUN_CAP`. ``ocr_batch:<acct>:<batch id>`` is one submitted Message Batches request:
+its payload is the batch id, the mode whose key submitted it, and the items as
+``{custom_id: page}``. Payloads carry UUIDs, hashes, generations and the batch id only; a
+transcript never goes into a payload or a result.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from scriptorium.errors import InvalidArgumentError
 from scriptorium.library.layout import is_sha256, is_uuid
 
 __all__ = [
+    "BATCH_ID_RE",
+    "CUSTOM_ID_RE",
+    "MAX_BATCH_ITEMS",
+    "OCR",
+    "OCR_BATCH",
+    "OCR_KINDS",
     "PAGE_IMAGE",
     "RENDER",
     "RENDER_KINDS",
     "RENDER_VERDICTS",
     "RERUN_CAP",
+    "BatchMode",
+    "OcrBatchSpec",
+    "OcrSpec",
     "RenderSpec",
     "is_render_verdict",
+    "ocr_batch_key",
+    "ocr_key",
     "page_image_key",
+    "parse_ocr_batch_payload",
+    "parse_ocr_payload",
     "parse_render_payload",
     "render_key",
     "rerun_family",
@@ -57,6 +81,19 @@ AFTER: Final = ":after:"
 MAX_SIDE_PX: Final = 8192
 """Largest ``page_image`` longest side a job may ask for."""
 _MAX_GENERATION: Final = 2**62
+
+OCR: Final = "ocr"
+OCR_BATCH: Final = "ocr_batch"
+OCR_KINDS: Final = (OCR, OCR_BATCH)
+MAX_BATCH_ITEMS: Final = 100
+"""Most pages in one ``ocr_batch``: bounds the request (images) and the payload (≤ 64 KB)."""
+CUSTOM_ID_RE: Final = re.compile(r"p[0-9]{1,4}")
+"""A batch item's ``custom_id``: ``p<n>``, an index into the job's own item list. It is
+built by Scriptorium, never from names, and a result is matched against the item list."""
+BATCH_ID_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
+"""A Message Batches id as the API returns it (``msgbatch_…``), checked before it is stored."""
+BatchMode = Literal["user", "server"]
+_BATCH_MODES: Final = frozenset({"user", "server"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,4 +178,131 @@ def parse_render_payload(kind: str, payload: Mapping[str, Any]) -> RenderSpec:
         hash=payload["hash"],
         generation=payload["generation"],
         max_side=max_side,
+    )
+
+
+# ---- OCR ------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class OcrSpec:
+    """One version of one document's page to transcribe (§7 step 6, §11.3).
+
+    ``generation`` names the version whose files hold the page (as for renders); ``force``
+    transcribes even when a transcript of this version exists (``transcribe(force=true)``).
+    """
+
+    document: str
+    page: str
+    hash: str
+    generation: int
+    force: bool = False
+
+    def __post_init__(self) -> None:
+        if not (is_uuid(self.document) and is_uuid(self.page) and is_sha256(self.hash)):
+            raise InvalidArgumentError("ocr job identifiers are malformed")
+        if type(self.generation) is not int or not 0 <= self.generation < _MAX_GENERATION:
+            raise InvalidArgumentError("ocr job generation is malformed")
+        if type(self.force) is not bool:
+            raise InvalidArgumentError("ocr job flag is malformed")
+
+    @property
+    def kind(self) -> str:
+        return OCR
+
+    def key(self, acct: str) -> str:
+        return ocr_key(acct, self.document, self.page, self.hash)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "document": self.document,
+            "page": self.page,
+            "hash": self.hash,
+            "generation": self.generation,
+            "force": self.force,
+        }
+
+    def render_spec(self) -> RenderSpec:
+        """The archive render of the same page version (the OCR input)."""
+        return RenderSpec(self.document, self.page, self.hash, self.generation)
+
+
+def ocr_key(acct: str, document: str, page: str, content_hash: str) -> str:
+    return f"{OCR}:{acct}:{document}:{page}:{content_hash}"
+
+
+_OCR_FIELDS: Final = frozenset({"document", "page", "hash", "generation", "force"})
+
+
+def parse_ocr_payload(payload: Mapping[str, Any]) -> OcrSpec:
+    """The payload of an ``ocr`` job (or one batch item); ``invalid_argument`` otherwise."""
+    if not isinstance(payload, Mapping):
+        raise InvalidArgumentError("ocr job payload is malformed")
+    keys = set(payload)
+    if not keys <= _OCR_FIELDS or not keys >= _OCR_FIELDS - {"force"}:
+        raise InvalidArgumentError("ocr job payload is malformed")
+    return OcrSpec(  # every field is checked in __post_init__
+        document=payload["document"],
+        page=payload["page"],
+        hash=payload["hash"],
+        generation=payload["generation"],
+        force=payload.get("force", False),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class OcrBatchSpec:
+    """One submitted Message Batches request and the pages it carries.
+
+    ``mode`` is the mode whose key submitted it: results are read with that key and the
+    spend is recorded under it, even if the user's mode has changed since.
+    """
+
+    batch_id: str
+    mode: BatchMode
+    items: Mapping[str, OcrSpec]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.batch_id, str) or not BATCH_ID_RE.fullmatch(self.batch_id):
+            raise InvalidArgumentError("ocr batch id is malformed")
+        if self.mode not in _BATCH_MODES:
+            raise InvalidArgumentError("ocr batch mode is malformed")
+        if not 1 <= len(self.items) <= MAX_BATCH_ITEMS:
+            raise InvalidArgumentError("ocr batch size is malformed")
+        for custom_id, spec in self.items.items():
+            if not isinstance(custom_id, str) or not CUSTOM_ID_RE.fullmatch(custom_id):
+                raise InvalidArgumentError("ocr batch item id is malformed")
+            if not isinstance(spec, OcrSpec) or spec.force:
+                raise InvalidArgumentError("ocr batch item is malformed")
+
+    @property
+    def kind(self) -> str:
+        return OCR_BATCH
+
+    def key(self, acct: str) -> str:
+        return ocr_batch_key(acct, self.batch_id)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "mode": self.mode,
+            "items": {cid: spec.payload() for cid, spec in sorted(self.items.items())},
+        }
+
+
+def ocr_batch_key(acct: str, batch_id: str) -> str:
+    return f"{OCR_BATCH}:{acct}:{batch_id}"
+
+
+def parse_ocr_batch_payload(payload: Mapping[str, Any]) -> OcrBatchSpec:
+    """The payload of an ``ocr_batch`` job; ``invalid_argument`` otherwise."""
+    if not isinstance(payload, Mapping) or set(payload) != {"batch_id", "mode", "items"}:
+        raise InvalidArgumentError("ocr batch payload is malformed")
+    items = payload["items"]
+    if not isinstance(items, Mapping):
+        raise InvalidArgumentError("ocr batch payload is malformed")
+    return OcrBatchSpec(
+        batch_id=payload["batch_id"],
+        mode=payload["mode"],
+        items={cid: parse_ocr_payload(item) for cid, item in items.items()},
     )
