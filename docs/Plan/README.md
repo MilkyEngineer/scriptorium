@@ -42,3 +42,4 @@ S1 ────────┘
 ```
 
 S0, S2, S3, S4, S5, S6 gate M1. S1 gates `push_ink` (M3) and all of M4. Spikes are independent of each other and can run in parallel sessions, except that S4 should reuse S0's client.
+- `04-m1-work-breakdown.md` — M1 split into parallel workstreams with binding interface contracts.
