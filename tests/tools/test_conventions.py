@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from scriptorium.tools._conventions import (
     MAX_LIMIT,
+    RESULT_CAP_BYTES,
     TEXT_CAP_BYTES,
     ErrorCode,
     NoArgs,
@@ -58,6 +59,31 @@ def test_error_result_shape() -> None:
     text = result.content[0]
     assert text.type == "text"
     assert json.loads(text.text) == expected
+
+
+def test_error_result_extra_keys_never_override_the_error() -> None:
+    result = error_result(
+        ErrorCode.AMBIGUOUS,
+        "Two documents match.",
+        None,
+        extra={"candidates": ["a", "b"], "code": "ok", "message": "x"},
+    )
+    assert result.structured_content == {
+        "code": "ambiguous",
+        "message": "Two documents match.",
+        "hint": None,
+        "candidates": ["a", "b"],
+    }
+    assert ToolError(ErrorCode.PENDING, "Wait.", extra={"job": 3}).extra == {"job": 3}
+
+
+def test_library_result_cap() -> None:
+    assert text_result("a" * RESULT_CAP_BYTES, cap=RESULT_CAP_BYTES).content
+    with pytest.raises(ToolError) as info:
+        text_result("a" * (RESULT_CAP_BYTES + 1), cap=RESULT_CAP_BYTES)
+    assert "32 KB" in info.value.message
+    with pytest.raises(ToolError):
+        json_result({"x": "a" * RESULT_CAP_BYTES}, cap=RESULT_CAP_BYTES)
 
 
 def test_text_cap() -> None:

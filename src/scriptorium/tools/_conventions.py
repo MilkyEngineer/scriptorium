@@ -44,23 +44,52 @@ class ErrorCode(StrEnum):
 class ToolError(Exception):
     """Raised inside a tool to return ``isError: true`` with ``{code, message, hint}``.
 
-    ``message`` and ``hint`` go to the client, never to logs.
+    ``message`` and ``hint`` go to the client, never to logs. ``extra`` adds identifiers the
+    client can act on (``job`` for ``pending``, ``candidates`` for ``ambiguous``); it never
+    carries content.
     """
 
-    def __init__(self, code: ErrorCode, message: str, hint: str | None = None) -> None:
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        hint: str | None = None,
+        *,
+        extra: Mapping[str, object] | None = None,
+    ) -> None:
         super().__init__(code.value)
         self.code = code
         self.message = message
         self.hint = hint
+        self.extra = dict(extra or {})
 
 
-def error_payload(code: ErrorCode, message: str, hint: str | None = None) -> dict[str, str | None]:
-    return {"code": code.value, "message": message, "hint": hint}
+_RESERVED_ERROR_KEYS: Final = frozenset({"code", "message", "hint"})
 
 
-def error_result(code: ErrorCode, message: str, hint: str | None = None) -> CallToolResult:
+def error_payload(
+    code: ErrorCode,
+    message: str,
+    hint: str | None = None,
+    *,
+    extra: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"code": code.value, "message": message, "hint": hint}
+    for key, value in (extra or {}).items():
+        if key not in _RESERVED_ERROR_KEYS:
+            payload[key] = value
+    return payload
+
+
+def error_result(
+    code: ErrorCode,
+    message: str,
+    hint: str | None = None,
+    *,
+    extra: Mapping[str, object] | None = None,
+) -> CallToolResult:
     """A tool error result: JSON text for the model plus the same object as structured content."""
-    payload = error_payload(code, message, hint)
+    payload = error_payload(code, message, hint, extra=extra)
     return CallToolResult(
         content=[TextContent(text=json.dumps(payload, ensure_ascii=False))],
         structured_content=payload,
@@ -92,7 +121,10 @@ class NoArgs(ToolArgs):
 # ---- results --------------------------------------------------------------------------
 
 TEXT_CAP_BYTES: Final = 64 * 1024
-"""Text results are capped at 64 KB (UTF-8 bytes)."""
+"""The spike tools' text cap (64 KB, UTF-8 bytes); S6 measured what clients do above it."""
+RESULT_CAP_BYTES: Final = 32 * 1024
+"""Text results of the library tools are capped at 32 KB (§11.0): Claude Code persists results
+of about 64 KB to a file and shows the model a 2 KB preview (S6)."""
 
 
 def cap_text(text: str, cap: int = TEXT_CAP_BYTES) -> tuple[str, bool]:
@@ -103,21 +135,28 @@ def cap_text(text: str, cap: int = TEXT_CAP_BYTES) -> tuple[str, bool]:
     return data[:cap].decode("utf-8", errors="ignore"), True
 
 
-def text_result(text: str) -> CallToolResult:
+def text_result(text: str, *, cap: int = TEXT_CAP_BYTES) -> CallToolResult:
     """A plain text result; refuses (rather than silently truncates) over the cap."""
-    if len(text.encode("utf-8")) > TEXT_CAP_BYTES:
+    if len(text.encode("utf-8")) > cap:
         raise invalid_argument(
-            "The result exceeds the 64 KB text limit.", "Request a smaller range or page."
+            f"The result exceeds the {cap // 1024} KB text limit.",
+            "Request a smaller range or page.",
         )
     return CallToolResult(content=[TextContent(text=text)])
 
 
-def json_result(payload: Mapping[str, object]) -> CallToolResult:
+def json_text(payload: Mapping[str, object]) -> str:
+    """The compact JSON rendering every JSON result uses."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def json_result(payload: Mapping[str, object], *, cap: int = TEXT_CAP_BYTES) -> CallToolResult:
     """A JSON object result: structured content plus its text rendering."""
-    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    if len(text.encode("utf-8")) > TEXT_CAP_BYTES:
+    text = json_text(payload)
+    if len(text.encode("utf-8")) > cap:
         raise invalid_argument(
-            "The result exceeds the 64 KB text limit.", "Use a smaller limit or a cursor."
+            f"The result exceeds the {cap // 1024} KB text limit.",
+            "Use a smaller limit or a cursor.",
         )
     return CallToolResult(content=[TextContent(text=text)], structured_content=dict(payload))
 
