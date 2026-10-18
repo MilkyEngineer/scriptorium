@@ -1,0 +1,33 @@
+{
+ "description": "Synthetic. The root cannot be reached.",
+ "format": 1,
+ "interactions": [
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "POST",
+    "url": "https://cloud.example.com/token/json/2/user/new"
+   },
+   "response": {
+    "body": "scrubbed-user-token",
+    "headers": {
+     "content-type": "text/plain"
+    },
+    "status": 200
+   }
+  },
+  {
+   "error": "connect",
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v4/root"
+   }
+  }
+ ],
+ "synthetic": true
+}

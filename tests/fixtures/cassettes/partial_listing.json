@@ -1,0 +1,409 @@
+{
+ "description": "Synthetic. Both documents; the PDF disappears while the notebook's index answers 503, twice.",
+ "format": 1,
+ "interactions": [
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "POST",
+    "url": "https://cloud.example.com/token/json/2/user/new"
+   },
+   "response": {
+    "body": "scrubbed-user-token",
+    "headers": {
+     "content-type": "text/plain"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v4/root"
+   },
+   "response": {
+    "body": "{\"hash\": \"fcfeb58e899a23968465287aaf3b17cab7bd5e7253a07ab147a6e51b8d623127\", \"generation\": 2, \"schemaVersion\": 4}",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "root.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/fcfeb58e899a23968465287aaf3b17cab7bd5e7253a07ab147a6e51b8d623127"
+   },
+   "response": {
+    "body": "4\n0:.:2:191027\n2fab2ee2ea8591d351343523e253f2cebdf36d13434a5997209c7f8166c5c8f9:0:00000000-0000-4000-8000-000000000001:9:165280\n5b8d4935bb74f53080b643e8dea6496748430626397e20ec3afa22cd38136b67:0:00000000-0000-4000-8000-000000000002:5:25747\n",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/2fab2ee2ea8591d351343523e253f2cebdf36d13434a5997209c7f8166c5c8f9"
+   },
+   "response": {
+    "body": "3\nec7ba2ef4b420c8107a20259699360e659b49a1bb9d223d45183bffcb18c23b7:0:00000000-0000-4000-8000-000000000001.content:0:3984\n54300a6d9baf5cc3ef1b595e6ad944b0d1d135fddf99766723421fff84f444ca:0:00000000-0000-4000-8000-000000000001.metadata:0:365\n5ee76ac9ab63d6cc8eb3644186413020c6e5eb70e6995e2fbd18e1069923c341:0:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000101.rm:0:12013\nf9d611399fe8240be9d091ae586e05c55726f0c3a9c56b0c3fb48fe4b249a119:0:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000102.rm:0:28805\nf52517e28a32956e6e598c7a0cbe6fe64d6ec982b02f020e3dddd2b3955c61a8:0:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000103.rm:0:38420\ne4acbb618b2631d949921ba5cfbee0b8e74fbe7530791709bafaf01c5637ebb6:0:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000104.rm:0:15265\n5b0812aa4201cac59ceb3a893adeeef19923ba63d8b35300d9476f80247eca7e:0:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000105.rm:0:19951\nda965dcdd88d905a146699ab471d9323c13010f93ba322585e97385eee66d023:0:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000106.rm:0:16863\nc76c032d1fc0754535c2a22016129e01d6cd98d34240f7f2d4ad814e7080b9c2:0:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000107.rm:0:29614\n",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000002.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/5b8d4935bb74f53080b643e8dea6496748430626397e20ec3afa22cd38136b67"
+   },
+   "response": {
+    "body": "3\nc40a22be48897c13f4de07608cdd8443ec3c6514962f34b557cdc1431154b2a5:0:00000000-0000-4000-8000-000000000002.content:0:1620\n130fff177aff58eb43fc1b49ea53932fe4d0264ddf6a330952f2334b6d8d7ce9:0:00000000-0000-4000-8000-000000000002.metadata:0:360\neb068726d14c31b4ce763585c1f9aef2a30e1d4342be7cd2f8843d55f99fe6f8:0:00000000-0000-4000-8000-000000000002.pagedata:0:6\n23203f9264161714cdb8d2f474b9b641e6a735f8cea4098c40a3cab8743bd749:0:00000000-0000-4000-8000-000000000002.pdf:0:3908\n0bb5d13c17083299bf4013ea85c1465e612fc14774910ba66c3f94f7de279d20:0:00000000-0000-4000-8000-000000000002/00000000-0000-4000-8000-000000000101.rm:0:19853\n",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001.content"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/ec7ba2ef4b420c8107a20259699360e659b49a1bb9d223d45183bffcb18c23b7"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001.content",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001.metadata"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/54300a6d9baf5cc3ef1b595e6ad944b0d1d135fddf99766723421fff84f444ca"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001.metadata",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000101.rm"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/5ee76ac9ab63d6cc8eb3644186413020c6e5eb70e6995e2fbd18e1069923c341"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000101.rm",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000102.rm"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/f9d611399fe8240be9d091ae586e05c55726f0c3a9c56b0c3fb48fe4b249a119"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000102.rm",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000103.rm"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/f52517e28a32956e6e598c7a0cbe6fe64d6ec982b02f020e3dddd2b3955c61a8"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000103.rm",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000104.rm"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/e4acbb618b2631d949921ba5cfbee0b8e74fbe7530791709bafaf01c5637ebb6"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000104.rm",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000105.rm"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/5b0812aa4201cac59ceb3a893adeeef19923ba63d8b35300d9476f80247eca7e"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000105.rm",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000106.rm"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/da965dcdd88d905a146699ab471d9323c13010f93ba322585e97385eee66d023"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000106.rm",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000107.rm"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/c76c032d1fc0754535c2a22016129e01d6cd98d34240f7f2d4ad814e7080b9c2"
+   },
+   "response": {
+    "fixture": "notebook/xochitl/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000107.rm",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000002.content"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/c40a22be48897c13f4de07608cdd8443ec3c6514962f34b557cdc1431154b2a5"
+   },
+   "response": {
+    "fixture": "pdf/xochitl/00000000-0000-4000-8000-000000000002.content",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000002.metadata"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/130fff177aff58eb43fc1b49ea53932fe4d0264ddf6a330952f2334b6d8d7ce9"
+   },
+   "response": {
+    "fixture": "pdf/xochitl/00000000-0000-4000-8000-000000000002.metadata",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000002.pagedata"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/eb068726d14c31b4ce763585c1f9aef2a30e1d4342be7cd2f8843d55f99fe6f8"
+   },
+   "response": {
+    "fixture": "pdf/xochitl/00000000-0000-4000-8000-000000000002.pagedata",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000002.pdf"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/23203f9264161714cdb8d2f474b9b641e6a735f8cea4098c40a3cab8743bd749"
+   },
+   "response": {
+    "fixture": "pdf/xochitl/00000000-0000-4000-8000-000000000002.pdf",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000002/00000000-0000-4000-8000-000000000101.rm"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/0bb5d13c17083299bf4013ea85c1465e612fc14774910ba66c3f94f7de279d20"
+   },
+   "response": {
+    "fixture": "pdf/xochitl/00000000-0000-4000-8000-000000000002/00000000-0000-4000-8000-000000000101.rm",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v4/root"
+   },
+   "response": {
+    "body": "{\"hash\": \"9dea93b2b0d2be55d6a040abe1758fa5fd08cf119997c2dcd4e85de900b0efc7\", \"generation\": 3, \"schemaVersion\": 4}",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "root.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/9dea93b2b0d2be55d6a040abe1758fa5fd08cf119997c2dcd4e85de900b0efc7"
+   },
+   "response": {
+    "body": "4\n0:.:1:173120\n06dafdd9280c80075eb65a036c6c763f07959646c37e19596b1ccc5e2b979920:0:00000000-0000-4000-8000-000000000001:9:173120\n",
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/06dafdd9280c80075eb65a036c6c763f07959646c37e19596b1ccc5e2b979920"
+   },
+   "response": {
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 503
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v4/root"
+   },
+   "response": {
+    "body": "{\"hash\": \"9dea93b2b0d2be55d6a040abe1758fa5fd08cf119997c2dcd4e85de900b0efc7\", \"generation\": 3, \"schemaVersion\": 4}",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "status": 200
+   }
+  },
+  {
+   "request": {
+    "headers": {
+     "authorization": "[scrubbed]",
+     "rm-filename": "00000000-0000-4000-8000-000000000001.docSchema"
+    },
+    "method": "GET",
+    "url": "https://cloud.example.com/sync/v3/files/06dafdd9280c80075eb65a036c6c763f07959646c37e19596b1ccc5e2b979920"
+   },
+   "response": {
+    "headers": {
+     "content-type": "application/octet-stream"
+    },
+    "status": 503
+   }
+  }
+ ],
+ "synthetic": true
+}
