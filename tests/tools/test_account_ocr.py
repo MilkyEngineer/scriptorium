@@ -262,8 +262,9 @@ async def test_whitespace_around_a_pasted_key_is_dropped(
     "args",
     [
         {"key": "not a key, keymarker-0123456789"},
-        {"key": "sk-ant-short"},
-        {"key": "sk-ant-api03-" + "x" * 600},
+        {"key": "keymarker"},
+        {"key": "keymarker-" + "x" * 600},
+        {"key": ["keymarker-" + "x" * 30]},
         {"key": "sk-ant-api03-keymarker-Zq7Zq7Zq7\x00"},
         {"key": 12345678901234567890123},
         {"key": KEY, "monthly_cap_usd": -1},
