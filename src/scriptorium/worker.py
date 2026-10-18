@@ -623,7 +623,13 @@ class Worker:
             head = await asyncio.to_thread(_read_head, base_path)
             longest = max(pg.png_size(head))
             scale = min(render.MAX_SCALE, max(render.MIN_SCALE, max_side / longest))
-        rm, single_pdf = await asyncio.to_thread(self._inputs, ctx.paths, source)
+        rm, pdf_blob = await asyncio.to_thread(self._inputs, ctx.paths, source)
+        single_pdf = None
+        if pdf_blob is not None and source.pdf_page is not None:
+            # The whole PDF is cloud-supplied: only a render child ever parses it (§8.3).
+            single_pdf = await self._in_pool(
+                job, render.extract_pdf_page_from_blob, str(pdf_blob), source.pdf_page
+            )
         if rm is not None:
             result = await self._in_pool(
                 job, render.render_rm_page, rm, scale=scale, pdf_page=single_pdf
@@ -659,20 +665,19 @@ class Worker:
             raise
 
     @staticmethod
-    def _inputs(paths: AccountPaths, source: pg.PageSource) -> tuple[bytes | None, bytes | None]:
-        """The page's ``.rm`` and, for a PDF page, a single-page PDF cut from the document.
+    def _inputs(paths: AccountPaths, source: pg.PageSource) -> tuple[bytes | None, Path | None]:
+        """The page's ``.rm`` bytes and, for a PDF page, the PDF blob's resolved path.
 
-        The cut runs here (PDFium is serialised per process) so only one page crosses into
-        the render pool (§8.3).
+        The worker's own process never opens the PDF: a render child reads it from that path
+        and cuts the one page out (:func:`~scriptorium.library.render.extract_pdf_page_from_blob`).
         """
         rm = None
         if source.rm_sha is not None:
             rm = pg.read_blob(paths, source.rm_sha, limit=render.MAX_RM_BYTES)
-        single = None
+        pdf = None
         if source.pdf_sha is not None and source.pdf_page is not None:
-            pdf = pg.read_blob(paths, source.pdf_sha, limit=render.MAX_PDF_BYTES)
-            single = render.extract_pdf_page(pdf, source.pdf_page)
-        return rm, single
+            pdf = pg.blob_path(paths, source.pdf_sha)
+        return rm, pdf
 
     async def _await_with_heartbeat[T](self, fut: Future[T], job: JobRow) -> T:
         """Await a pool future, extending the job's lease while it runs."""

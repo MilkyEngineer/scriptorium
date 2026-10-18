@@ -19,12 +19,13 @@ from remarkable_mcp.strokes import append_strokes
 from rmscene import read_blocks, write_blocks
 from rmscene.scene_stream import SceneLineItemBlock
 
-from scriptorium.errors import InvalidArgumentError
+from scriptorium.errors import InvalidArgumentError, NotFoundError, PathEscapeError
 from scriptorium.library import render
 from scriptorium.library.render import (
     PX_PER_UNIT,
     RenderResult,
     extract_pdf_page,
+    extract_pdf_page_from_blob,
     page_image_bytes,
     render_in_pool,
     render_pdf_page,
@@ -385,6 +386,83 @@ def test_temporary_files_are_removed(tmp_path: Path, monkeypatch: pytest.MonkeyP
     with pytest.raises(InvalidArgumentError):
         render_rm_page(b"reMarkable .lines file, version=6          garbage")
     assert list(tmp_path.iterdir()) == []
+
+
+# ----------------------------------------------------------------------------- PDF blobs
+
+
+def _blob(tmp_path: Path, data: bytes) -> Path:
+    """``data`` stored the way the archive stores it: ``<root>/blobs/<sha256>``, resolved."""
+    blobs = tmp_path / "acct" / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    path = blobs / hashlib.sha256(data).hexdigest()
+    path.write_bytes(data)
+    return path.resolve()
+
+
+def _assert_cut(single: bytes) -> None:
+    """``single`` is the fixture PDF's first page alone (PDFium's output is not byte-stable)."""
+    assert render_pdf_page(single, 0).png == render_pdf_page(_pdf(), 0).png
+    doc = pdfium.PdfDocument(single)
+    try:
+        assert len(doc) == 1
+    finally:
+        doc.close()
+
+
+def test_a_pdf_page_is_cut_from_an_archive_blob(tmp_path: Path) -> None:
+    path = _blob(tmp_path, _pdf())
+    _assert_cut(extract_pdf_page_from_blob(str(path), 0))
+    with pytest.raises(InvalidArgumentError, match="out of range"):
+        extract_pdf_page_from_blob(str(path), 1)
+
+
+def test_only_an_archive_blob_path_is_read(tmp_path: Path) -> None:
+    good = _blob(tmp_path, _pdf())
+    elsewhere = tmp_path / "acct" / "library"
+    elsewhere.mkdir()
+    (elsewhere / good.name).write_bytes(_pdf())
+    link = good.parent / ("0" * 64)
+    link.symlink_to(good)
+    (good.parent / ("1" * 64)).mkdir()
+    for bad in (
+        good.name,  # relative
+        str(elsewhere / good.name),  # not in blobs/
+        str(good.parent / "doc.pdf"),  # not a SHA-256 name
+        str(good.parent / good.name.upper()),
+        str(good.parent / ".." / "blobs" / good.name),  # not canonical
+        str(link),  # a symlink, even to a real blob
+        str(good.parent / ("1" * 64)),  # a directory
+        str(good) + "\x00",
+        b"/" + str(good).encode(),  # not a str
+    ):
+        with pytest.raises(PathEscapeError):
+            extract_pdf_page_from_blob(bad, 0)  # type: ignore[arg-type]
+    with pytest.raises(NotFoundError):
+        extract_pdf_page_from_blob(str(good.parent / ("2" * 64)), 0)
+
+
+def test_a_pdf_blob_over_the_limit_is_refused_unread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _blob(tmp_path, _pdf())
+    monkeypatch.setattr(render, "MAX_PDF_BYTES", 1024)
+    with pytest.raises(InvalidArgumentError, match="too large"):
+        extract_pdf_page_from_blob(str(path), 0)
+    empty = _blob(tmp_path, b"")
+    with pytest.raises(InvalidArgumentError, match="empty"):
+        extract_pdf_page_from_blob(str(empty), 0)
+
+
+def test_a_corrupt_pdf_blob_is_a_verdict_in_the_pool(tmp_path: Path) -> None:
+    corrupt = _blob(tmp_path, b"%PDF-1.7\nthis is not a pdf")
+    good = _blob(tmp_path, _pdf())
+    with render_pool(1) as pool:
+        broken = render_in_pool(pool, extract_pdf_page_from_blob, str(corrupt), 0)
+        with pytest.raises(InvalidArgumentError):
+            broken.result(timeout=120)
+        cut = render_in_pool(pool, extract_pdf_page_from_blob, str(good), 0)
+        _assert_cut(cut.result(timeout=120))  # the pool survived
 
 
 # ----------------------------------------------------------------------------- process pool

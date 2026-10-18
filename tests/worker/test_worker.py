@@ -367,6 +367,52 @@ async def test_a_broken_render_pool_is_rebuilt_and_the_next_job_renders(
         linked.close()
 
 
+async def test_pdfs_are_only_parsed_in_render_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt PDF fails its job with a verdict; the pool and the worker are unharmed."""
+    import pypdfium2
+
+    docs = fixture_documents()
+    good = docs[PDF][f"{PDF}.pdf"]
+    linked = link(tmp_path, settings={"render_workers": 1})
+    try:
+        injected = linked.worker.render_executor
+        assert injected is not None
+        injected.shutdown()
+        linked.worker.render_executor = None  # a real spawn pool
+
+        def no_pdfium(*_a: object, **_k: object) -> None:
+            raise AssertionError("PDFium was called in the worker's own process")
+
+        monkeypatch.setattr(pypdfium2, "PdfDocument", no_pdfium)
+        linked.cloud.set_file(PDF, f"{PDF}.pdf", b"%PDF-1.7\nthis is not a pdf")
+        await linked.loop().poll_once(linked.context())
+        assert await linked.worker.drain_jobs() == 8
+        source = pg.page_sources(
+            linked.paths,
+            pg.current_version(linked.paths, linked.index(), PDF),  # type: ignore[arg-type]
+        )[0]
+        jobs = [linked.queue.get(n, linked.uid) for n in range(1, 9)]
+        (pdf_job,) = [j for j in jobs if j is not None and j.payload["document"] == PDF]
+        assert (pdf_job.state, pdf_job.error) == ("failed", "invalid_argument")
+        others = [j for j in jobs if j is not None and j.id != pdf_job.id]
+        assert all(j.state == "done" for j in others)
+        assert linked.worker.render_pool_rebuilds == 0
+
+        linked.cloud.set_file(PDF, f"{PDF}.pdf", good)  # a new version of the PDF renders
+        await linked.loop().poll_once(linked.context())
+        await linked.worker.drain_jobs()
+        fixed = pg.page_sources(
+            linked.paths,
+            pg.current_version(linked.paths, linked.index(), PDF),  # type: ignore[arg-type]
+        )[0]
+        assert fixed.content_hash != source.content_hash
+        assert pg.png_relpath(fixed.page_id, fixed.content_hash) in pngs(linked)
+    finally:
+        linked.close()
+
+
 async def test_page_image_jobs_render_larger_than_the_archive(linked: Linked) -> None:
     await linked.sync()
     page = linked.index().page(NOTEBOOK, 0)

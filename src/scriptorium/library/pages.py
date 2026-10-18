@@ -67,6 +67,7 @@ __all__ = [
     "PageSource",
     "Version",
     "blank_page_png",
+    "blob_path",
     "content_hash",
     "current_version",
     "load_version",
@@ -101,11 +102,16 @@ class Version:
     files: Mapping[str, str]
 
 
-def read_blob(paths: AccountPaths, sha256: str, *, limit: int) -> bytes:
-    """``blobs/<sha256>``, at most ``limit`` bytes; ``invalid_argument`` when larger."""
+def blob_path(paths: AccountPaths, sha256: str) -> Path:
+    """``blobs/<sha256>`` resolved inside ``blobs/`` (not checked to exist)."""
     if not is_sha256(sha256):
         raise NotFoundError("blob is not in the archive")
-    path = resolve_inside(paths.blobs, paths.blobs / sha256)
+    return resolve_inside(paths.blobs, paths.blobs / sha256)
+
+
+def read_blob(paths: AccountPaths, sha256: str, *, limit: int) -> bytes:
+    """``blobs/<sha256>``, at most ``limit`` bytes; ``invalid_argument`` when larger."""
+    path = blob_path(paths, sha256)
     try:
         with path.open("rb") as fh:
             data = fh.read(limit + 1)

@@ -35,6 +35,9 @@ import io
 import logging
 import math
 import multiprocessing
+import os
+import re
+import stat
 import struct
 import tempfile
 import threading
@@ -49,7 +52,7 @@ import resvg_py
 from PIL import Image, ImageChops
 from remarkable_mcp import extract as _fork
 
-from scriptorium.errors import InvalidArgumentError
+from scriptorium.errors import InvalidArgumentError, NotFoundError, PathEscapeError
 
 __all__ = [
     "INK_MARGIN_UNITS",
@@ -63,6 +66,7 @@ __all__ = [
     "UNITS_PER_PT",
     "RenderResult",
     "extract_pdf_page",
+    "extract_pdf_page_from_blob",
     "page_image_bytes",
     "render_in_pool",
     "render_pdf_page",
@@ -103,6 +107,8 @@ _MULTIPLY: Final[str] = "mix-blend-mode:multiply"  # how the fork marks highligh
 _PNG_SIGNATURE: Final[bytes] = b"\x89PNG\r\n\x1a\n"
 
 _PDFIUM_LOCK = threading.Lock()
+_BLOB_NAME: Final = re.compile("[0-9a-f]{64}")
+_BLOBS_DIR: Final[str] = "blobs"
 
 
 @dataclass(frozen=True)
@@ -180,18 +186,26 @@ def extract_pdf_page(pdf_bytes: bytes, index: int) -> bytes:
     once per page keeps what crosses into a pool worker small.
     """
     _check_bytes(pdf_bytes, MAX_PDF_BYTES, "PDF")
-    with _PDFIUM_LOCK, _open_pdf(pdf_bytes) as src:
-        _check_index(index, len(src))
-        out = pdfium.PdfDocument.new()
-        try:
-            out.import_pages(src, [index])
-            buf = io.BytesIO()
-            out.save(buf)
-            return buf.getvalue()
-        except pdfium.PdfiumError:
-            raise InvalidArgumentError("PDF page could not be extracted") from None
-        finally:
-            out.close()
+    with _PDFIUM_LOCK:
+        return _extract_locked(pdf_bytes, index)
+
+
+def extract_pdf_page_from_blob(blob_path: str, index: int) -> bytes:
+    """Read an archived PDF blob and return page ``index`` (0-based) as a single-page PDF.
+
+    This is the pool-side cut (§8.3): the worker passes the blob's path, never its bytes,
+    so PDFium only ever parses a whole cloud-supplied PDF inside a render child. The path
+    must be the archive's own resolved blob path: absolute and canonical (no symlink, no
+    ``..``), named by a lowercase SHA-256, directly inside a directory named ``blobs``, and a
+    regular file; anything else is :class:`~scriptorium.errors.PathEscapeError`. The file
+    is opened without following a symlink, refused above :data:`MAX_PDF_BYTES` before it is
+    read, and read under the PDFium lock. A missing blob is ``not_found``.
+    """
+    path = _check_blob_path(blob_path)
+    with _PDFIUM_LOCK:
+        data = _read_blob_file(path, MAX_PDF_BYTES)
+        _check_bytes(data, MAX_PDF_BYTES, "PDF")
+        return _extract_locked(data, index)
 
 
 def page_image_bytes(result: RenderResult, *, max_side_px: int = 1024) -> bytes:
@@ -256,8 +270,9 @@ def render_in_pool[**P, R](
 ) -> Future[R]:
     """Submit one of this module's rendering functions to ``pool``.
 
-    Only :func:`render_rm_page`, :func:`render_pdf_page`, :func:`extract_pdf_page` and
-    :func:`page_image_bytes` are accepted, so nothing else is shipped to a worker by accident.
+    Only :func:`render_rm_page`, :func:`render_pdf_page`, :func:`extract_pdf_page`,
+    :func:`extract_pdf_page_from_blob` and :func:`page_image_bytes` are accepted, so nothing
+    else is shipped to a worker by accident.
     The future raises the same :class:`InvalidArgumentError` (message and hint intact) the
     function raises in-process. Wrap it with ``asyncio.wrap_future`` to await it.
     """
@@ -267,11 +282,73 @@ def render_in_pool[**P, R](
 
 
 _POOL_FUNCTIONS: Final[frozenset[Callable[..., object]]] = frozenset(
-    {render_rm_page, render_pdf_page, extract_pdf_page, page_image_bytes}
+    {
+        render_rm_page,
+        render_pdf_page,
+        extract_pdf_page,
+        extract_pdf_page_from_blob,
+        page_image_bytes,
+    }
 )
 
 
 # --------------------------------------------------------------------------- internals
+
+
+def _extract_locked(pdf_bytes: bytes, index: int) -> bytes:
+    """The single-page cut; the caller holds :data:`_PDFIUM_LOCK`."""
+    with _open_pdf(pdf_bytes) as src:
+        _check_index(index, len(src))
+        out = pdfium.PdfDocument.new()
+        try:
+            out.import_pages(src, [index])
+            buf = io.BytesIO()
+            out.save(buf)
+            return buf.getvalue()
+        except pdfium.PdfiumError:
+            raise InvalidArgumentError("PDF page could not be extracted") from None
+        finally:
+            out.close()
+
+
+def _check_blob_path(blob_path: str) -> str:
+    """``blob_path`` if it has the shape of an archive blob's resolved path, else refused."""
+    if not isinstance(blob_path, str) or "\x00" in blob_path or not os.path.isabs(blob_path):
+        raise PathEscapeError("PDF blob path is not an absolute path")
+    try:
+        canonical = os.path.realpath(blob_path) == blob_path
+    except (OSError, ValueError):
+        canonical = False
+    head, name = os.path.split(blob_path)
+    if not canonical or _BLOB_NAME.fullmatch(name) is None or os.path.basename(head) != _BLOBS_DIR:
+        raise PathEscapeError("PDF blob path is not an archive blob")
+    return blob_path
+
+
+def _read_blob_file(path: str, limit: int) -> bytes:
+    """A regular file's bytes, refused above ``limit`` before reading, symlinks refused."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        raise NotFoundError("blob is not in the archive") from None
+    except OSError:
+        raise PathEscapeError("PDF blob could not be opened as a file") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PathEscapeError("PDF blob is not a regular file")
+        if info.st_size > limit:
+            raise InvalidArgumentError(
+                f"PDF is too large to render ({info.st_size} bytes)",
+                hint=f"the limit is {limit} bytes",
+            )
+        fh = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with fh:
+        return fh.read(limit + 1)
 
 
 def _check_scale(scale: float) -> None:
