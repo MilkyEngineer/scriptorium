@@ -245,7 +245,7 @@ Demonstrated against the operator's deployment with the operator's own account (
 
 | # | Result |
 | --- | --- |
-| 1 | Partial: claude.ai web and mobile web and Claude Code logins work (S2 steps 2–3; the connector is per claude.ai account, so web and mobile share one login). Claude Desktop and the 403 for a non-allowlisted user: pending |
+| 1 | Partial: claude.ai web, mobile web, Claude Desktop and Claude Code logins work (S2 steps 2–3; the connector is per claude.ai account, so web, mobile and Desktop share one login). The 403 for a non-allowlisted user: pending |
 | 2 | Passed: `connect_remarkable` from claude.ai; first poll 26 s later archived every document (16, then 17) in xochitl layout, all pages rendered, 0 tombstones; `list` matched the tablet |
 | 3 | Passed: a page edited on the tablet produced a second `history` row within one poll, superseded files went to `.holding/`, every baseline blob remained; `versions` + `read_page(version=<old>)` returned the pre-edit page, the current one the edit |
 | 4 | Passed: a tablet delete first appeared as `parent=trash` (mirrored, no tombstone); emptying the trash removed four documents from the cloud, which were tombstoned after two complete listings (4 of 18 is under the breaker), with `deletion_cause=unknown`, no `library/` entry left, no blob missing against the baseline manifest |
