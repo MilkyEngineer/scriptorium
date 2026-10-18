@@ -250,6 +250,22 @@ class Settings(BaseSettings):
             "`pending` with the job id (§11.0)."
         ),
     )
+    notifications: bool = Field(
+        default=False,
+        description=(
+            "Poll on the cloud's change notification as a wake-up (§7). Refused at start "
+            "until spike S7 has passed."
+        ),
+    )
+    notify_min_gap_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=3600,
+        description=(
+            "Minimum gap between a notification-triggered poll and the end of the previous "
+            "poll (§7)."
+        ),
+    )
 
     # ---- OCR (§8) -------------------------------------------------------------------------
     anthropic_api_key: SecretStr | None = Field(
@@ -454,6 +470,16 @@ class Settings(BaseSettings):
                 f"{env_name('poll_timeout_seconds')} must be larger than "
                 f"{env_name('sync_max_poll_seconds')}: the budget stops a poll from starting "
                 "work, the watchdog ends one that is stuck."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _notifications_gated(self) -> Settings:
+        if self.notifications:
+            raise ValueError(
+                f"{env_name('notifications')}=true is not available (spike_s7_pending): "
+                "polling on change notifications waits for spike S7. Unset it; the worker "
+                f"polls every {env_name('poll_seconds')}."
             )
         return self
 
