@@ -133,12 +133,13 @@ def test_document_index_keeps_only_allowlisted_names_of_its_document() -> None:
         f"{DOC}.metadata",
         f"{DOC}.content",
         f"{DOC}/{PAGE}.rm",
+        f"{DOC}/{PAGE}-metadata.json",
+        f"{DOC}.thumbnails/{PAGE}.png",
         f"{OTHER}.metadata",
-        f"{DOC}/{PAGE}-metadata.json",  # not on A's allowlist
+        f"{DOC}.thumbnails/{PAGE}.gif",  # not on A's allowlist
         f"{DOC}/../{OTHER}.metadata",
         f"{DOC}.metadata/../../x",
         f"/{DOC}.pdf",
-        f"{DOC}.thumbnails/{PAGE}.png",
         DOC,
     ]
     lines = [f"{hashlib.sha256(n.encode()).hexdigest()}:0:{n}:0:1" for n in names]
@@ -147,8 +148,8 @@ def test_document_index_keeps_only_allowlisted_names_of_its_document() -> None:
 
     index = parse_document_index(raw, uuid=DOC, hash=address, max_files=20)
 
-    assert sorted(index.files) == sorted(names[:3])
-    assert index.skipped == 7
+    assert sorted(index.files) == sorted(names[:5])
+    assert index.skipped == 6
     with pytest.raises(TypeError):
         index.files["x"] = index.files[names[0]]  # type: ignore[index]
 
