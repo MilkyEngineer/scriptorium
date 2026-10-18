@@ -50,6 +50,7 @@ __all__ = [
     "OCR_BATCH",
     "OCR_KINDS",
     "PAGE_IMAGE",
+    "PROMPT_VERSION_RE",
     "RENDER",
     "RENDER_KINDS",
     "RENDER_VERDICTS",
@@ -92,6 +93,8 @@ CUSTOM_ID_RE: Final = re.compile(r"p[0-9]{1,4}")
 built by Scriptorium, never from names, and a result is matched against the item list."""
 BATCH_ID_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
 """A Message Batches id as the API returns it (``msgbatch_…``), checked before it is stored."""
+PROMPT_VERSION_RE: Final = re.compile(r"v[1-9][0-9]{0,5}")
+"""A prompt version as ``ocr/prompt.md`` declares it."""
 BatchMode = Literal["user", "server"]
 _BATCH_MODES: Final = frozenset({"user", "server"})
 
@@ -256,11 +259,15 @@ class OcrBatchSpec:
 
     ``mode`` is the mode whose key submitted it: results are read with that key and the
     spend is recorded under it, even if the user's mode has changed since.
+    ``prompt_version`` is the prompt the pages were sent with, stored with their transcripts
+    whatever the prompt is when the results are collected (None in a payload written before
+    it was recorded).
     """
 
     batch_id: str
     mode: BatchMode
     items: Mapping[str, OcrSpec]
+    prompt_version: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.batch_id, str) or not BATCH_ID_RE.fullmatch(self.batch_id):
@@ -274,6 +281,11 @@ class OcrBatchSpec:
                 raise InvalidArgumentError("ocr batch item id is malformed")
             if not isinstance(spec, OcrSpec) or spec.force:
                 raise InvalidArgumentError("ocr batch item is malformed")
+        if self.prompt_version is not None and (
+            not isinstance(self.prompt_version, str)
+            or not PROMPT_VERSION_RE.fullmatch(self.prompt_version)
+        ):
+            raise InvalidArgumentError("ocr batch prompt version is malformed")
 
     @property
     def kind(self) -> str:
@@ -283,20 +295,26 @@ class OcrBatchSpec:
         return ocr_batch_key(acct, self.batch_id)
 
     def payload(self) -> dict[str, Any]:
-        return {
+        body: dict[str, Any] = {
             "batch_id": self.batch_id,
             "mode": self.mode,
             "items": {cid: spec.payload() for cid, spec in sorted(self.items.items())},
         }
+        if self.prompt_version is not None:
+            body["prompt_version"] = self.prompt_version
+        return body
 
 
 def ocr_batch_key(acct: str, batch_id: str) -> str:
     return f"{OCR_BATCH}:{acct}:{batch_id}"
 
 
+_BATCH_FIELDS: Final = frozenset({"batch_id", "mode", "items"})
+
+
 def parse_ocr_batch_payload(payload: Mapping[str, Any]) -> OcrBatchSpec:
     """The payload of an ``ocr_batch`` job; ``invalid_argument`` otherwise."""
-    if not isinstance(payload, Mapping) or set(payload) != {"batch_id", "mode", "items"}:
+    if not isinstance(payload, Mapping) or set(payload) - {"prompt_version"} != _BATCH_FIELDS:
         raise InvalidArgumentError("ocr batch payload is malformed")
     items = payload["items"]
     if not isinstance(items, Mapping):
@@ -305,4 +323,5 @@ def parse_ocr_batch_payload(payload: Mapping[str, Any]) -> OcrBatchSpec:
         batch_id=payload["batch_id"],
         mode=payload["mode"],
         items={cid: parse_ocr_payload(item) for cid, item in items.items()},
+        prompt_version=payload.get("prompt_version"),
     )

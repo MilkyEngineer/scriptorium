@@ -135,11 +135,27 @@ def test_ocr_batch_round_trip() -> None:
         _batch(items={f"p{n}": OcrSpec(DOC, PAGE, HASH, 1).payload() for n in range(101)}),
         _batch(items=[1]),
         {**_batch(), "extra": 1},
+        _batch(prompt_version="1"),
+        _batch(prompt_version="v0"),
+        _batch(prompt_version="v1\n"),
+        _batch(prompt_version=1),
     ],
 )
 def test_malformed_ocr_batch_payloads_are_refused(payload: dict[str, Any]) -> None:
     with pytest.raises(InvalidArgumentError):
         parse_ocr_batch_payload(payload)
+
+
+def test_ocr_batch_carries_the_prompt_version_it_was_sent_with() -> None:
+    spec = parse_ocr_batch_payload(_batch(prompt_version="v12"))
+    assert spec.prompt_version == "v12"
+    assert spec.payload()["prompt_version"] == "v12"
+    assert parse_ocr_batch_payload(spec.payload()) == spec
+    # A job queued before the field existed has none (and its payload stays as it was).
+    older = parse_ocr_batch_payload(_batch())
+    assert older.prompt_version is None and "prompt_version" not in older.payload()
+    with pytest.raises(InvalidArgumentError):
+        OcrBatchSpec("b1", "user", {"p0": OcrSpec(DOC, PAGE, HASH, 1)}, prompt_version="x")
 
 
 def test_batch_size_bound() -> None:
