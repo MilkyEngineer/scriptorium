@@ -762,7 +762,14 @@ class Worker:
             # an account that was removed meanwhile would recreate its directory.
             if await asyncio.to_thread(self._account_gone, job):
                 return dict(GONE_RESULT)
-            await asyncio.to_thread(pg.write_png, ctx.paths, rel, data)
+            try:
+                await asyncio.to_thread(pg.write_png, ctx.paths, rel, data)
+            except FileNotFoundError:
+                # The directory was moved after the check above: write_png refuses to
+                # recreate it. Gone once the removal is recorded (it is, before the move).
+                if await asyncio.to_thread(self._account_gone, job):
+                    return dict(GONE_RESULT)
+                raise
         size = (await asyncio.to_thread(path.stat)).st_size
         if spec.max_side is None:
             # Marks every document listing this page version, not only spec.document: a
@@ -789,7 +796,12 @@ class Worker:
                 base = await self._render(ctx, source, None, job)
                 if await asyncio.to_thread(self._account_gone, job):  # as in _render_job
                     raise _AccountGoneError
-                await asyncio.to_thread(pg.write_png, ctx.paths, base_rel, base)
+                try:
+                    await asyncio.to_thread(pg.write_png, ctx.paths, base_rel, base)
+                except FileNotFoundError:
+                    if await asyncio.to_thread(self._account_gone, job):
+                        raise _AccountGoneError from None
+                    raise
             head = await asyncio.to_thread(_read_head, base_path)
             longest = max(pg.png_size(head))
             scale = min(render.MAX_SCALE, max(render.MIN_SCALE, max_side / longest))

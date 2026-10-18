@@ -438,7 +438,16 @@ def _cached_variant(account: Account, source: pg.PageSource, base: bytes, side: 
     if data is not None:
         return data
     data = fit_png(base, side)
-    pg.write_png(account.paths, rel, data)
+    try:
+        pg.write_png(account.paths, rel, data)
+    except FileNotFoundError:
+        # The account directory was moved away by disconnect_remarkable meanwhile:
+        # write_png never recreates it, and a removed account is not served.
+        raise ToolError(
+            ErrorCode.NOT_FOUND,
+            "That account's archive was removed from this server.",
+            "account_status lists your accounts.",
+        ) from None
     return data
 
 

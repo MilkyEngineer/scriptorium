@@ -615,3 +615,19 @@ async def test_trash_lists_trashed_documents(library: Served, linked: Linked) ->
 async def test_tools_need_no_account_argument(library: Served, tool: str) -> None:
     args = {"since": "2000-01-01T00:00:00Z"} if tool == "recent" else {}
     await library.ok(tool, args)
+
+
+def test_a_cached_variant_of_a_removed_account_is_not_found(tmp_path: Any) -> None:
+    """write_png never recreates a moved account root; the cache write says not_found."""
+    from types import SimpleNamespace
+
+    from scriptorium.tools._library import _cached_variant
+    from scriptorium.users.store import account_paths
+
+    paths = account_paths(tmp_path, "0123456789abcdef", "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    account: Any = SimpleNamespace(paths=paths)  # never created: as if moved aside
+    source: Any = SimpleNamespace(page_id=PAGES[0], content_hash="e" * 64)
+    with pytest.raises(ToolError) as caught:
+        _cached_variant(account, source, pg.blank_page_png(), 256)
+    assert caught.value.code == ErrorCode.NOT_FOUND
+    assert not paths.root.exists()

@@ -180,6 +180,37 @@ async def test_a_page_image_whose_account_goes_while_rendering_writes_nothing(
     assert not pages.exists() or not any(pages.rglob("*.png"))
 
 
+async def test_a_render_that_loses_the_race_with_a_removal_recreates_nothing(
+    linked: Linked, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory moves after the worker's last check and before the PNG is written:
+    write_png refuses to recreate it and the job completes as gone."""
+    await linked.loop().poll_once(linked.context())  # queues the archive renders
+    root = linked.paths.root
+    moved = root.with_name(root.name + "-moved")
+    calls: dict[int, int] = {}
+    mover: list[int] = []
+
+    def gone(row: Any) -> bool:
+        n = calls[row.id] = calls.get(row.id, 0) + 1
+        if n == 2 and not mover:
+            # The check right before the write: the removal is recorded and the directory
+            # moved just after it answers.
+            mover.append(row.id)
+            root.rename(moved)
+            return False
+        return n > 2 or bool(mover and row.id != mover[0])
+
+    monkeypatch.setattr(linked.worker, "_account_gone", gone)
+
+    await linked.worker.drain_jobs()
+
+    assert mover and not root.exists()
+    done = linked.queue.get(mover[0], linked.uid)
+    assert done is not None and (done.state, done.result) == ("done", dict(GONE_RESULT))
+    assert not any(moved.glob("pages/*/*.png"))
+
+
 async def test_a_poll_does_nothing_once_the_directory_has_moved(
     linked: Linked, caplog: pytest.LogCaptureFixture
 ) -> None:

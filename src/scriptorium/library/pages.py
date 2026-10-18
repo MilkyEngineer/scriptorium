@@ -35,11 +35,13 @@ their allowlists before they reach a path, and every path is resolved inside its
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import io
 import json
 import os
 import secrets
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -336,12 +338,25 @@ def _px(text: str) -> int:
 
 
 def write_png(paths: AccountPaths, relpath: str, data: bytes) -> Path:
-    """Write ``data`` to ``relpath`` atomically (temporary file, fsync, rename)."""
+    """Write ``data`` to ``relpath`` atomically (temporary file, fsync, rename).
+
+    Never creates the account directory: ``disconnect_remarkable(keep_archive=false)`` moves
+    it to ``removed/`` (§11.1), and a writer that lost that race must not leave a new, empty
+    account root holding one PNG. Only ``pages/`` and the page's own directory are created,
+    one level at a time. Raises :class:`FileNotFoundError` when the account root is gone (or
+    is no longer a directory); callers treat that as "the account is gone".
+    """
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise InvalidArgumentError("not a PNG")
     target = resolve_png(paths, relpath)
     directory = target.parent
-    directory.mkdir(parents=True, exist_ok=True)
+    if not _is_real_dir(paths.root):
+        raise FileNotFoundError(errno.ENOENT, "the account directory is gone")
+    # Non-recursive: if the root is moved between the check and here, mkdir fails with
+    # FileNotFoundError instead of recreating it.
+    paths.pages.mkdir(exist_ok=True)
+    resolve_inside(paths.root, paths.pages)
+    directory.mkdir(exist_ok=True)
     resolve_inside(paths.pages, directory)
     tmp = directory / f".{target.name}.{secrets.token_hex(6)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -357,6 +372,14 @@ def write_png(paths: AccountPaths, relpath: str, data: bytes) -> Path:
             tmp.unlink()  # our own temporary file under pages/, never archive data
         raise
     return target
+
+
+def _is_real_dir(path: Path) -> bool:
+    """``path`` is a directory itself (a symlink to one is not)."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 def png_size(data: bytes) -> tuple[int, int]:

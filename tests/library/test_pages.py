@@ -228,6 +228,42 @@ def test_write_png_is_atomic_and_stays_inside_pages(synced: tuple[FakeCloud, Har
     assert list(outside.iterdir()) == []
 
 
+def test_write_png_never_recreates_a_moved_account_directory(
+    synced: tuple[FakeCloud, Harness],
+) -> None:
+    """disconnect_remarkable(keep_archive=false) moves the account root aside; a PNG writer
+    that loses that race must not leave a new account root holding one PNG (§11.1)."""
+    _cloud, h = synced
+    blank = pg.blank_page_png(0.1)
+    rel = pg.png_relpath(PAGES[0], "e" * 64)
+    moved = h.paths.root.with_name(h.paths.root.name + "-moved")
+    h.paths.root.rename(moved)
+
+    with pytest.raises(FileNotFoundError):
+        pg.write_png(h.paths, rel, blank)
+
+    assert not h.paths.root.exists()
+    assert not any(moved.glob("pages/*/*.png"))
+
+    # A symlink where the root was is not the account directory either.
+    h.paths.root.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(FileNotFoundError):
+        pg.write_png(h.paths, rel, blank)
+    assert not any(moved.glob("pages/*/*.png"))
+
+
+def test_write_png_creates_pages_one_level_at_a_time(synced: tuple[FakeCloud, Harness]) -> None:
+    _cloud, h = synced
+    if h.paths.pages.exists():
+        for png in h.paths.pages.rglob("*.png"):
+            png.unlink()
+        for directory in sorted(h.paths.pages.iterdir(), reverse=True):
+            directory.rmdir()
+        h.paths.pages.rmdir()
+    path = pg.write_png(h.paths, pg.png_relpath(PAGES[0], "e" * 64), pg.blank_page_png(0.1))
+    assert path.parent.parent == h.paths.pages and path.is_file()
+
+
 def test_the_fixture_page_ids_collide_across_documents(synced: tuple[FakeCloud, Harness]) -> None:
     """Open question 8: the scrubbed fixture reuses page UUID ...0101 in both documents."""
     _cloud, h = synced
