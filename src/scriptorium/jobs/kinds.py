@@ -21,7 +21,10 @@ Re-runs are bounded for the life of the data, not per call: a key's **family** i
 key and every ``:after:`` key built from it, and ``JobQueue.rerun`` creates at most
 :data:`RERUN_CAP` ``:after:`` jobs per family, so a page version whose content keeps killing
 render children costs a bounded number of crashes across tool calls and worker restarts.
-A family at its cap is treated like a verdict.
+A family at its cap is treated like a verdict. A job that finds its page version gone (the
+version or the account is no longer there) completes with :data:`GONE_RESULT`: it is not
+re-run for that version, and its family is not revived at worker start; another version
+holding the same page re-runs it with its own payload.
 
 **OCR jobs.** ``ocr:<acct>:<document>:<page>:<hash>`` transcribes one version of one
 document's page (transcripts are per document, §6.1, so the document is in the key);
@@ -37,6 +40,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Final, Literal
 
 from scriptorium.errors import InvalidArgumentError
@@ -45,6 +49,7 @@ from scriptorium.library.layout import is_sha256, is_uuid
 __all__ = [
     "BATCH_ID_RE",
     "CUSTOM_ID_RE",
+    "GONE_RESULT",
     "MAX_BATCH_ITEMS",
     "OCR",
     "OCR_BATCH",
@@ -59,6 +64,7 @@ __all__ = [
     "OcrBatchSpec",
     "OcrSpec",
     "RenderSpec",
+    "is_gone",
     "is_render_verdict",
     "ocr_batch_key",
     "ocr_key",
@@ -79,6 +85,9 @@ RENDER_VERDICTS: Final = frozenset({"invalid_argument", "refused"})
 RERUN_CAP: Final = 3
 """Most ``:after:`` re-runs one key family ever gets (page_png and worker-start revival)."""
 AFTER: Final = ":after:"
+GONE_RESULT: Final[Mapping[str, str]] = MappingProxyType({"state": "gone"})
+"""A render job's result when its page version (or its account) no longer exists: the job is
+``done``, it is not re-run for that version, and that version's page is ``not_found``."""
 MAX_SIDE_PX: Final = 8192
 """Largest ``page_image`` longest side a job may ask for."""
 _MAX_GENERATION: Final = 2**62
@@ -151,6 +160,11 @@ def page_image_key(acct: str, page: str, content_hash: str, max_side: int) -> st
 def is_render_verdict(error: str | None) -> bool:
     """True when a render job's ``error`` is the renderer's verdict on the page."""
     return error in RENDER_VERDICTS
+
+
+def is_gone(result: Mapping[str, Any] | None) -> bool:
+    """True when a finished render job's ``result`` is :data:`GONE_RESULT`."""
+    return result is not None and dict(result) == dict(GONE_RESULT)
 
 
 def rerun_family(key: str) -> str:

@@ -27,7 +27,7 @@ from typing import Final
 
 from scriptorium.auth.oidc import User
 from scriptorium.errors import InvalidArgumentError
-from scriptorium.jobs.kinds import RenderSpec, is_render_verdict
+from scriptorium.jobs.kinds import RenderSpec, is_gone, is_render_verdict
 from scriptorium.library import pages as pg
 from scriptorium.library import render
 from scriptorium.library.index import DocumentRow, Index
@@ -358,10 +358,23 @@ async def page_png(
                 "The page may be damaged or in a format the renderer does not support.",
                 extra={"job": job.id},
             )
+        gone = job.state == "done" and is_gone(job.result)
+        if gone and job.payload == spec.payload():
+            # The worker found this very version gone: re-running it would find the same, so
+            # it is not re-run (and costs the page none of its re-runs).
+            raise ToolError(
+                ErrorCode.NOT_FOUND,
+                "This version of the page is not in the archive.",
+                "List or read the document again to get its current pages.",
+                extra={"job": job.id},
+            )
         if job.state in ("done", "cancelled", "dead"):
             # Terminates: each step is an existing re-run (the family is finite) or a new
-            # one (at most RERUN_CAP for all time), and None once the family is spent.
-            nxt = await asyncio.to_thread(svc.queue.rerun, job)
+            # one (at most RERUN_CAP for all time), and None once the family is spent. A
+            # family another version left gone re-runs with this version's payload.
+            nxt = await asyncio.to_thread(
+                svc.queue.rerun, job, payload=spec.payload() if gone else None
+            )
             if nxt is None and job.state == "dead":
                 raise ToolError(
                     ErrorCode.REFUSED,

@@ -275,6 +275,8 @@ async def test_dead_renders_are_refused_only_for_a_verdict_and_otherwise_rerun(
         verdict_key = render_key(linked.acct, PAGES[1], sources[1].content_hash)
         gone_key = render_key(linked.acct, PAGES[2], sources[2].content_hash)
         broken_key = render_key(linked.acct, PAGES[3], sources[3].content_hash)
+        # Found gone while it named another version (a later generation) of the same page.
+        moved_key = render_key(linked.acct, PAGES[4], sources[4].content_hash)
         conn = sqlite3.connect(global_db_path(linked.settings.data_dir))
         try:
             with conn:
@@ -284,8 +286,13 @@ async def test_dead_renders_are_refused_only_for_a_verdict_and_otherwise_rerun(
                     (verdict_key,),
                 )
                 conn.execute(
-                    "UPDATE jobs SET state = 'done', result = ? WHERE dedupe_key = ?",
-                    ('{"state":"gone"}', gone_key),
+                    "UPDATE jobs SET state = 'done', result = ? WHERE dedupe_key IN (?, ?)",
+                    ('{"state":"gone"}', gone_key, moved_key),
+                )
+                conn.execute(
+                    "UPDATE jobs SET payload = json_set(payload, '$.generation', 999) "
+                    "WHERE dedupe_key = ?",
+                    (moved_key,),
                 )
                 # Died of its run (a broken render pool), not of its page.
                 conn.execute(
@@ -294,21 +301,38 @@ async def test_dead_renders_are_refused_only_for_a_verdict_and_otherwise_rerun(
                 )
             ids = {
                 key: conn.execute("SELECT id FROM jobs WHERE dedupe_key = ?", (key,)).fetchone()[0]
-                for key in (gone_key, broken_key)
+                for key in (gone_key, broken_key, moved_key)
             }
         finally:
             conn.close()
+
+        def reruns(key: str) -> int:
+            conn = sqlite3.connect(global_db_path(linked.settings.data_dir))
+            try:
+                row = conn.execute(
+                    "SELECT count(*) FROM jobs WHERE dedupe_key LIKE ?", (key + ":after:%",)
+                ).fetchone()
+                return int(row[0])
+            finally:
+                conn.close()
+
         async with serve(linked.settings, issuer, make_validator, clock=linked.clock) as library:
             dead = await library.error("read_page", {"document": NOTEBOOK, "page": 2})
             assert dead["code"] == "refused"
-            for page, key in ((3, gone_key), (4, broken_key)):
+            # This very version was found gone: not found, and none of its re-runs spent.
+            gone = await library.error("read_page", {"document": NOTEBOOK, "page": 3})
+            assert (gone["code"], gone["job"]) == ("not_found", ids[gone_key])
+            assert reruns(gone_key) == 0
+            for page, key in ((4, broken_key), (5, moved_key)):
                 rerun = await library.error("read_page", {"document": NOTEBOOK, "page": page})
                 assert rerun["code"] == "pending"
                 assert rerun["job"] != ids[key]
                 job = library.services.queue.get(rerun["job"], linked.uid)
                 assert job is not None and job.dedupe_key == f"{key}:after:{ids[key]}"
+                assert job.payload["generation"] != 999  # the version that was asked for
             await linked.worker.drain_jobs()
             image_of(await library.call("read_page", {"document": NOTEBOOK, "page": 4}))
+            image_of(await library.call("read_page", {"document": NOTEBOOK, "page": 5}))
             again = await library.error("read_page", {"document": NOTEBOOK, "page": 2})
             assert again["code"] == "refused"  # a verdict is not re-run
     finally:

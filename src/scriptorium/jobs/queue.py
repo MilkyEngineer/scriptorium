@@ -55,8 +55,10 @@ from scriptorium.db.schema_global import SCRIPTORIUM_STEPS
 from scriptorium.errors import InvalidArgumentError, RefusedError
 from scriptorium.jobs.kinds import (
     AFTER,
+    GONE_RESULT,
     RENDER_KINDS,
     RERUN_CAP,
+    is_gone,
     is_render_verdict,
     rerun_family,
     rerun_key,
@@ -486,14 +488,20 @@ class JobQueue:
     def rerun(self, job: JobRow, *, payload: Mapping[str, Any] | None = None) -> JobRow | None:
         """A fresh job re-running ``job`` under ``rerun_key``, or None when its family is capped.
 
-        The new job copies ``job``'s user, account, kind, payload (or takes ``payload``, e.g.
-        an ``ocr`` job re-run with ``force``) and ``max_attempts``. If the re-run already
-        exists (another caller got there first) it is returned whatever its state. Otherwise
-        it is created only while the key's family has fewer than
-        :data:`~scriptorium.jobs.kinds.RERUN_CAP` ``:after:`` jobs, counted for all time.
+        The new job copies ``job``'s user, account, kind and ``max_attempts``, and its payload
+        unless ``payload`` is given. If the re-run already exists (another caller got there
+        first) it is returned whatever its state. Otherwise it is created only while the key's
+        family has fewer than :data:`~scriptorium.jobs.kinds.RERUN_CAP` ``:after:`` jobs,
+        counted for all time. A job that ended :data:`~scriptorium.jobs.kinds.GONE_RESULT` is
+        not re-run with the payload it had (None): that page version was not there to render.
+        Another version that holds the same page (a copy, a later generation) may re-run it
+        by passing its own ``payload``.
         """
-        key = rerun_key(job.dedupe_key, job.id)
         body = _json(job.payload if payload is None else payload, MAX_PAYLOAD_BYTES, "payload")
+        if job.state == "done" and is_gone(job.result):
+            if body == _json(job.payload, MAX_PAYLOAD_BYTES, "payload"):
+                return None
+        key = rerun_key(job.dedupe_key, job.id)
         with self._write() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE dedupe_key = ?", (key,)).fetchone()
             if row is None:
@@ -581,7 +589,8 @@ class JobQueue:
     def _dead_render_leaves(
         conn: sqlite3.Connection, where: str, params: Sequence[Any]
     ) -> list[tuple[sqlite3.Row, int]]:
-        """Dead render jobs never re-run, each with its family's re-run count."""
+        """Dead render jobs never re-run, each with its family's re-run count; a family in
+        which some job ended ``gone`` is left out (nothing of it is re-run or reported)."""
         kinds = ", ".join("?" * len(RENDER_KINDS))
         rows = conn.execute(
             f"SELECT * FROM jobs WHERE state = 'dead' AND kind IN ({kinds}){where} ORDER BY id",  # noqa: S608
@@ -592,7 +601,10 @@ class JobQueue:
             child = rerun_key(row["dedupe_key"], row["id"])
             if conn.execute("SELECT 1 FROM jobs WHERE dedupe_key = ?", (child,)).fetchone():
                 continue
-            out.append((row, _family_reruns(conn, rerun_family(row["dedupe_key"]))))
+            base = rerun_family(row["dedupe_key"])
+            if _family_gone(conn, base):
+                continue
+            out.append((row, _family_reruns(conn, base)))
         return out
 
     # ---- lookups ----------------------------------------------------------------------------
@@ -681,6 +693,22 @@ class JobQueue:
                 else:
                     rerunnable += 1
         return final, rerunnable
+
+
+_GONE_TEXT: Final = _json(GONE_RESULT, MAX_RESULT_BYTES, "result")
+
+
+def _family_gone(conn: sqlite3.Connection, base: str) -> bool:
+    """Whether a job of the family ``base`` (the base key or one of its re-runs) ended with
+    :data:`~scriptorium.jobs.kinds.GONE_RESULT`."""
+    low = base + AFTER
+    high = low[:-1] + chr(ord(AFTER[-1]) + 1)
+    row = conn.execute(
+        "SELECT 1 FROM jobs WHERE (dedupe_key = ? OR (dedupe_key >= ? AND dedupe_key < ?)) "
+        "AND state = 'done' AND result = ? LIMIT 1",
+        (base, low, high, _GONE_TEXT),
+    ).fetchone()
+    return row is not None
 
 
 def _family_reruns(conn: sqlite3.Connection, base: str) -> int:

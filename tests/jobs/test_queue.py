@@ -12,7 +12,7 @@ from scriptorium.db.connect import open_sqlite
 from scriptorium.db.migrations import SchemaMismatch
 from scriptorium.db.schema_jobs import JOBS_STEPS
 from scriptorium.errors import InvalidArgumentError, RefusedError
-from scriptorium.jobs.kinds import RERUN_CAP
+from scriptorium.jobs.kinds import GONE_RESULT, RERUN_CAP, is_gone
 from scriptorium.jobs.queue import (
     LEASE_EXPIRED_ERROR,
     JobQueue,
@@ -781,3 +781,49 @@ def test_reruns_run_at_normal_priority_and_revivals_keep_theirs(queue: JobQueue)
             "SELECT priority FROM jobs WHERE dedupe_key LIKE 'render:revive:after:%'"
         ).fetchall()
     assert [r["priority"] for r in rows] == [-1]
+
+
+# ---- gone renders (M2) ------------------------------------------------------------------------
+
+
+def finish(q: JobQueue, key: str, result: dict[str, Any]) -> int:
+    job_id = put(q, key)
+    job = q.lease("w", kinds=["render"])
+    assert job is not None and job.id == job_id
+    q.complete(job_id, "w", result)
+    return job_id
+
+
+def test_a_gone_render_is_not_re_run_for_the_same_version(queue: JobQueue) -> None:
+    gone = queue.get(finish(queue, "render:gone", dict(GONE_RESULT)), UID)
+    assert gone is not None and is_gone(gone.result)
+    assert queue.rerun(gone) is None
+    assert queue.rerun(gone, payload=dict(gone.payload)) is None  # the same version
+    assert "render:gone:after:1" not in keys(queue)
+    rendered = queue.get(finish(queue, "render:ok", {"png": "p", "bytes": 1}), UID)
+    assert rendered is not None and not is_gone(rendered.result)
+    assert queue.rerun(rendered) is not None  # a finished job whose PNG was lost re-runs
+    other = {**gone.payload, "generation": 2}
+    again = queue.rerun(gone, payload=other)  # another version holding the same page
+    assert again is not None and again.payload == other
+    assert again.dedupe_key == f"render:gone:after:{gone.id}"
+
+
+def test_a_family_that_went_gone_is_not_revived_or_reported(queue: JobQueue) -> None:
+    # An older run of the family died; a later one found the page version gone.
+    kill(queue, "render:fam", "internal")
+    first = queue.get(1, UID)
+    assert first is not None
+    child = queue.rerun(first)
+    assert child is not None
+    leased = queue.lease("w", kinds=["render"])
+    assert leased is not None and leased.id == child.id
+    queue.complete(child.id, "w", dict(GONE_RESULT))
+    kill(queue, "render:fam:after:99", "internal")  # a dead leaf of the same family
+    kill(queue, "render:other", "internal")
+    assert queue.dead_renders(UID) == (0, 1)
+
+    assert queue.revive_dead_renders() == 1  # render:other only
+
+    assert not any(k.startswith("render:fam:after:99:") for k in keys(queue))
+    assert "render:fam:after:99:after:4" not in keys(queue)
