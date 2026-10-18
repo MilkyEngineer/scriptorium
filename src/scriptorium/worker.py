@@ -17,7 +17,16 @@ One process, one asyncio loop, four kinds of task:
   closed (failing whatever request is in flight) and no new poll of that account starts
   until the old one has returned. After a poll, the pages and tags of every committed or
   un-tombstoned document (the tags of a folder) are refreshed from its new version
-  (:func:`refresh_document`) and ``render`` jobs are queued for pages without a PNG.
+  (:func:`refresh_document`) and ``render`` jobs are queued for pages without a PNG: at low
+  priority (:func:`render_priority`) for a document that is tombstoned, in the trash or
+  outside the sync scope, so live pages render first; the waiting render jobs of a document
+  the poll tombstoned are lowered too (``JobQueue.deprioritise``). Each poll holds the
+  account's poll lock (``accounts.poll_lock``); a poll that finds the directory moved
+  (``disconnect_remarkable(keep_archive=false)``) does nothing (``account_moved``). A poll
+  the watchdog gave up on is still reaped when its thread returns: its error is logged by
+  class name, or its committed documents are refreshed. :meth:`AccountLoop.poke` (for cloud
+  notifications, M2, if S7 passes) brings the next poll forward to ``NOTIFY_MIN_GAP_SECONDS``
+  after the last one ended, after an ``ok`` or ``partial`` poll only.
 - **Job runner.** Leases ``render`` and ``page_image`` jobs, at most ``RENDER_WORKERS`` at a
   time, renders in the process pool (heartbeating the lease while it waits), writes the PNG
   and completes or fails the job. A job whose lease was lost is abandoned, not reported. A
@@ -81,6 +90,7 @@ from scriptorium.accounts import (
     STATE_NEEDS_RELINK,
     STATE_TOKEN_REJECTIONS,
     device_token_name,
+    poll_lock,
 )
 from scriptorium.cloud.client import CloudClient
 from scriptorium.cloud.sync import SyncOnce, SyncReport, SyncSettings
@@ -88,12 +98,25 @@ from scriptorium.config import Settings
 from scriptorium.db.connect import to_db_time, utc_now
 from scriptorium.db.migrations import SchemaMismatch
 from scriptorium.errors import ScriptoriumError
-from scriptorium.jobs.kinds import OCR, OCR_KINDS, RENDER_KINDS, RenderSpec, parse_render_payload
-from scriptorium.jobs.queue import JobQueue, JobRow, LeaseLostError
+from scriptorium.jobs.kinds import (
+    GONE_RESULT,
+    OCR,
+    OCR_KINDS,
+    RENDER_KINDS,
+    RenderSpec,
+    parse_render_payload,
+)
+from scriptorium.jobs.queue import (
+    PRIORITY_LOW,
+    PRIORITY_NORMAL,
+    JobQueue,
+    JobRow,
+    LeaseLostError,
+)
 from scriptorium.library import pages as pg
 from scriptorium.library import render
 from scriptorium.library.archive import Archive
-from scriptorium.library.index import Index, PageRow
+from scriptorium.library.index import DocumentRow, Index, PageRow
 from scriptorium.logging import log_event
 from scriptorium.ocr._ports import OcrPorts, build_ocr_ports
 from scriptorium.ocr.ledger import SpendLedger
@@ -123,6 +146,7 @@ __all__ = [
     "jittered",
     "read_heartbeat",
     "refresh_document",
+    "render_priority",
 ]
 
 logger = logging.getLogger(__name__)
@@ -136,6 +160,7 @@ HEARTBEAT_STALE_SECONDS: Final = 180
 HEARTBEAT_MAX_BYTES: Final = 4096
 DOCUMENT_TYPE: Final = "DocumentType"
 FOLDER_TYPE: Final = "CollectionType"
+TRASH: Final = "trash"
 
 
 @dataclass(frozen=True)
@@ -278,6 +303,21 @@ def refresh_document(
             continue
         todo.append(RenderSpec(uuid, source.page_id, source.content_hash, version.generation))
     return todo
+
+
+def render_priority(doc: DocumentRow | None) -> int:
+    """The priority of a document's background renders: ``PRIORITY_LOW`` when it is
+    tombstoned, in the trash or outside the sync scope (its pages wait behind live ones),
+    else ``PRIORITY_NORMAL``. A page someone asks for is enqueued at normal priority by the
+    tool, which raises a waiting job."""
+    if (
+        doc is None
+        or doc.deleted_at is not None
+        or doc.excluded_at is not None
+        or doc.parent == TRASH
+    ):
+        return PRIORITY_LOW
+    return PRIORITY_NORMAL
 
 
 def find_source(paths: AccountPaths, index: Index, spec: RenderSpec) -> pg.PageSource | None:
@@ -529,12 +569,16 @@ class Worker:
             return None
 
     def refresh(self, ctx: AccountContext, uuids: Iterable[str]) -> int:
-        """Refresh the pages of ``uuids`` and queue their renders; returns jobs queued."""
+        """Refresh the pages of ``uuids`` and queue their renders; returns jobs queued.
+
+        Renders of a document :func:`render_priority` ranks low are queued low, and its
+        renders already waiting are lowered with them."""
         queued = 0
         now = self.clock()
         for uuid in uuids:
             try:
                 todo = refresh_document(ctx.paths, ctx.index, uuid, now, acct=ctx.acct)
+                priority = render_priority(ctx.index.document(uuid))
             except ScriptoriumError:
                 log_event(logger, "pages_refresh_failed", level=logging.WARNING, acct=ctx.acct)
                 continue
@@ -545,9 +589,23 @@ class Worker:
                     kind=spec.kind,
                     dedupe_key=spec.key(ctx.acct),
                     payload=spec.payload(),
+                    priority=priority,
                 )
                 queued += 1
+            if priority == PRIORITY_LOW:
+                self.deprioritise(ctx, (uuid,))
         return queued
+
+    def deprioritise(self, ctx: AccountContext, uuids: Iterable[str]) -> int:
+        """Lower the waiting render jobs of ``uuids``; returns how many (logged as a count)."""
+        lowered = 0
+        for uuid in uuids:
+            lowered += self.queue.deprioritise(
+                uid=ctx.uid, acct=ctx.acct, document=uuid, kinds=RENDER_KINDS
+            )
+        if lowered:
+            log_event(logger, "renders_deprioritised", acct=ctx.acct, count=lowered)
+        return lowered
 
     # ---- jobs ------------------------------------------------------------------------------
 
@@ -672,21 +730,30 @@ class Worker:
             duration_ms=round((self.monotonic() - started) * 1000, 1),
         )
 
+    def _account_gone(self, job: JobRow) -> bool:
+        """The job's account is unknown, or was removed (its directory moved to ``removed/``)."""
+        if job.acct is None:
+            return True
+        row = self.store.account(job.uid, job.acct)
+        return row is None or row.removed_at is not None
+
     async def _render_job(self, job: JobRow) -> Mapping[str, Any]:
         spec = parse_render_payload(job.kind, job.payload)
-        if (
-            job.acct is None
-            or await asyncio.to_thread(self.store.account, job.uid, job.acct) is None
-        ):
-            return {"state": "gone"}
+        if await asyncio.to_thread(self._account_gone, job):
+            return dict(GONE_RESULT)
+        assert job.acct is not None
         ctx = await asyncio.to_thread(self.context, job.uid, job.acct)
         source = await asyncio.to_thread(find_source, ctx.paths, ctx.index, spec)
         if source is None:
-            return {"state": "gone"}
+            return dict(GONE_RESULT)
         rel = pg.png_relpath(source.page_id, source.content_hash, max_side=spec.max_side)
         path = pg.resolve_png(ctx.paths, rel)
         if not await asyncio.to_thread(path.is_file):
             data = await self._render(ctx, source, spec.max_side, job)
+            # Looked at again after the render (which can take a while): a PNG written into
+            # an account that was removed meanwhile would recreate its directory.
+            if await asyncio.to_thread(self._account_gone, job):
+                return dict(GONE_RESULT)
             await asyncio.to_thread(pg.write_png, ctx.paths, rel, data)
         size = (await asyncio.to_thread(path.stat)).st_size
         if spec.max_side is None:
@@ -797,6 +864,16 @@ async def _wait(stop: asyncio.Event, seconds: float) -> None:
         await asyncio.wait_for(stop.wait(), timeout=max(0.0, seconds))
 
 
+async def _wait_either(first: asyncio.Event, second: asyncio.Event, seconds: float) -> None:
+    """Sleep ``seconds`` or until either event is set."""
+    waiters = {asyncio.ensure_future(first.wait()), asyncio.ensure_future(second.wait())}
+    try:
+        await asyncio.wait(waiters, timeout=max(0.0, seconds), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+
+
 # ---- one account ------------------------------------------------------------------------------
 
 
@@ -809,9 +886,24 @@ class AccountLoop:
         self.acct = row.acct
         self.backoffs = 0
         self.archive: Archive | None = None
-        self._inflight: asyncio.Future[SyncReport] | None = None
+        self._inflight: asyncio.Future[SyncReport | None] | None = None
         self._client: CloudClient | None = None
         self._u = worker.rng.uniform
+        self._wake = asyncio.Event()
+        self._ended_at: float | None = None
+        self._pokeable = False
+        self._reaping: set[asyncio.Task[Any]] = set()
+
+    def poke(self) -> None:
+        """Ask for a poll soon: a cloud notification said something changed (M2, S7).
+
+        Event loop only. Honoured after an ``ok`` or ``partial`` poll: the next poll starts
+        ``NOTIFY_MIN_GAP_SECONDS`` after the last one ended (at once if that is past), never
+        sooner. Ignored while the account backs off, needs relinking or has no token, so a
+        burst of notifications cannot defeat the backoff. Budgets and the two-listings rule
+        are the poll's own and do not change.
+        """
+        self._wake.set()
 
     def abort(self) -> None:
         """Close the cloud client of a poll in progress (shutdown): its request fails fast."""
@@ -835,9 +927,26 @@ class AccountLoop:
                 delay = await self.poll_once(ctx)
             except Exception:
                 log_event(logger, "poll_failed", level=logging.ERROR, exc_info=True, acct=self.acct)
+                self._pokeable = False
                 self.backoffs += 1
                 delay = backoff_delay(self.worker.settings.poll_seconds, self.backoffs, None)
-            await _wait(stop, delay)
+            self._ended_at = asyncio.get_running_loop().time()
+            await self.pause(stop, delay)
+
+    async def pause(self, stop: asyncio.Event, delay: float) -> None:
+        """Wait ``delay`` seconds before the next poll, or less after a :meth:`poke`."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, delay)
+        gap = float(self.worker.settings.notify_min_gap_seconds)
+        while not stop.is_set():
+            if self._wake.is_set():
+                self._wake.clear()
+                if self._pokeable and self._ended_at is not None:
+                    deadline = min(deadline, self._ended_at + gap)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await _wait_either(stop, self._wake, remaining)
 
     async def _context(self, stop: asyncio.Event) -> AccountContext | None:
         while not stop.is_set():
@@ -849,10 +958,15 @@ class AccountLoop:
         return None
 
     def start(self, ctx: AccountContext) -> None:
-        """Finish or discard interrupted commits, then reconcile every live document's pages."""
-        self.archive = Archive(ctx.paths)
-        self.archive.sweep_staging()
-        queued = self.worker.refresh(ctx, sorted(ctx.index.document_uuids(deleted=False)))
+        """Finish or discard interrupted commits, then reconcile every live document's pages
+        (under the poll lock; nothing is done if the directory was moved away)."""
+        with poll_lock(ctx.paths) as held:
+            if held != "held":
+                log_event(logger, "account_start_skipped", acct=self.acct, reason="account_moved")
+                return
+            self.archive = Archive(ctx.paths)
+            self.archive.sweep_staging()
+            queued = self.worker.refresh(ctx, sorted(ctx.index.document_uuids(deleted=False)))
         log_event(logger, "account_start", acct=self.acct, count=queued)
 
     async def poll_once(self, ctx: AccountContext) -> float:
@@ -864,12 +978,16 @@ class AccountLoop:
             if not self._inflight.done():
                 return worker.timing.recheck_s
             self._inflight = None
+        if self.archive is None:  # the start-up sweep found the directory moved
+            return worker.timing.recheck_s
         if await asyncio.to_thread(ctx.index.get_state, STATE_NEEDS_RELINK) == "true":
+            self._pokeable = False
             return worker.timing.recheck_s
         assert worker.client_factory is not None
         async with worker.sync_slots():
             token = await asyncio.to_thread(worker.device_token, self.uid, self.acct)
             if token is None:
+                self._pokeable = False
                 log_event(logger, "poll_skipped", acct=self.acct, reason="no_device_token")
                 return worker.timing.recheck_s
             client = worker.client_factory(token)
@@ -890,6 +1008,10 @@ class AccountLoop:
                     )
                 if fut.done():
                     self._inflight = None
+                else:
+                    # Abandoned: reaped whenever the thread returns, so its error is logged
+                    # and its commits get their pages refreshed.
+                    fut.add_done_callback(lambda done: self._reap(ctx, done))
                 return await asyncio.to_thread(self._record_failure, ctx, "watchdog")
             except Exception:
                 client.close()
@@ -899,6 +1021,11 @@ class AccountLoop:
                 if fut.done():
                     self._client = None
             client.close()
+        if report is None:
+            # disconnect_remarkable moved the directory: the supervisor stops this loop.
+            self._pokeable = False
+            log_event(logger, "poll_skipped", acct=self.acct, reason="account_moved")
+            return worker.timing.recheck_s
         log_event(
             logger,
             "poll",
@@ -922,18 +1049,57 @@ class AccountLoop:
                 )
         return delay
 
-    def _sync(self, ctx: AccountContext, client: CloudClient) -> SyncReport:
+    def _sync(self, ctx: AccountContext, client: CloudClient) -> SyncReport | None:
+        """One ``SyncOnce`` under the poll lock; None if the account directory was moved."""
         assert self.archive is not None
-        return SyncOnce(
-            client,
-            self.archive,
-            ctx.index,
-            self.worker.sync_settings,
-            self.worker.clock,
-            monotonic=self.worker.monotonic,
-        ).run()
+        with poll_lock(ctx.paths) as held:
+            if held != "held":
+                return None
+            return SyncOnce(
+                client,
+                self.archive,
+                ctx.index,
+                self.worker.sync_settings,
+                self.worker.clock,
+                monotonic=self.worker.monotonic,
+            ).run()
+
+    def _reap(self, ctx: AccountContext, fut: asyncio.Future[SyncReport | None]) -> None:
+        """A poll the watchdog gave up on has returned: log its error by class name only,
+        or refresh what it committed (its outcome was already recorded as ``watchdog``)."""
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+        if exc is not None:
+            log_event(
+                logger,
+                "poll_thread_error",
+                level=logging.WARNING,
+                acct=self.acct,
+                reason=type(exc).__name__,
+            )
+            return
+        report = fut.result()
+        if report is None:
+            return
+        log_event(logger, "poll_late", acct=self.acct, outcome=report.outcome)
+        task = asyncio.get_running_loop().create_task(
+            asyncio.to_thread(self.refresh_after, ctx, report)
+        )
+        self._reaping.add(task)
+        task.add_done_callback(self._reaping.discard)
+
+    def refresh_after(self, ctx: AccountContext, report: SyncReport) -> None:
+        """Refresh the pages of what ``report`` committed or un-tombstoned, and lower the
+        waiting renders of what it tombstoned."""
+        changed = dict.fromkeys((*report.committed, *report.untombstoned))
+        if changed:
+            self.worker.refresh(ctx, changed)
+        if report.tombstoned:
+            self.worker.deprioritise(ctx, report.tombstoned)
 
     def _record_failure(self, ctx: AccountContext, outcome: str) -> float:
+        self._pokeable = False
         log_event(logger, "poll_abandoned", level=logging.WARNING, acct=self.acct, outcome=outcome)
         ctx.index.set_state(STATE_LAST_POLL_AT, to_db_time(self.worker.clock()))
         ctx.index.set_state(STATE_LAST_POLL_OUTCOME, outcome)
@@ -949,13 +1115,12 @@ class AccountLoop:
         index.set_state(STATE_LAST_POLL_AT, to_db_time(now))
         index.set_state(STATE_LAST_POLL_OUTCOME, report.outcome)
         u = self._u(-1.0, 1.0)
+        self._pokeable = report.outcome in ("ok", "partial")
         if report.outcome in ("ok", "partial"):
             self.backoffs = 0
             index.set_state(STATE_TOKEN_REJECTIONS, None)
             index.set_state(STATE_LAST_SYNC_AT, to_db_time(now))
-            changed = dict.fromkeys((*report.committed, *report.untombstoned))
-            if changed:
-                self.worker.refresh(ctx, changed)
+            self.refresh_after(ctx, report)
             if report.outcome == "partial" and report.reason in BUDGET_REASONS:
                 return jittered(self.worker.timing.continue_s, u, spread=0.5)
             return jittered(settings.poll_seconds, u)
