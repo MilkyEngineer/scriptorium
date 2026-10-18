@@ -122,7 +122,7 @@ from scriptorium.library.index import DocumentRow, Index, PageRow
 from scriptorium.logging import log_event
 from scriptorium.ocr._ports import OcrPorts, build_ocr_ports
 from scriptorium.ocr.ledger import SpendLedger
-from scriptorium.ocr.runner import OCR_SLOTS, JobFailure, OcrRunner
+from scriptorium.ocr.runner import OCR_SLOTS, JobDeferred, JobFailure, OcrRunner
 from scriptorium.users.secrets import SecretBox
 from scriptorium.users.store import (
     AccountPaths,
@@ -722,6 +722,8 @@ class Worker:
             else:
                 result = await self._render_job(job)
             await asyncio.to_thread(self.queue.complete, job.id, self.owner, result)
+        except JobDeferred:
+            outcome = "deferred"
         except LeaseLostError:
             outcome = "lease_lost"
         except asyncio.CancelledError:
