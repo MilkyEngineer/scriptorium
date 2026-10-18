@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 from collections.abc import AsyncIterator, Callable
 from datetime import timedelta
 from pathlib import Path
@@ -492,6 +493,41 @@ async def test_a_removal_waits_for_a_connect_of_the_same_user(
         assert linked.paths.root.is_dir()
     done = await pending
     assert done["removed"] is True
+
+
+async def test_two_concurrent_executes_with_one_token_remove_once(
+    library: Served, linked: Linked, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The second call is inside the tool while the first is moving the directory: it waits
+    # on the user's connect lock, then finds the token spent.
+    entered = 0
+    both_in = threading.Event()
+    real_remove, real_move = account_tools._remove, account_tools.move_aside
+
+    async def counting_remove(svc: Services, user: Any, token: str) -> dict[str, object]:
+        nonlocal entered
+        entered += 1
+        if entered == 2:
+            both_in.set()
+        return await real_remove(svc, user, token)
+
+    def move_once_both_are_in(paths: AccountPaths, destination: Path) -> None:
+        assert both_in.wait(10)
+        real_move(paths, destination)
+
+    monkeypatch.setattr(account_tools, "_remove", counting_remove)
+    monkeypatch.setattr(account_tools, "move_aside", move_once_both_are_in)
+    token = (await _dry_run(library))["confirmation_token"]
+
+    results = await asyncio.gather(_execute(library, token), _execute(library, token))
+
+    assert entered == 2
+    done = [r for r in results if r.get("removed") is True]
+    refused = [r for r in results if r.get("code") == "refused"]
+    assert len(done) == 1 and len(refused) == 1, results
+    assert refused[0]["reason"] == "used"
+    assert _moved_to(linked).name.startswith(f"{linked.acct}-")  # exactly one directory
+    await _assert_stays_removed(library, linked)
 
 
 async def test_an_archive_kept_at_disconnect_can_be_removed_later(
