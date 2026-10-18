@@ -58,6 +58,7 @@ from scriptorium.library.layout import (
     resolve_inside,
 )
 from scriptorium.library.render import PX_PER_UNIT
+from scriptorium.library.tags import TagSet, parse_tags
 from scriptorium.users.store import AccountPaths
 
 __all__ = [
@@ -69,6 +70,7 @@ __all__ = [
     "blank_page_png",
     "blob_path",
     "content_hash",
+    "content_tags",
     "current_version",
     "load_version",
     "page_list",
@@ -292,6 +294,12 @@ def page_sources(paths: AccountPaths, version: Version) -> list[PageSource]:
             )
         )
     return out
+
+
+def content_tags(paths: AccountPaths, version: Version) -> TagSet:
+    """The tags in ``version``'s ``.content`` (``library/tags.py``), read with the same size
+    cap as :func:`page_sources`; no ``.content``, or one that does not parse, has none."""
+    return parse_tags(_content_json(paths, version))
 
 
 # ---- PNG files -------------------------------------------------------------------------------

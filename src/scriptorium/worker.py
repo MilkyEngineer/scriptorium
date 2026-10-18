@@ -15,9 +15,9 @@ One process, one asyncio loop, four kinds of task:
   its normal interval. At most ``SYNC_CONCURRENCY`` polls run at once. Each poll runs in a
   thread under a watchdog (``POLL_TIMEOUT_SECONDS``): when it fires, the cloud client is
   closed (failing whatever request is in flight) and no new poll of that account starts
-  until the old one has returned. After a poll, the pages of every committed or
-  un-tombstoned document are refreshed from its new version (:func:`refresh_document`) and
-  ``render`` jobs are queued for pages without a PNG.
+  until the old one has returned. After a poll, the pages and tags of every committed or
+  un-tombstoned document (the tags of a folder) are refreshed from its new version
+  (:func:`refresh_document`) and ``render`` jobs are queued for pages without a PNG.
 - **Job runner.** Leases ``render`` and ``page_image`` jobs, at most ``RENDER_WORKERS`` at a
   time, renders in the process pool (heartbeating the lease while it waits), writes the PNG
   and completes or fails the job. A job whose lease was lost is abandoned, not reported. A
@@ -125,6 +125,7 @@ BUDGET_REASONS: Final = frozenset({"byte_budget", "time_budget"})
 HEARTBEAT_STALE_SECONDS: Final = 180
 HEARTBEAT_MAX_BYTES: Final = 4096
 DOCUMENT_TYPE: Final = "DocumentType"
+FOLDER_TYPE: Final = "CollectionType"
 
 
 @dataclass(frozen=True)
@@ -222,28 +223,40 @@ def read_heartbeat(path: Path) -> dict[str, Any]:
 
 
 def refresh_document(
-    paths: AccountPaths, index: Index, uuid: str, now: datetime
+    paths: AccountPaths, index: Index, uuid: str, now: datetime, *, acct: str | None = None
 ) -> list[RenderSpec]:
-    """Make ``pages`` match the document's current version; returns what needs rendering.
+    """Make ``pages`` and ``tags`` match the document's current version; returns what needs
+    rendering.
 
     Every page of the version gets a row under ``(uuid, page id)``, including pages whose id
     another document also lists (the same ``.rm`` files uploaded more than once share page
-    UUIDs, open question 8). Returns the render specs of pages with no PNG on disk. A page
+    UUIDs, open question 8). The document's tags (§6.1, from its ``.content``) are replaced
+    whole in the same transaction as its pages; a folder has tags and no pages. Tag entries
+    that ``parse_tags`` skips are logged as a count (``acct`` names the account), never by
+    name. Returns the render specs of pages with no PNG on disk. A page
     whose PNG is already on disk (a page of a document uploaded again, or a render that
     finished before a restart) is marked rendered without a job. Copies queue the same
     ``render:<acct>:<page>:<hash>`` key, so one job renders the shared PNG, and finishing it
     marks every copy's row (:meth:`Index.set_rendered`).
     """
     doc = index.document(uuid)
-    if doc is None or doc.type != DOCUMENT_TYPE or doc.hash_root is None:
+    if doc is None or doc.type not in (DOCUMENT_TYPE, FOLDER_TYPE) or doc.hash_root is None:
         return []
     version = pg.current_version(paths, index, uuid)
     if version is None:
         return []
+    tags = pg.content_tags(paths, version)
+    if tags.skipped:
+        log_event(logger, "tags_skipped", acct=acct, count=tags.skipped)
+    if doc.type == FOLDER_TYPE:
+        index.replace_tags(uuid, tags)
+        return []
     sources = pg.page_sources(paths, version)
-    index.replace_pages(
-        uuid, [PageRow(s.page_id, uuid, s.idx, s.content_hash, now) for s in sources]
-    )
+    with index.transaction():
+        index.replace_pages(
+            uuid, [PageRow(s.page_id, uuid, s.idx, s.content_hash, now) for s in sources]
+        )
+        index.replace_tags(uuid, tags)
     listed = {row.page_id: row for row in index.pages(uuid)}
     todo: list[RenderSpec] = []
     for source in sources:
@@ -498,7 +511,7 @@ class Worker:
         now = self.clock()
         for uuid in uuids:
             try:
-                todo = refresh_document(ctx.paths, ctx.index, uuid, now)
+                todo = refresh_document(ctx.paths, ctx.index, uuid, now, acct=ctx.acct)
             except ScriptoriumError:
                 log_event(logger, "pages_refresh_failed", level=logging.WARNING, acct=ctx.acct)
                 continue
