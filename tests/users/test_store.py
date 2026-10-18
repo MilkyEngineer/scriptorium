@@ -547,15 +547,19 @@ def test_audit_accepts_a_uid_as_the_user_identifier(db: Path, gs: GlobalStore) -
         tool="admin_allow_server_key",
         duration_ms=1,
         outcome="ok",
-        identifiers={"user": UID},
+        identifiers={"user": UID, "allowed": False},
     )
-    for bad in ("reader@example.com", "sub-1", UID.upper(), UID + "0"):
+    bad_ids: list[dict[str, object]] = [
+        {"user": bad} for bad in ("reader@example.com", "sub-1", UID.upper(), UID + "0")
+    ]
+    bad_ids += [{"allowed": bad} for bad in ("true", 1, 0, "admin")]
+    for identifiers in bad_ids:
         with pytest.raises(ValueError):
             gs.audit(
                 uid_hash=make_user().uid_hash,
                 tool="admin_allow_server_key",
                 duration_ms=1,
                 outcome="ok",
-                identifiers={"user": bad},
+                identifiers=identifiers,
             )
     assert len(_audit_rows(db)) == 1

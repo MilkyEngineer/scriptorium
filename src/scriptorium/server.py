@@ -567,15 +567,16 @@ def _require_user() -> User:
 
 
 def build_registry(settings: Settings, services: Services | None = None) -> ToolRegistry:
-    """The tools this deployment offers: the M1 tools when the server has ``/data`` open
-    (``services``), and the S6 spike tools when ``SPIKE_TOOLS`` is on."""
+    """The tools this deployment offers: the library, account and admin tools when the server
+    has ``/data`` open (``services``), and the S6 spike tools when ``SPIKE_TOOLS`` is on."""
     registry = ToolRegistry()
     if services is not None:
-        from scriptorium.tools import account, library, ocr
+        from scriptorium.tools import account, admin, library, ocr
 
         account.register(registry)
         library.register(registry)
         ocr.register(registry)
+        admin.register(registry)
     if settings.spike_tools:
         from scriptorium.tools.spike import register_spike_tools
 

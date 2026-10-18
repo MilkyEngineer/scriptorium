@@ -30,6 +30,7 @@ M1_TOOLS = {
     "save_transcript",
 }
 M2_TOOLS = {"search", "set_claude_api_key", "clear_claude_api_key"}
+ADMIN_TOOLS = {"admin_allow_server_key"}
 NOTEBOOK_NAME = "Scriptorium Test Notebook"
 TRANSCRIPT_MARKER = "transcript-marker-7f3a"
 PATH_MARKER = "path-marker-91c2"
@@ -52,7 +53,7 @@ async def test_tools_list_for_a_user_and_an_admin(library: Served) -> None:
     assert not tools["save_transcript"].annotations.read_only_hint
     async with mcp_session(library.app, library.issuer.admin_token()) as (client, _):
         admin = {tool.name for tool in (await client.list_tools()).tools}
-    assert admin == M1_TOOLS | M2_TOOLS | USER_TOOLS | {"admin_spike_ping"}
+    assert admin == M1_TOOLS | M2_TOOLS | USER_TOOLS | ADMIN_TOOLS | {"admin_spike_ping"}
 
 
 async def test_list_and_read_page_p95_under_two_seconds(library: Served) -> None:

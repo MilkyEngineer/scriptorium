@@ -236,6 +236,8 @@ AUDIT_IDENTIFIER_KEYS: Final[Mapping[str, Callable[[object], bool]]] = {
     "snapshot": _matches(_SNAPSHOT_RE),
     # The target of an admin tool: a 16-character uid, never an email or a sub.
     "user": _matches(UID_RE),
+    # What an admin grant or withdrawal set (admin_allow_server_key); a flag, nothing else.
+    "allowed": lambda value: isinstance(value, bool),
 }
 
 
