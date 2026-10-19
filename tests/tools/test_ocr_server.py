@@ -485,3 +485,42 @@ async def test_no_transcript_reaches_the_audit_or_the_jobs(ocr: Ocr) -> None:
     assert text not in repr(ocr.served.audit_rows())
     rows = ocr.linked.queue._conn.execute("SELECT payload, result, error FROM jobs").fetchall()
     assert text not in repr([tuple(r) for r in rows])
+
+
+async def test_force_keeps_a_transcript_saved_by_hand_unless_told_otherwise(ocr: Ocr) -> None:
+    # A hand-saved transcript (lazy mode) is a person's work, often a correction.
+    ocr.lazy()
+    lazy = await ocr.served.call("read_page", {"document": NOTEBOOK, "page": 3})
+    meta = meta_of(lazy)
+    saved = await ocr.served.ok(
+        "save_transcript",
+        {
+            "document": NOTEBOOK,
+            "page": 3,
+            "content_hash": meta["content_hash"],
+            "text": "# Corrected by hand\n\nfull email",
+            "model": "claude-in-session",
+        },
+    )
+    assert saved["saved"] is True
+    ocr.linked.store.set_server_key_allowed(ocr.linked.uid, True)
+    # Without force the page is simply transcribed; with force it is kept as manual.
+    plain = await ocr.served.ok("transcribe", {"document": NOTEBOOK, "pages": [3]})
+    assert plain["jobs"] == [{"page": 3, "state": "transcribed"}]
+    forced = await ocr.served.ok("transcribe", {"document": NOTEBOOK, "pages": [3], "force": True})
+    assert forced["jobs"] == [{"page": 3, "state": "manual"}]
+    await ocr.drain()
+    assert ocr.client.count("transcribe") == 0
+    read = await ocr.served.call("read_page", {"document": NOTEBOOK, "page": 3})
+    assert any("full email" in text_of(read, i) for i in range(len(read.content)))
+    # replace_manual is the explicit opt-in.
+    replaced = await ocr.served.ok(
+        "transcribe",
+        {"document": NOTEBOOK, "pages": [3], "force": True, "replace_manual": True},
+    )
+    (job,) = replaced["jobs"]
+    assert job["state"] == "queued"
+    await ocr.drain()
+    assert ocr.client.count("transcribe") == 1
+    read = await ocr.served.call("read_page", {"document": NOTEBOOK, "page": 3})
+    assert meta_of(read)["transcript"]["mode"] == "server"

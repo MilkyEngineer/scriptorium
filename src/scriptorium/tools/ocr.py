@@ -269,6 +269,13 @@ class TranscribeArgs(ToolArgs):
     force: bool = Field(
         default=False, description="Transcribe again even pages that have a transcript."
     )
+    replace_manual: bool = Field(
+        default=False,
+        description=(
+            "With force: also replace transcripts saved by hand with save_transcript, which "
+            "force otherwise keeps."
+        ),
+    )
     account: str | None = Field(
         default=None, pattern=ACCT_PATTERN, description="Account id; the linked one by default."
     )
@@ -304,10 +311,15 @@ def _queue_pages(
     pages: Pages,
     numbers: list[int],
     force: bool,
+    replace_manual: bool,
     mode: str,
 ) -> list[dict[str, object]]:
     """Queue (or re-run, when dead) each page's job. A deferred job is made runnable now
-    unless the key in use is on hold after a refusal, when it would only be deferred again."""
+    unless the key in use is on hold after a refusal, when it would only be deferred again.
+
+    A transcript saved by hand (``save_transcript``, mode ``lazy``) is someone's work, often
+    a correction of a model's reading: ``force`` leaves it alone (``manual``) unless
+    ``replace_manual`` says otherwise."""
     index = account.index
     refusal = load_key_refusal(index)
     wake = refusal is None or not refusal.applies(mode, svc.clock())
@@ -316,10 +328,15 @@ def _queue_pages(
         source = pick_page(pages, number)
         item: dict[str, object] = {"page": number}
         row = index.page_by_id(doc.uuid, source.page_id)
+        existing = (
+            None if row is None else index.transcript(doc.uuid, source.page_id, source.content_hash)
+        )
         if row is None or row.content_hash != source.content_hash:
             item["state"] = "not_indexed"
-        elif not force and index.transcript(doc.uuid, source.page_id, source.content_hash):
+        elif existing is not None and not force:
             item["state"] = "transcribed"
+        elif existing is not None and existing.mode == "lazy" and not replace_manual:
+            item["state"] = "manual"
         else:
             spec = OcrSpec(
                 doc.uuid, source.page_id, source.content_hash, pages.version.generation, force
@@ -382,7 +399,10 @@ async def transcribe(ctx: ToolContext, args: TranscribeArgs) -> CallToolResult:
     queued for background transcription and the call returns the job ids and the mode; read
     the pages with read_page once the jobs are done. In lazy mode (no key) it returns up to
     three page images with instructions for you to transcribe and save with
-    save_transcript. force transcribes pages again even if they have a transcript."""
+    save_transcript. Pages that already have a transcript are skipped and reported as
+    transcribed; force transcribes them again, except transcripts saved by hand with
+    save_transcript, which are kept (reported as manual) unless replace_manual is also
+    true."""
     account = await use_account(ctx, args.account)
     doc = await use_document(ctx, account, args.document)
     svc = services(ctx)
@@ -401,7 +421,7 @@ async def transcribe(ctx: ToolContext, args: TranscribeArgs) -> CallToolResult:
             )
         return await _lazy_pages(ctx, account, doc, pages, numbers, args.force, reason)
     jobs = await asyncio.to_thread(
-        _queue_pages, svc, account, doc, pages, numbers, args.force, mode
+        _queue_pages, svc, account, doc, pages, numbers, args.force, args.replace_manual, mode
     )
     ctx.audit["count"] = sum(1 for j in jobs if "job" in j)
     return json_result(
