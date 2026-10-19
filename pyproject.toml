@@ -1,6 +1,6 @@
 [project]
 name = "scriptorium"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Self-hosted MCP server and sync worker for reMarkable libraries"
 readme = "README.md"
 license = "MIT"
