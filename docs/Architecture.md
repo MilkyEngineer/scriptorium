@@ -182,6 +182,7 @@ Checked 2026-10-17 (PyPI metadata unless stated):
 | WeasyPrint | BSD-3 | Use for Markdown/HTML → PDF (sandboxed, §9) |
 | httpx, cryptography, pydantic | BSD-3 / Apache-2.0 / MIT | Use |
 | anthropic 1.x (with docstring-parser MIT, jiter MIT, sniffio Apache-2.0/MIT; checked 2026-10-18 with `scriptorium licence-check`) | MIT | Use; imported by `ocr/client.py` only (§8) |
+| websockets 17.2 (wheel `License-Expression`, no dependencies; checked 2026-10-19 with `scriptorium licence-check`) | BSD-3-Clause | Use for the notifications websocket, worker only; imported by `cloud/notifications.py` only (§7, S7) |
 | Keycloak | Apache-2.0 | Separate container; no linkage |
 | **PyMuPDF** | **AGPL-3.0 or commercial** | **Excluded.** Upstream hard dependency; fork makes it an optional extra we never install |
 | **ebooklib** | **AGPL-3.0-or-later** | **Excluded.** Upstream hard dependency; fork makes it optional. EPUB push is pass-through bytes and needs no parser |

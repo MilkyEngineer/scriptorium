@@ -649,6 +649,7 @@ def test_serve_refuses_bad_config(capsys: pytest.CaptureFixture[str]) -> None:
         "MPL-2.0",
         "Apache-2.0 OR GPL-2.0-or-later",
         "MIT AND BSD-3-Clause",
+        "BSD-3-Clause",  # websockets 17.2 (License-Expression), §4.4
         "MIT License; BSD License",
         "Historical Permission Notice and Disclaimer (HPND)",
     ],

@@ -18,6 +18,7 @@ dependencies = [
     "anyio>=4.5,<5",
     "pillow>=11,<14",  # imported directly by library/render.py (§4.4)
     "anthropic>=1.12,<2",  # imported by ocr/client.py only (§8.2, §4.4)
+    "websockets>=15,<18",  # imported by cloud/notifications.py only (§7, S7, §4.4)
 ]
 
 [project.scripts]
