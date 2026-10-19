@@ -410,7 +410,7 @@ def test_poll_budgets_and_watchdog(env: pytest.MonkeyPatch) -> None:
         load_settings()
 
 
-def test_notifications_are_refused_until_spike_s7(env: pytest.MonkeyPatch) -> None:
+def test_notifications_are_available_since_spike_s7(env: pytest.MonkeyPatch) -> None:
     settings = load_settings()
     assert (settings.notifications, settings.notify_min_gap_seconds) == (False, 10)
     env.setenv("SCRIPTORIUM_NOTIFY_MIN_GAP_SECONDS", "30")
@@ -421,8 +421,7 @@ def test_notifications_are_refused_until_spike_s7(env: pytest.MonkeyPatch) -> No
             load_settings()
     env.delenv("SCRIPTORIUM_NOTIFY_MIN_GAP_SECONDS")
     env.setenv("SCRIPTORIUM_NOTIFICATIONS", "true")
-    with pytest.raises(ConfigError, match="spike_s7_pending"):
-        load_settings()
+    assert load_settings().notifications is True
     env.setenv("SCRIPTORIUM_NOTIFICATIONS", "false")
     assert load_settings().notifications is False
 

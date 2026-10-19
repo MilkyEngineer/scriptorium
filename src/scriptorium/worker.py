@@ -26,9 +26,16 @@ One process, one asyncio loop, four kinds of task:
   account's poll lock (``accounts.poll_lock``); a poll that finds the directory moved
   (``disconnect_remarkable(keep_archive=false)``) does nothing (``account_moved``). A poll
   the watchdog gave up on is still reaped when its thread returns: its error is logged by
-  class name, or its committed documents are refreshed. :meth:`AccountLoop.poke` (for cloud
-  notifications, M2, if S7 passes) brings the next poll forward to ``NOTIFY_MIN_GAP_SECONDS``
-  after the last one ended, after an ``ok`` or ``partial`` poll only.
+  class name, or its committed documents are refreshed. :meth:`AccountLoop.poke` (cloud
+  notifications, S7) brings the next poll forward to ``NOTIFY_MIN_GAP_SECONDS`` after the
+  last one ended, after an ``ok`` or ``partial`` poll only.
+- **Notification listener** (``NOTIFICATIONS=true``, S7). The supervisor starts one
+  :class:`~scriptorium.cloud.notifications.NotificationListener` per account loop (task
+  ``notify-<acct>``), with its own cloud client and the loop's ``account_stop``; its events
+  call the loop's :meth:`AccountLoop.poke`. One socket per device token: a new listener for
+  an account starts only once the previous one has ended. A listener that ended by itself
+  (device token rejected, no device token) is started again once its loop has polled
+  successfully.
 - **Job runner.** Leases ``render`` and ``page_image`` jobs, at most ``RENDER_WORKERS`` at a
   time, renders in the process pool (heartbeating the lease while it waits), writes the PNG
   and completes or fails the job. A job whose lease was lost is abandoned, not reported. A
@@ -68,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -95,6 +103,7 @@ from scriptorium.accounts import (
     poll_lock,
 )
 from scriptorium.cloud.client import CloudClient
+from scriptorium.cloud.notifications import Connector, NotificationListener, websocket_connector
 from scriptorium.cloud.sync import SyncOnce, SyncReport, SyncSettings
 from scriptorium.config import Settings
 from scriptorium.db.connect import to_db_time, utc_now
@@ -376,6 +385,8 @@ class Worker:
     ocr: OcrPorts | None = None
     """The OCR seams (:meth:`open` binds F's modules); None, for tests and tooling that build
     a Worker directly, defers every OCR job and skips the scan."""
+    notify_connector: Connector = websocket_connector
+    """Opens the notifications websocket (tests pass a fake)."""
     clock: Callable[[], datetime] = utc_now
     monotonic: Callable[[], float] = time.monotonic
     timing: Timing = field(default_factory=Timing)
@@ -392,6 +403,8 @@ class Worker:
         self._contexts: dict[tuple[str, str], AccountContext] = {}
         self._contexts_lock = threading.Lock()
         self._loops: dict[str, tuple[AccountLoop, asyncio.Task[None], asyncio.Event]] = {}
+        self._listeners: dict[str, tuple[AccountLoop, asyncio.Task[None]]] = {}
+        """Account → the notification listener started for that loop (``NOTIFICATIONS``)."""
         self._poll_executor = ThreadPoolExecutor(
             max_workers=self.settings.sync_concurrency + 2, thread_name_prefix="poll"
         )
@@ -491,11 +504,13 @@ class Worker:
             for loop, _task, account_stop in self._loops.values():
                 account_stop.set()
                 loop.abort()
-            pending = [task for _l, task, _s in self._loops.values()] + tasks
+            pending = [task for _l, task, _s in self._loops.values()]
+            pending += [task for _l, task in self._listeners.values()] + tasks
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             self._loops.clear()
+            self._listeners.clear()
             log_event(logger, "worker_stop")
 
     # ---- housekeeping ------------------------------------------------------------------
@@ -538,7 +553,11 @@ class Worker:
             await _wait(stop, self.timing.supervise_s)
 
     def reconcile_loops(self, rows: Sequence[AccountRow]) -> None:
-        """Start a loop for each new active account; stop those no longer listed."""
+        """Start a loop for each new active account; stop those no longer listed.
+
+        With ``NOTIFICATIONS`` on, also start each loop's notification listener
+        (:meth:`reconcile_listeners`); a stopped loop's ``account_stop`` ends its listener.
+        """
         wanted = {row.acct: row for row in rows}
         for acct in list(self._loops):
             if acct not in wanted:
@@ -546,13 +565,68 @@ class Worker:
                 account_stop.set()
                 log_event(logger, "account_loop_stop", acct=acct)
         for acct, row in wanted.items():
-            if acct in self._loops and not self._loops[acct][1].done():
-                continue
+            if acct in self._loops:
+                if not self._loops[acct][1].done():
+                    continue
+                self._loops[acct][2].set()  # the loop ended: end its listener too
             loop = AccountLoop(self, row)
             account_stop = asyncio.Event()
             task = asyncio.create_task(loop.run(account_stop), name=f"account-{acct}")
             self._loops[acct] = (loop, task, account_stop)
             log_event(logger, "account_loop_start", acct=acct)
+        if self.settings.notifications:
+            self.reconcile_listeners()
+
+    def reconcile_listeners(self) -> None:
+        """One notification listener per account loop, never two at once for an account.
+
+        A listener still running (even one winding down after its loop stopped) holds the
+        account's slot: the next one starts at a later pass, once it has ended, because a
+        second socket with the same device token kicks the first. A listener that ended by
+        itself for the current loop (token rejected, no token) starts again only once that
+        loop has polled successfully (``ok`` or ``partial``).
+        """
+        for acct, (_old, task) in list(self._listeners.items()):
+            if task.done() and acct not in self._loops:
+                del self._listeners[acct]
+        for acct, (loop, _task, account_stop) in self._loops.items():
+            previous = self._listeners.get(acct)
+            if previous is not None:
+                old_loop, old_task = previous
+                if not old_task.done():
+                    continue
+                if old_loop is loop and not loop._pokeable:
+                    continue
+            task = asyncio.create_task(self._notify(loop, account_stop), name=f"notify-{acct}")
+            self._listeners[acct] = (loop, task)
+
+    async def _notify(self, loop: AccountLoop, stop: asyncio.Event) -> None:
+        """Run one account's notification listener with its own cloud client."""
+        assert self.client_factory is not None
+        try:
+            token = await asyncio.to_thread(self.device_token, loop.uid, loop.acct)
+        except Exception:
+            log_event(
+                logger, "notifications_skipped", level=logging.ERROR, exc_info=True, acct=loop.acct
+            )
+            return
+        if token is None:
+            log_event(logger, "notifications_skipped", acct=loop.acct, reason="no_device_token")
+            return
+        client = self.client_factory(token)
+        del token
+        try:
+            listener = NotificationListener(
+                loop.acct,
+                functools.partial(client.user_token, renew=True),
+                loop.poke,
+                connector=self.notify_connector,
+                rng=self.rng,
+            )
+            log_event(logger, "notifications_start", acct=loop.acct)
+            await listener.run(stop)
+        finally:
+            client.close()
 
     def context(self, uid: str, acct: str) -> AccountContext:
         """The account's paths and index; raises ``SchemaMismatch`` until it is migrated.
