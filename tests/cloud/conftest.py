@@ -11,6 +11,8 @@ from typing import Any
 import httpx
 import pytest
 
+from scriptorium.cloud import notifications
+
 _PROTECTED = ("blobs", "library", "tombstones")
 
 
@@ -46,3 +48,5 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("a cloud test tried to use the network")
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", refuse)
+    # The notifications websocket (cloud/notifications.py): tests inject a fake connector.
+    monkeypatch.setattr(notifications, "_NoRedirects", refuse)

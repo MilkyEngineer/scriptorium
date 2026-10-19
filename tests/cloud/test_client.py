@@ -209,6 +209,29 @@ def test_an_expired_user_token_is_renewed_once(tmp_path: Path, cloud: FakeCloud)
     assert cloud.targets().count(TOKEN_KEY) == 2
 
 
+def test_user_token_is_cached_unless_renewed(tmp_path: Path, cloud: FakeCloud) -> None:
+    client = make(cloud, tmp_path)
+    assert client.user_token() == cloud.user_token
+    assert client.user_token() == cloud.user_token
+    assert cloud.targets() == [TOKEN_KEY]
+    cloud.user_token = "rotated-user-token"
+    assert client.user_token(renew=True) == "rotated-user-token"
+    assert cloud.targets() == [TOKEN_KEY, TOKEN_KEY]
+    assert client.root().hash == cloud.root_hash  # the renewed token serves sync too
+    assert cloud.targets().count(TOKEN_KEY) == 2
+
+
+@pytest.mark.parametrize(
+    ("status", "error"), [(401, TokenRejectedError), (503, TransientCloudError)]
+)
+def test_user_token_failures(
+    status: int, error: type[Exception], tmp_path: Path, cloud: FakeCloud
+) -> None:
+    cloud.status[TOKEN_KEY] = status
+    with pytest.raises(error):
+        make(cloud, tmp_path).user_token(renew=True)
+
+
 # ---- statuses and bounds -----------------------------------------------------------------
 
 

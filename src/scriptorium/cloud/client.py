@@ -338,6 +338,19 @@ class CloudClient:
     def _deadline(self, size: int) -> float:
         return time.monotonic() + self._timeout_s + size / MIN_TRANSFER_RATE
 
+    def user_token(self, *, renew: bool = False) -> str:
+        """The current user token, exchanged from the device token if there is none (or,
+        with ``renew``, always): what the notifications websocket authenticates with (§7).
+
+        Blocking. Raises :class:`TokenRejectedError` on 401/403 from the token endpoint and
+        :class:`TransientCloudError` for anything else. Never log the token or its claims:
+        they carry the user's name and email.
+        """
+        with self._lock:
+            if renew or self._user_token is None:
+                self._user_token = self._renew()
+            return self._user_token
+
     def _token(self) -> str:
         with self._lock:
             if self._user_token is None:
