@@ -589,7 +589,7 @@ Environment variables, all prefixed `SCRIPTORIUM_`. Secrets may be given as `*_F
 ```yaml
 services:
   scriptorium:
-    image: ghcr.io/milkyengineer/scriptorium:1
+    image: ghcr.io/milkyengineer/scriptorium:0.1        # latest 0.1.x; the major tag `1` follows the 1.0 release
     command: serve
     env_file: scriptorium.env
     secrets: [scriptorium_master_keys]
@@ -598,7 +598,7 @@ services:
     read_only: true
     tmpfs: ["/tmp"]
   scriptorium-worker:
-    image: ghcr.io/milkyengineer/scriptorium:1
+    image: ghcr.io/milkyengineer/scriptorium:0.1
     command: worker
     env_file: scriptorium.env
     secrets: [scriptorium_master_keys]
@@ -644,7 +644,7 @@ The default `docker compose up` starts only `scriptorium` and `scriptorium-worke
 - **Cloudflare Tunnel** is an alternative that avoids port-forwarding but terminates TLS at Cloudflare; the direct route is preferred because note content then only transits Anthropic ↔ your host.
 - **Health:** `GET /healthz` (server); the worker rewrites `<data>/worker.heartbeat` every 30 s (body: JSON `{"at", "render_pool_rebuilds"}`; liveness is its mtime) and `scriptorium healthcheck --worker` fails once it is older than 180 s (the compose example wires it). One worker per `/data`: it holds an exclusive `flock` on `<data>/worker.lock` and exits with code 3 if another worker holds it.
 - **Backups of the backup:** host-level backup of `/srv/scriptorium` (data, the Keycloak DB if the profile is used, `secrets/` kept separately) or the restic strategy to an off-site repo.
-- **Image:** `python:3.12-slim` base, `uv` sync, apt `libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core fonts-noto-cjk` for WeasyPrint (≈ +100 MB), non-root user (`PUID`/`PGID` build args or `user:` in compose), read-only root filesystem, `/data` and `/tmp` writable, multi-arch (amd64, arm64 — resvg-py and pypdfium2 ship aarch64 wheels). Published to `ghcr.io/milkyengineer/scriptorium`, tagged by semver; `1` tracks the latest 1.x.
+- **Image:** `python:3.12-slim` base, `uv` sync, apt `libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core fonts-noto-cjk` for WeasyPrint (≈ +100 MB), non-root user (`PUID`/`PGID` build args or `user:` in compose), read-only root filesystem, `/data` and `/tmp` writable, multi-arch (amd64, arm64 — resvg-py and pypdfium2 ship aarch64 wheels). Published to `ghcr.io/milkyengineer/scriptorium`, tagged by semver (`X.Y.Z`, `X.Y`, `X`, `latest`); the compose example follows `0.1` until 1.0, after which `1` tracks the latest 1.x.
 - **CI:** GitHub Actions — ruff, mypy, pytest with cassettes, image build, SBOM, licence gate, push on tag.
 
 Going fully cloud-free (self-hosting the reMarkable cloud with `rmfakecloud`) is out of scope: it requires developer mode on the Paper Pro Move and breaks on every firmware update.

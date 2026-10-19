@@ -23,7 +23,8 @@
 name: scriptorium
 
 x-scriptorium-common: &scriptorium-common
-  image: ghcr.io/milkyengineer/scriptorium:1
+  # Tracks the latest 0.1.x release; the major tag `1` exists from the 1.0 release on.
+  image: ghcr.io/milkyengineer/scriptorium:0.1
   env_file: scriptorium.env
   secrets: [scriptorium_master_keys]
   read_only: true

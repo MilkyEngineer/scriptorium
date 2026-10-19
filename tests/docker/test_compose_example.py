@@ -61,7 +61,7 @@ def test_core_services_exist_and_are_hardened(compose: dict[str, Any]) -> None:
         assert "/tmp" in svc["tmpfs"], name
         assert svc["env_file"] == "scriptorium.env", name
         assert "scriptorium_master_keys" in svc["secrets"], name
-        assert svc["image"] == "ghcr.io/milkyengineer/scriptorium:1", name
+        assert svc["image"] == "ghcr.io/milkyengineer/scriptorium:0.1", name
         assert "profiles" not in svc, name
         assert any(str(v).endswith(":/data") for v in svc["volumes"]), name
         assert "healthcheck" in svc, name
