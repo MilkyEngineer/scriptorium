@@ -1,0 +1,166 @@
+name: Release
+
+# Pushing a tag vX.Y.Z (on main, after the version bump and the CHANGELOG section are merged)
+# publishes the multi-arch image to GHCR and creates the GitHub release. See README "Releasing".
+on:
+  push:
+    tags: ["v*.*.*"]
+
+# Nothing by default; each job asks for what it needs (packages: write for the image,
+# contents: write for the release).
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Actions are pinned by commit SHA with the release tag as a comment, as in ci.yml.
+env:
+  UV_VERSION: "0.13.1"
+  PYTHON_VERSION: "3.12"
+  IMAGE: ghcr.io/milkyengineer/scriptorium
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # full history, to check the tag against main
+      - uses: astral-sh/setup-uv@c7f87aa956e4c323abf06d5dec078e358f6b4d04 # v6.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Tag is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - run: uv sync --locked
+      - name: Tag matches the package version
+        run: |
+          uv run --no-sync python - <<'EOF'
+          import os
+          import tomllib
+
+          import scriptorium
+
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          with open("pyproject.toml", "rb") as f:
+              project = tomllib.load(f)["project"]["version"]
+          found = {"pyproject.toml": project, "scriptorium.__version__": scriptorium.__version__}
+          wrong = {k: v for k, v in found.items() if v != tag}
+          if wrong:
+              raise SystemExit(f"tag {tag} does not match {wrong}")
+          EOF
+      - run: uv run pytest -q
+      - run: uv run scriptorium licence-check
+
+  image:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ env.IMAGE }}
+          # v0.1.0 -> 0.1.0, 0.1, 0 and latest. A pre-release tag (v0.2.0-rc.1) gets only
+          # its full version and does not move latest. The major tag 1 starts at 1.0.0.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+          flavor: |
+            latest=auto
+          labels: |
+            org.opencontainers.image.title=scriptorium
+            org.opencontainers.image.description=Self-hosted MCP server and sync worker for reMarkable libraries
+            org.opencontainers.image.licenses=MIT
+      # Smoke-test the amd64 image before anything is pushed.
+      - name: Build linux/amd64 for a smoke test
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: scriptorium:release
+          cache-from: type=gha
+      - name: Smoke test (non-root, read-only root, licence gate, version)
+        run: |
+          set -eu
+          test "$(docker run --rm --entrypoint id scriptorium:release -u)" = "1000"
+          docker run --rm --read-only --tmpfs /tmp scriptorium:release licence-check
+          version="$(docker run --rm --read-only --tmpfs /tmp --entrypoint python \
+            scriptorium:release -c 'import scriptorium; print(scriptorium.__version__)')"
+          test "$version" = "${GITHUB_REF_NAME#v}"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push linux/amd64 and linux/arm64
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha
+
+  release:
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Release notes from CHANGELOG.md
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          # The section is everything between "## <version> ..." and the next "## " heading.
+          if ! awk -v v="$version" '
+              /^## / { if (found) exit; if ($2 == v) { found = 1; next } }
+              found { print }
+              END { if (!found) exit 1 }
+            ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::error::the CHANGELOG.md section for $version is empty"
+            exit 1
+          fi
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          prerelease=""
+          case "$version" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Scriptorium $version" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            $prerelease
