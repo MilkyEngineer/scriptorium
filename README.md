@@ -4,7 +4,7 @@
 
 Scriptorium is a self-hosted [MCP](https://modelcontextprotocol.io) server that mirrors a reMarkable cloud library to local storage, keeps a durable, versioned archive of every notebook (including ones the free tier stops syncing), transcribes handwriting with Claude on demand, pushes documents back to the tablet, and can restore a wiped tablet from the archive — all through tools any Claude client can call.
 
-> **Status: design phase.** Nothing runs yet. The architecture is in [`docs/Architecture.md`](docs/Architecture.md) (v0.2, after an adversarial review); spikes and milestones are in [`docs/Plan/`](docs/Plan/).
+> **Status: 0.1 (pre-1.0).** The archive, reading tools, OCR and search work; push and restore are still to come (see the [changelog](CHANGELOG.md)). The architecture is in [`docs/Architecture.md`](docs/Architecture.md); spikes and milestones are in [`docs/Plan/`](docs/Plan/).
 >
 > Not affiliated with reMarkable AS. The reMarkable cloud API is unofficial and may change without notice.
 
@@ -50,6 +50,14 @@ Once deployed at `https://mcp.example.com/mcp`:
 ## Deploying
 
 A `docker/compose.example.yml` with the server and worker (plus optional `keycloak` and `ink` profiles) and a reverse-proxy layout is described in the architecture document. Requirements: a public HTTPS hostname, an OIDC issuer reachable by Claude, a local filesystem for `/data` (not a network or FUSE mount), and a master key kept outside `/data`. See `docs/Architecture.md` §12–13.
+
+The image is `ghcr.io/milkyengineer/scriptorium` for linux/amd64 and linux/arm64, tagged `X.Y.Z`, `X.Y`, `X` and `latest`. The compose example uses `0.1`, which picks up patch releases; before 1.0 a minor release may change configuration, so move to the next minor tag after reading the [changelog](CHANGELOG.md). The major tag `1` follows the 1.0 release.
+
+### Releasing
+
+1. On a branch, set `version` in `pyproject.toml` and `__version__` in `src/scriptorium/__init__.py` to `X.Y.Z`, run `uv lock`, and add a `## X.Y.Z — YYYY-MM-DD` section to `CHANGELOG.md`. Merge to `main`.
+2. Tag the merge commit on `main` and push the tag: `git tag -a vX.Y.Z -m "Scriptorium X.Y.Z"`, then `git push origin vX.Y.Z`.
+3. `.github/workflows/release.yml` checks that the tag is on `main` and matches the package version, runs the tests and the licence gate, smoke-tests the amd64 image, pushes both architectures to GHCR, and creates the GitHub release from the changelog section. A tag with a pre-release suffix (`vX.Y.Z-rc.1`) is published as a pre-release and does not move `latest` or the short tags.
 
 ## Roadmap
 
