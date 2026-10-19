@@ -157,7 +157,14 @@ def link(
         cloud.put_documents(fixture_documents())
     data = tmp_path / "data"
     data.mkdir(exist_ok=True)
-    values: dict[str, Any] = {"data_dir": data, "render_workers": 2, "sync_concurrency": 2}
+    # Notifications are on by default (§7); worker tests that exercise the listener say so,
+    # the rest keep the websocket out of the picture.
+    values: dict[str, Any] = {
+        "data_dir": data,
+        "render_workers": 2,
+        "sync_concurrency": 2,
+        "notifications": False,
+    }
     values.update(settings or {})
     config = make_settings(**values)
     clock = TickingClock()

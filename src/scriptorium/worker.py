@@ -29,7 +29,7 @@ One process, one asyncio loop, four kinds of task:
   class name, or its committed documents are refreshed. :meth:`AccountLoop.poke` (cloud
   notifications, S7) brings the next poll forward to ``NOTIFY_MIN_GAP_SECONDS`` after the
   last one ended, after an ``ok`` or ``partial`` poll only.
-- **Notification listener** (``NOTIFICATIONS=true``, S7). The supervisor starts one
+- **Notification listener** (``NOTIFICATIONS``, on by default, S7). The supervisor starts one
   :class:`~scriptorium.cloud.notifications.NotificationListener` per account loop (task
   ``notify-<acct>``), with its own cloud client and the loop's ``account_stop``; its events
   call the loop's :meth:`AccountLoop.poke`. One socket per device token: a new listener for

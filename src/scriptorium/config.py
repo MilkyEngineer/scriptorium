@@ -251,11 +251,11 @@ class Settings(BaseSettings):
         ),
     )
     notifications: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Hold the cloud's notifications websocket (worker only, one per account) and poll "
             "soon after each change notification, as a wake-up; polling on the interval "
-            "continues (§7, S7)."
+            "continues (§7, S7). Set false to poll on the interval only."
         ),
     )
     notify_min_gap_seconds: int = Field(

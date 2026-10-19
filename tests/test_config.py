@@ -412,7 +412,7 @@ def test_poll_budgets_and_watchdog(env: pytest.MonkeyPatch) -> None:
 
 def test_notifications_are_available_since_spike_s7(env: pytest.MonkeyPatch) -> None:
     settings = load_settings()
-    assert (settings.notifications, settings.notify_min_gap_seconds) == (False, 10)
+    assert (settings.notifications, settings.notify_min_gap_seconds) == (True, 10)
     env.setenv("SCRIPTORIUM_NOTIFY_MIN_GAP_SECONDS", "30")
     assert load_settings().notify_min_gap_seconds == 30
     for bad in ("0", "3601"):
